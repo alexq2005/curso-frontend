@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Computación Física Senior — Track experto · CS-FE Campus</title>
+  <meta name="description" content="Track de nivel experto en sistemas embebidos: tiempo real y RTOS, arquitectura de firmware, diseño para autonomía, buses industriales, integridad de señal y PCB, seguridad embebida, TinyML en el borde y el camino de prototipo a producto.">
+  <style>
+    :root {
+      --bg: #0f172a; --surface: #1e293b; --surface-2: #334155;
+      --text: #f1f5f9; --muted: #94a3b8;
+      --accent: #f0883e; --accent-2: #3fb950;
+      --success: #10b981; --border: #334155;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; min-height: 100vh; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 2rem 1.5rem; }
+    .breadcrumb { padding: 1rem 1.5rem; max-width: 1100px; margin: 0 auto; font-size: 0.9em; color: var(--muted); }
+    .breadcrumb a { color: var(--accent); text-decoration: none; }
+    .breadcrumb a:hover { text-decoration: underline; }
+    header { text-align: center; padding: 3rem 1rem 2rem; background: radial-gradient(circle at top, rgba(240, 136, 62, 0.15), transparent 60%); border-bottom: 1px solid var(--border); }
+    h1 { font-size: clamp(2rem, 5vw, 3.5rem); font-weight: 800; background: linear-gradient(135deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin-bottom: 0.5rem; }
+    .subtitle { color: var(--muted); font-size: 1.1rem; max-width: 680px; margin: 0 auto; }
+    .badges { margin-top: 1.5rem; display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; }
+    .badge { background: var(--surface); border: 1px solid var(--border); padding: 0.3rem 0.8rem; border-radius: 999px; font-size: 0.85em; color: var(--muted); }
+    .badge strong { color: var(--accent); }
+    h2 { margin-top: 3rem; margin-bottom: 1rem; font-size: 1.5rem; color: var(--accent); border-left: 4px solid var(--accent); padding-left: 0.8rem; }
+    .modules { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin-top: 1.5rem; }
+    .module { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; display: flex; flex-direction: column; transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s; }
+    .module:hover { transform: translateY(-2px); border-color: var(--accent); box-shadow: 0 6px 20px rgba(240, 136, 62, 0.15); }
+    .module-number { font-size: 0.75em; font-weight: 700; letter-spacing: 0.08em; color: var(--accent); text-transform: uppercase; }
+    .module h3 { font-size: 1.1rem; margin: 0.3rem 0 0.5rem; color: var(--text); }
+    .module p { color: var(--muted); font-size: 0.9em; margin-bottom: 1rem; flex: 1; }
+    .status { margin-top: auto; font-size: 0.78em; font-weight: 600; padding: 0.25rem 0.7rem; border-radius: 999px; align-self: flex-start; background: rgba(240, 136, 62, 0.18); color: var(--accent); text-decoration: none; }
+    .intro { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 2rem; margin-top: 2rem; }
+    .intro h3 { color: var(--accent); margin-bottom: 0.8rem; }
+    .intro p { color: var(--muted); margin-bottom: 0.5rem; }
+    .intro code { background: var(--bg); padding: 0.15rem 0.4rem; border-radius: 4px; color: var(--accent-2); font-size: 0.9em; }
+    .intro a { color: var(--accent-2); }
+    .aviso { background: rgba(63, 185, 80, 0.08); border: 1px solid var(--accent-2); border-radius: 12px; padding: 1.25rem 1.5rem; margin-top: 1.5rem; }
+    .aviso strong { color: var(--accent-2); }
+    .aviso p { color: var(--muted); font-size: 0.95em; }
+    footer { text-align: center; padding: 2.5rem 1rem; color: var(--muted); border-top: 1px solid var(--border); margin-top: 3rem; font-size: 0.9em; }
+    footer a { color: var(--accent); }
+  </style>
+</head>
+<body>
+
+  <nav class="breadcrumb">
+    <a href="../../../index.html">← Campus CS-FE</a> · <a href="../index.html">Computación Física</a> · <span>Comp. Física Senior</span>
+  </nav>
+
+  <header>
+    <div class="container">
+      <h1>⚡ Computación Física Senior</h1>
+      <p class="subtitle">
+        El track experto en sistemas embebidos. Del prototipo que anda en tu escritorio
+        al producto que corre cinco años sin que nadie lo toque.<br>
+        <em>"Tiempo real no significa rápido: significa predecible."</em>
+      </p>
+      <div class="badges">
+        <span class="badge"><strong>8</strong> módulos</span>
+        <span class="badge">RTOS · Firmware · Energía</span>
+        <span class="badge">CAN · RS-485 · PCB</span>
+        <span class="badge">Seguridad · TinyML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <div class="intro">
+      <h3>📖 Para quién es</h3>
+      <p>Para el que ya hace andar un microcontrolador y ahora enfrenta lo difícil: por qué el equipo se cuelga cada tres semanas, por qué la batería que debía durar dos años duró tres, por qué el bus RS-485 pierde tramas a 200 metros, o por qué un ADC de 16 bits solo entrega 11 útiles.</p>
+      <p style="margin-top: 1rem;"><strong>Pre-requisito real:</strong> el <a href="../index.html">Curso de Computación Física</a> completo (E00–E09). Circuitos, microcontroladores, sensores, señales y control tienen que estar cómodos.</p>
+      <p style="margin-top: 1rem;"><strong>Se cruza con otros tracks:</strong> CF6 conecta con <a href="../../Curso-Ciberseguridad/senior/index.html">Ciberseguridad Senior</a> (el atacante con el dispositivo en la mano), CF7 con <a href="../../../datos-ia/Curso-Datos-ML/senior/index.html">Datos/ML Senior</a> (entrenás en la PC, inferís en 256 KB), y el firmware moderno con <a href="../../../lenguajes/Curso-Rust/senior/index.html">Rust Senior</a>.</p>
+    </div>
+
+    <div class="aviso">
+      <p><strong>⚙️ La parte que ningún curso enseña.</strong> CF8 cubre lo que separa un proyecto terminado de un producto: DFM, cadena de suministro, test en producción, calibración por unidad, certificación (FCC/CE/ENACOM) y el costeo real a 100, 1.000 y 10.000 unidades. Es donde muere la mayoría de los proyectos de hardware, y casi nunca se documenta.</p>
+    </div>
+
+    <h2>📚 Los 8 módulos</h2>
+    <div class="modules">
+
+      <div class="module" style="border-color: var(--accent); background: linear-gradient(135deg, var(--surface), rgba(240, 136, 62, 0.1));">
+        <span class="module-number">CF1</span>
+        <h3>⏱️ Tiempo real y RTOS</h3>
+        <p>Cuando llegar tarde es fallar: hard vs soft real-time, jitter y WCET, planificación (RMS, EDF), <strong>inversión de prioridad</strong> y el caso del Mars Pathfinder.</p>
+        <a class="status" href="./cf1-tiempo-real-rtos/lecture.html">📖 Empezar CF1 →</a>
+      </div>
+
+      <div class="module">
+        <span class="module-number">CF2</span>
+        <h3>🏗️ Arquitectura de firmware</h3>
+        <p>Código que corre 5 años sin reiniciarse: capas y HAL, máquinas de estados, <strong>por qué nada de memoria dinámica</strong>, watchdog bien usado, y OTA con partición A/B.</p>
+        <a class="status" href="./cf2-arquitectura-firmware/lecture.html">📖 Abrir módulo →</a>
+      </div>
+
+      <div class="module">
+        <span class="module-number">CF3</span>
+        <h3>🔋 Energía</h3>
+        <p>Durar cinco años con una pila: presupuesto energético, modos de sleep, <strong>duty cycling</strong>, medir µA de verdad, y los ladrones de batería más comunes.</p>
+        <a class="status" href="./cf3-energia/lecture.html">📖 Abrir módulo →</a>
+      </div>
+
+      <div class="module">
+        <span class="module-number">CF4</span>
+        <h3>🔌 Buses industriales</h3>
+        <p>Cuando el cable tiene 40 metros y ruido: I2C y SPI a fondo, señalización diferencial, <strong>RS-485 y CAN</strong>, Modbus, y protocolos de aplicación defensivos.</p>
+        <a class="status" href="./cf4-buses-industriales/lecture.html">📖 Abrir módulo →</a>
+      </div>
+
+      <div class="module">
+        <span class="module-number">CF5</span>
+        <h3>📡 Integridad de señal y PCB</h3>
+        <p>Cuando el cable deja de ser un cable: líneas de transmisión, reflexiones, <strong>el plano de masa y el camino de retorno</strong>, desacoplo, crosstalk y EMI/EMC.</p>
+        <a class="status" href="./cf5-integridad-senal/lecture.html">📖 Abrir módulo →</a>
+      </div>
+
+      <div class="module">
+        <span class="module-number">CF6</span>
+        <h3>🔐 Seguridad embebida</h3>
+        <p>El atacante tiene el dispositivo en la mano: secure boot, actualización firmada, dónde viven las claves, JTAG en producción y la <strong>Cyber Resilience Act</strong>.</p>
+        <a class="status" href="./cf6-seguridad-embebida/lecture.html">📖 Abrir módulo →</a>
+      </div>
+
+      <div class="module">
+        <span class="module-number">CF7</span>
+        <h3>🤖 TinyML en el borde</h3>
+        <p>Inferencia en 256 KB: cuantización int8, pruning, el pipeline completo, el preprocesamiento que debe ser idéntico — y <strong>cuándo un umbral le gana al modelo</strong>.</p>
+        <a class="status" href="./cf7-tinyml-edge/lecture.html">📖 Abrir módulo →</a>
+      </div>
+
+      <div class="module" style="border-color: var(--accent-2); background: linear-gradient(135deg, var(--surface), rgba(63, 185, 80, 0.12));">
+        <span class="module-number" style="color: var(--accent-2);">CF8</span>
+        <h3>🏭 De prototipo a producto</h3>
+        <p>Las 1.000 unidades: DFM y BOM, test en producción, calibración y trazabilidad, <strong>certificación</strong>, versionado de hardware y el costo unitario real.</p>
+        <a class="status" href="./cf8-prototipo-a-producto/lecture.html">📖 Abrir módulo →</a>
+      </div>
+
+    </div>
+
+  </main>
+
+  <footer>
+    <p><em>Computación Física Senior — Campus CS-FE</em></p>
+    <p style="margin-top: 0.5rem;">
+      <a href="../index.html">← Curso de Computación Física</a> ·
+      <a href="../../../index.html">🏠 Campus</a> ·
+      <a href="../../Curso-Ciberseguridad/senior/index.html">🛡️ Ciberseguridad Senior</a>
+    </p>
+  </footer>
+
+</body>
+</html>

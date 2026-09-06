@@ -1,0 +1,1146 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FS4 — Core Web Vitals y performance medida · Frontend Senior</title>
+  <meta name="description" content="Campo vs laboratorio, el percentil 75, LCP y sus cuatro sub-partes, CLS y la ventana de sesión, INP con atribución LoAF, instrumentación con web-vitals v6, sendBeacon, performance budgets en CI, third-party y fuentes web.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Frontend Senior</a>
+  <a href="../../modulo-00-sillabus/lecture.html">🌐 Curso Frontend</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">FS4</span>
+  <span class="badge">⏱ 55–125 min</span>
+  <span class="badge">🎯 Pre-req: Curso Frontend M00–M13 · FS1–FS3</span>
+  <span class="badge">📊 Medición y presupuesto</span>
+</div>
+
+<article>
+
+<h1>FS4 — Core Web Vitals y performance medida</h1>
+
+<h2>FS4.0 Por qué este módulo</h2>
+
+<p>En el <strong>M12</strong> del curso base viste el nivel de entrada de performance: comprimí las imágenes, poné <code>loading="lazy"</code>, no cargues 3 MB de JavaScript. Todo eso sigue siendo cierto y sigue siendo el 80% de la ganancia en un sitio que nunca lo hizo. Este módulo no repite nada de eso. Acá el tema es otro: <strong>cómo se mide, cómo se atribuye una causa concreta a un número concreto, y cómo se defiende ese número en el tiempo</strong>.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> <em>"En mi máquina anda rápido"</em> no es un dato: es una anécdota de una sola muestra, tomada en una laptop cara, con caché caliente, en fibra, sin extensiones, sin el consent banner, sin el chat widget y probablemente sin datos reales. La performance de un sitio es una <strong>distribución</strong> sobre miles de sesiones en dispositivos que no elegiste, y hasta que no la mirás como distribución estás optimizando a ciegas — con la mala suerte de que optimizar a ciegas <em>igual da resultados</em>, solo que no sabés cuáles ni de quién.
+</div>
+
+<p>El objetivo concreto: que al terminar puedas mirar un panel de campo, decir <em>"el p75 de INP en la ficha de producto en Android es 480 ms, y el 62% de eso lo causa un handler que se llama <code>onAddToCart</code>"</em>, y tener el arreglo y el test de regresión listos. Eso es medir. Lo demás es tener opiniones.</p>
+
+<div class="info">
+  <strong>Dónde encaja esto.</strong> El <em>pipeline de render</em> (parse, style, layout, paint, composite) es <strong>FS1</strong>: acá damos por sabido qué es un reflow y por qué <code>transform</code> no lo dispara. La <em>red</em> (HTTP/2 y /3, prioridades, <code>Early Hints</code>, caché, CDN) es <strong>FS3</strong>: cuando hablemos de TTFB o de preload vamos a apoyarnos en eso sin re-explicarlo.
+</div>
+
+<h2>FS4.1 Campo (RUM) vs laboratorio: dos verdades que no se contradicen</h2>
+
+<p>Hay exactamente dos formas de obtener un número de performance, y confundirlas es el error número uno de la disciplina.</p>
+
+<table>
+<thead><tr><th></th><th>Laboratorio (sintético)</th><th>Campo (RUM)</th></tr></thead>
+<tbody>
+<tr><td><strong>Qué es</strong></td><td>Una corrida controlada: Lighthouse, PageSpeed Insights (la mitad "lab"), WebPageTest, DevTools</td><td>Lo que le pasó a usuarios reales: CrUX, o tu propia instrumentación</td></tr>
+<tr><td><strong>Muestra</strong></td><td>n = 1 (o 3, o 5 si sos prolijo)</td><td>n = miles de sesiones</td></tr>
+<tr><td><strong>Dispositivo</strong></td><td>El que elegiste emular</td><td>El que tienen tus usuarios, incluido el de 2019</td></tr>
+<tr><td><strong>Repetible</strong></td><td>✅ Sí — por eso sirve en CI</td><td>❌ No: nunca corrés "la misma" medición dos veces</td></tr>
+<tr><td><strong>Mide INP</strong></td><td>❌ No, salvo que scriptees interacciones</td><td>✅ Sí, es su hábitat natural</td></tr>
+<tr><td><strong>Da causa</strong></td><td>✅ Traza completa, waterfall, flamegraph</td><td>⚠️ Solo si instrumentaste atribución</td></tr>
+<tr><td><strong>Latencia del feedback</strong></td><td>Segundos</td><td>Horas o días (CrUX: ventana de 28 días)</td></tr>
+<tr><td><strong>Costo</strong></td><td>Casi cero</td><td>Beacons, almacenamiento, alguien que lo mantenga</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Cuál manda.</strong> Manda el <strong>campo</strong>. Siempre. Es lo que sienten los usuarios, y es lo que usa Google para la señal de experiencia de página (vía CrUX). El laboratorio no es una fuente de verdad: es un <strong>generador de hipótesis reproducible</strong>. Sirve para saber <em>por qué</em> pasa lo que el campo ya te dijo que pasa, y para que un cambio no empeore las cosas antes de mergear.
+</div>
+
+<h3>Por qué Lighthouse y CrUX se contradicen (y no es un bug)</h3>
+
+<p>El caso clásico: PageSpeed Insights muestra un <strong>98 de performance</strong> arriba y abajo, en la sección de datos de campo, un cartelito rojo que dice que la URL <strong>no aprueba</strong> los Core Web Vitals. Las dos cosas son verdad al mismo tiempo. Las razones más frecuentes:</p>
+
+<div class="step"><strong>1. Lighthouse no interactúa.</strong> Carga la página, mide y se va. <strong>INP no existe en el laboratorio</strong> porque no hay usuario que haga clic. Si tu problema es INP, Lighthouse puede darte 100 eternamente.</div>
+
+<div class="step"><strong>2. El lab tiene un solo perfil.</strong> Lighthouse móvil emula un dispositivo de gama media con red 4G simulada. Tus usuarios están repartidos en un continuo que va de un iPhone en Wi-Fi a un Android de gama baja en 3G en un subte.</div>
+
+<div class="step"><strong>3. El lab no tiene el caché de tus usuarios.</strong> Lighthouse mide siempre visita fría. Buena parte de tu tráfico es repetido y tiene todo cacheado — o peor, el problema aparece <em>solo</em> en visita repetida, por un service worker mal configurado.</div>
+
+<div class="step"><strong>4. El lab no tiene el consent banner, ni la extensión de cupones, ni el A/B testing.</strong> Todo eso corre en la máquina del usuario y no en la tuya. Es, muy seguido, la mitad del problema (FS4.10).</div>
+
+<div class="step"><strong>5. CrUX agrega 28 días.</strong> Si desplegaste el arreglo el martes, el campo va a tardar semanas en reflejarlo del todo. Tu RUM propio te lo dice en minutos: esa es la razón principal para tenerlo.</div>
+
+<div class="mistake">
+  <strong>El error que se comete siempre:</strong> optimizar contra el número de Lighthouse. Es una métrica compuesta, con pesos arbitrarios, medida una vez, sobre un dispositivo que no existe. Subir de 92 a 100 puede costarte una semana y no mover un solo milisegundo de la experiencia de nadie. Lo que se optimiza es <strong>el p75 de campo de LCP, CLS e INP</strong>; el score de Lighthouse es, con suerte, un indicador adelantado.
+</div>
+
+<h3>Qué es CrUX y dónde tiene agujeros</h3>
+
+<p>El <strong>Chrome UX Report</strong> es el dataset público de campo: usuarios de Chrome que optaron por compartir estadísticas de uso, agregados en una ventana móvil de 28 días. Es gratis, es la fuente que usa Google, y tiene límites que conviene conocer antes de basar decisiones en él:</p>
+
+<ul>
+  <li><strong>Solo Chrome.</strong> Nada de Safari ni de Firefox — y en móvil, según tu mercado, eso puede ser la mitad del tráfico. (Nota 2026: Firefox 144 sumó INP en octubre de 2025 y Safari 26.2 sumó LCP e INP en diciembre de 2025, así que <em>tu</em> RUM ya puede medir en todos lados aunque CrUX no lo haga.)</li>
+  <li><strong>Umbral de popularidad.</strong> Una URL con poco tráfico no aparece: caés al dato de origen, que mezcla la home con el checkout.</li>
+  <li><strong>Sin tus dimensiones.</strong> CrUX no sabe qué es un usuario logueado, qué release estaba activo, ni qué variante del A/B test le tocó.</li>
+  <li><strong>Latencia.</strong> Ventana de 28 días: cualquier mejora aparece diluida durante un mes.</li>
+</ul>
+
+<div class="tip">
+  <strong>La combinación que funciona en producción:</strong> CrUX como <em>fuente de verdad externa y auditable</em> (es la que mira Google y la que puede citar el equipo de negocio), tu RUM propio como <em>instrumento de trabajo</em> (rápido, segmentado, con atribución), y el laboratorio en CI como <em>alarma de regresión</em> antes del merge. Las tres, cada una en su rol. Ninguna de las tres sola alcanza.
+</div>
+
+<h2>FS4.2 El percentil 75, y por qué el promedio esconde a los que sufren</h2>
+
+<p>Los umbrales de los Core Web Vitals no se evalúan sobre el promedio: se evalúan sobre el <strong>percentil 75 de las cargas de página</strong>, segmentado además por tipo de dispositivo (móvil y escritorio se miden por separado). Es decir: para que una URL apruebe, el 75% de las visitas tiene que estar en verde.</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Bueno (p75)</th><th>Necesita mejorar</th><th>Malo (p75)</th><th>Qué mide</th></tr></thead>
+<tbody>
+<tr><td><strong>LCP</strong></td><td>≤ 2,5 s</td><td>2,5 – 4,0 s</td><td>&gt; 4,0 s</td><td>Carga percibida</td></tr>
+<tr><td><strong>INP</strong></td><td>≤ 200 ms</td><td>200 – 500 ms</td><td>&gt; 500 ms</td><td>Respuesta a la interacción</td></tr>
+<tr><td><strong>CLS</strong></td><td>≤ 0,10</td><td>0,10 – 0,25</td><td>&gt; 0,25</td><td>Estabilidad visual</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Estado a 2026.</strong> Los tres umbrales siguen sin cambios desde que <strong>INP reemplazó a FID en marzo de 2024</strong>, y no se agregó ninguna métrica nueva al núcleo desde entonces. Lo que sí se movió es el ecosistema alrededor: la <em>atribución</em> de LCP en cuatro sub-partes ya es estándar en el tooling, la medición de <em>soft navigations</em> para SPAs entró en prueba de origen en Chrome 139 (agosto de 2025), y LCP e INP pasaron a estar disponibles en los tres motores. Si leés un artículo que todavía habla de FID, es de antes de 2024: descartalo.
+</div>
+
+<h3>El promedio miente, y miente siempre para el mismo lado</h3>
+
+<p>Las distribuciones de performance no son simétricas: tienen una cola larga a la derecha. Hay un piso duro (nadie carga en 0 ms) y no hay techo (un dispositivo viejo en 3G puede tardar 15 s). El promedio queda arrastrado hacia el medio y <strong>no representa a nadie</strong>.</p>
+
+<pre><code class="lang-javascript">// 20 sesiones de LCP, en milisegundos, ordenadas de menor a mayor
+const lcp = [
+  900, 1000, 1100, 1150, 1200, 1250, 1300, 1400, 1450, 1500,
+  1600, 1700, 1800, 1900, 2100, 2400, 3200, 4800, 7100, 9400
+];
+
+const media = lcp.reduce(function (a, b) { return a + b; }, 0) / lcp.length;
+
+function percentil(valores, p) {
+  const orden = valores.slice().sort(function (a, b) { return a - b; });
+  // Índice del percentil, "nearest rank": el que usa CrUX conceptualmente
+  const idx = Math.ceil((p / 100) * orden.length) - 1;
+  return orden[Math.max(0, idx)];
+}
+
+console.log('media  ', Math.round(media));      // 2412 ms  -&gt; "necesita mejorar"
+console.log('mediana', percentil(lcp, 50));     // 1550 ms  -&gt; "bueno" (p50 = promedio de 1500/1600 en def. estricta)
+console.log('p75    ', percentil(lcp, 75));     // 2400 ms  -&gt; "bueno", al borde
+console.log('p95    ', percentil(lcp, 95));     // 9400 ms  -&gt; alguien esperó 9 segundos</code></pre>
+
+<p>Fijate lo que pasó: la <strong>mediana dice que está todo bien</strong> (1,55 s), el <strong>promedio dice que está mal</strong> (2,41 s) — y lo dice por culpa de dos outliers, no porque la experiencia típica sea mala — y el <strong>p75 dice la verdad útil</strong>: uno de cada cuatro usuarios está en 2,4 s o peor, y hay gente esperando 9 segundos.</p>
+
+<div class="rule">
+  <strong>📌 Nunca reportes un promedio de un Web Vital.</strong> Ni en un dashboard, ni en un Slack, ni en una reunión. El promedio de LCP es un número sin significado operativo: no corresponde a ninguna experiencia real y se puede mover moviendo la cola sin mejorarle la vida a nadie. Reportá <strong>p75</strong> (para el umbral) y <strong>p95</strong> (para saber cuán fea es la cola), siempre con el <strong>n</strong> al lado.
+</div>
+
+<h3>La trampa de agregar todo en un solo número</h3>
+
+<p>Un segundo error, más sutil, es calcular un p75 global del sitio. Un e-commerce típico tiene esta forma:</p>
+
+<table>
+<thead><tr><th>Ruta</th><th>% de cargas</th><th>p75 LCP</th><th>Estado</th></tr></thead>
+<tbody>
+<tr><td><code>/</code> (home, cacheada en CDN)</td><td>48%</td><td>1,4 s</td><td>🟢</td></tr>
+<tr><td><code>/producto/:id</code></td><td>34%</td><td>2,3 s</td><td>🟢</td></tr>
+<tr><td><code>/buscar</code></td><td>13%</td><td>3,9 s</td><td>🟠</td></tr>
+<tr><td><code>/checkout</code></td><td>5%</td><td>5,2 s</td><td>🔴</td></tr>
+<tr><td><strong>Global (blended)</strong></td><td>100%</td><td><strong>2,4 s</strong></td><td>🟢 <em>y es mentira</em></td></tr>
+</tbody>
+</table>
+
+<p>El número global aprueba porque la home, que es rápida y barata, aporta la mitad de las cargas. Mientras tanto, <strong>el checkout —la ruta que paga los sueldos— tarda 5,2 segundos</strong> y el dashboard lo esconde. La regla práctica: segmentá siempre por <strong>ruta × clase de dispositivo</strong>, y si una ruta tiene valor de negocio desproporcionado, se mira sola, con su propio umbral.</p>
+
+<h2>FS4.3 LCP: qué elemento cuenta y las cuatro sub-partes</h2>
+
+<p><strong>Largest Contentful Paint</strong> marca el momento en que se pintó el elemento de contenido más grande visible en el viewport. No es "cuándo terminó de cargar la página": es cuándo el usuario sintió que <em>ya tiene algo</em>.</p>
+
+<h3>Qué elementos son candidatos</h3>
+
+<ul>
+  <li><code>&lt;img&gt;</code> (y <code>&lt;image&gt;</code> dentro de un <code>&lt;svg&gt;</code>)</li>
+  <li><code>&lt;video&gt;</code>: el <code>poster</code>, y en navegadores recientes también el primer fotograma pintado</li>
+  <li>Cualquier elemento con un <strong>background-image cargado por <code>url()</code></strong> (los gradientes CSS <em>no</em> cuentan)</li>
+  <li>Elementos de nivel bloque que contienen <strong>nodos de texto</strong> u otros elementos inline de texto</li>
+</ul>
+
+<div class="warn">
+  El elemento LCP <strong>cambia durante la carga</strong>. Al principio puede ser el título, después la imagen del héroe cuando llega. Y cambia entre dispositivos: en móvil el viewport es distinto, así que el "más grande visible" puede ser otro. Nunca asumas cuál es tu elemento LCP: <strong>preguntáselo al navegador</strong> con atribución, para cada segmento.
+</div>
+
+<h3>Las cuatro sub-partes: dónde está realmente el tiempo</h3>
+
+<p>Esta es la herramienta de diagnóstico más útil de todo el módulo. Todo LCP se descompone en cuatro tramos que suman el total, y cada uno tiene un dueño distinto:</p>
+
+<table>
+<thead><tr><th>#</th><th>Sub-parte</th><th>Qué es</th><th>Objetivo (~% del LCP)</th><th>Cómo se ataca</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>TTFB</strong></td><td>Desde la navegación hasta el primer byte del documento</td><td>≤ 40%</td><td>Backend, caché de CDN, <code>Early Hints</code>, streaming de HTML (FS3)</td></tr>
+<tr><td>2</td><td><strong>Resource load delay</strong></td><td>Desde el TTFB hasta que el navegador <em>empieza</em> a bajar el recurso LCP</td><td>≤ 10%</td><td>Descubribilidad: que la URL esté en el HTML inicial, <code>fetchpriority</code>, <code>preload</code></td></tr>
+<tr><td>3</td><td><strong>Resource load duration</strong></td><td>Lo que tarda en bajar el recurso</td><td>≤ 40%</td><td>Peso del archivo, formato (AVIF/WebP), <code>srcset</code>, compresión, CDN cercana</td></tr>
+<tr><td>4</td><td><strong>Element render delay</strong></td><td>Desde que el recurso está listo hasta que se pinta</td><td>≤ 10%</td><td>CSS/JS que bloquean el render, hidratación, fuentes, <code>content-visibility</code></td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Por qué esto cambia todo.</strong> Sin esta descomposición, "mi LCP es 4 s" solo se puede atacar probando cosas. Con ella, sabés a quién llamar. Si el 70% del LCP es TTFB, comprimir la imagen no va a servir de nada y el problema es de backend o de caché. Si el 60% es <em>render delay</em>, el recurso ya estaba en RAM y algo lo estaba bloqueando: casi siempre una fuente o un bundle. Es la diferencia entre diagnosticar y adivinar.
+</div>
+
+<h3>Los cinco errores clásicos de LCP</h3>
+
+<div class="danger">
+  <strong>1. <code>loading="lazy"</code> en la imagen del héroe.</strong> El error más común de la industria, y viene de aplicar bien una regla del M12 en el lugar equivocado. <code>lazy</code> hace que el navegador espere a saber la posición del elemento antes de pedir la imagen — lo que agrega cientos de milisegundos de <em>resource load delay</em> justo al recurso más importante. Regla: <strong>lazy para todo lo que está abajo del pliegue, nunca para lo que está arriba.</strong>
+</div>
+
+<pre><code class="lang-html">&lt;!-- ❌ Mal: la imagen LCP con lazy, descubierta tarde, sin prioridad --&gt;
+&lt;img src="/hero.jpg" loading="lazy" alt="Zapatilla modelo X"&gt;
+
+&lt;!-- ✅ Bien: eager (por defecto), alta prioridad, dimensiones para no generar CLS --&gt;
+&lt;img src="/hero-800.avif"
+     srcset="/hero-400.avif 400w, /hero-800.avif 800w, /hero-1600.avif 1600w"
+     sizes="(max-width: 600px) 100vw, 800px"
+     width="800" height="450"
+     fetchpriority="high"
+     decoding="async"
+     alt="Zapatilla modelo X"&gt;</code></pre>
+
+<p><strong>2. La imagen LCP como <code>background-image</code> en CSS.</strong> El navegador no puede descubrirla hasta que bajó, parseó y aplicó el CSS, y calculó que ese elemento es visible. Eso es <em>resource load delay</em> puro. Si es tu LCP, ponela como <code>&lt;img&gt;</code> en el HTML, o al menos precargala:</p>
+
+<pre><code class="lang-html">&lt;link rel="preload" as="image"
+      href="/hero-800.avif"
+      imagesrcset="/hero-400.avif 400w, /hero-800.avif 800w"
+      imagesizes="(max-width: 600px) 100vw, 800px"
+      fetchpriority="high"&gt;</code></pre>
+
+<div class="warn">
+  <strong>El costo del <code>preload</code>.</strong> Un preload es una promesa de que ese recurso es más importante que los demás — y el ancho de banda es finito. Si precargás cinco cosas, no precargaste nada: solo reordenaste la cola y le sacaste prioridad al recurso que sí importaba. La regla dura: <strong>como máximo un preload de imagen y uno de fuente por página</strong>, y solo si medís la mejora. Si además la URL del preload no coincide <em>exactamente</em> con la que después pide el <code>&lt;img&gt;</code> (por <code>srcset</code>, por query string, por <code>crossorigin</code> faltante), bajás el archivo <strong>dos veces</strong>: empeoraste todo.
+</div>
+
+<p><strong>3. La fuente que bloquea el render del texto LCP.</strong> Si tu LCP es un titular, el texto no se pinta hasta que la fuente está lista (o hasta que vence el período de bloqueo). Eso va todo a <em>element render delay</em>. Ver FS4.11.</p>
+
+<p><strong>4. Renderizado del lado del cliente.</strong> Si el elemento LCP solo existe después de que el bundle bajó, parseó, ejecutó y montó el árbol, el LCP no puede ser mejor que ese camino completo. Es un problema de arquitectura, no de imágenes: SSR, streaming de HTML o generación estática. FS8 lo trata en serio.</p>
+
+<p><strong>5. El carrusel que anima el héroe.</strong> Si el primer slide entra con un <code>opacity</code> de 0 a 1 durante 400 ms, ese es tu LCP: el navegador cuenta el pintado, no la intención. Una animación de entrada "elegante" en el héroe es medio segundo de LCP regalado.</p>
+
+<h2>FS4.4 CLS: qué cuenta como movimiento inesperado</h2>
+
+<p><strong>Cumulative Layout Shift</strong> no mide píxeles ni segundos: mide <em>cuánto se movió la página debajo de los ojos del usuario sin que él lo pidiera</em>. Es la métrica más barata de arreglar y la que más irrita cuando falla — es la que te hace tocar el botón equivocado.</p>
+
+<h3>La fórmula, en una línea</h3>
+
+<div class="rule">
+  <strong>📌 Puntaje de un shift = fracción de impacto × fracción de distancia.</strong> La <em>fracción de impacto</em> es qué porción del viewport ocuparon los elementos inestables (posición inicial ∪ final). La <em>fracción de distancia</em> es cuánto se movieron, respecto de la dimensión mayor del viewport. Un banner que ocupa la mitad de la pantalla y empuja todo 10% de la altura: 0,5 × 0,1 = <strong>0,05</strong> — la mitad de tu presupuesto entero en un solo evento.
+</div>
+
+<h3>"Inesperado" tiene una definición técnica</h3>
+
+<p>Un desplazamiento <strong>no cuenta</strong> si ocurre dentro de los <strong>500 ms posteriores a una interacción del usuario</strong> (clic, tecla). Esa es la ventana <code>hadRecentInput</code>. Por eso un acordeón que se abre al hacer clic es gratis, y el mismo acordeón abriéndose solo por un <code>setTimeout</code> te cuesta CLS.</p>
+
+<div class="mistake">
+  <strong>El abuso que se ve seguido:</strong> disparar cambios de layout artificialmente "cerca" de un clic para esconderlos de la métrica. Además de ser hacer trampa contra vos mismo, no funciona: 500 ms es poco, y el usuario igual ve el salto. La métrica es un proxy de la molestia, no la molestia.
+</div>
+
+<h3>Ventana de sesión: por qué CLS ya no se acumula infinito</h3>
+
+<p>La definición original sumaba todos los shifts de la vida de la página, lo que castigaba injustamente a las páginas de sesión larga (un feed infinito, una SPA abierta ocho horas). Desde 2021 se usa <strong>ventana de sesión</strong>:</p>
+
+<div class="step"><strong>1.</strong> Los shifts se agrupan en ventanas. Una ventana se cierra si pasan <strong>1 segundo sin ningún shift</strong>, o si la ventana ya lleva <strong>5 segundos</strong> abierta.</div>
+<div class="step"><strong>2.</strong> Cada ventana tiene su propia suma.</div>
+<div class="step"><strong>3.</strong> El <strong>CLS reportado es el máximo de esas sumas</strong>, no el total. La peor ráfaga, no la acumulación.</div>
+
+<div class="info">
+  Consecuencia práctica: <strong>un problema aislado y feo pesa más que muchos problemas chiquitos y espaciados</strong>. Cuando busques causas, no busques "shifts", buscá <em>ráfagas</em>: momentos donde varias cosas se acomodan juntas. Casi siempre es un solo culpable arrastrando al resto.
+</div>
+
+<h3>Las cinco causas, y sus arreglos con su costo</h3>
+
+<table>
+<thead><tr><th>Causa</th><th>Arreglo</th><th>Costo real</th></tr></thead>
+<tbody>
+<tr><td>Imágenes / videos sin dimensiones</td><td><code>width</code> y <code>height</code> en el HTML, o <code>aspect-ratio</code> en CSS</td><td>Ninguno. Es el arreglo con mejor relación esfuerzo/beneficio que existe</td></tr>
+<tr><td>Fuente web que cambia las métricas del texto</td><td><code>size-adjust</code> + overrides en el fallback (FS4.11)</td><td>Requiere calcular los overrides por fuente; hay herramientas</td></tr>
+<tr><td>Banners, avisos de cookies, ads inyectados</td><td>Reservar el espacio con <code>min-height</code>, o superponer en vez de empujar</td><td>Si el banner no aparece, queda un hueco vacío. Superponer resuelve, pero tapa contenido</td></tr>
+<tr><td>Contenido async (recomendados, precio en vivo, "quedan 3")</td><td>Skeleton del tamaño final; o reservar la caja y llenarla</td><td>El skeleton tiene que medir lo mismo que el contenido real, si no lo cambiaste de lugar al salto</td></tr>
+<tr><td>Animar <code>top</code>/<code>left</code>/<code>height</code> en vez de <code>transform</code></td><td><code>transform</code> y <code>opacity</code> (FS1: no disparan layout)</td><td>Casi ninguno, y encima ganás en fluidez</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-html">&lt;style&gt;
+/* Reserva la caja antes de saber el contenido: nada se mueve cuando llega */
+.card-media {
+  aspect-ratio: 16 / 9;   /* el navegador reserva la altura desde el layout inicial */
+  width: 100%;
+  background: #1e293b;    /* placeholder visible, no un salto blanco */
+}
+
+/* El bloque de recomendados llega por fetch. Le reservamos su altura exacta. */
+.recomendados {
+  min-height: 320px;      /* medido: 3 filas de 96px + 2 gaps de 16px */
+  contain: layout;        /* aísla el layout interno; NO borra el shift si es visible */
+}
+
+/* El banner de consentimiento NO empuja: se superpone */
+.consent {
+  position: fixed;
+  inset: auto 0 0 0;      /* pegado abajo, fuera del flujo */
+  z-index: 100;
+}
+&lt;/style&gt;</code></pre>
+
+<div class="warn">
+  <strong><code>contain: layout</code> no es un borrador de CLS.</strong> Aísla el cálculo de layout de los hijos para que no afecte al resto del documento — eso ayuda al rendimiento y evita que un cambio interno mueva media página. Pero si el elemento contenido <em>igual</em> cambia de tamaño y desplaza a sus hermanos, el shift se cuenta igual. Lo que elimina CLS es <strong>reservar el espacio correcto de antemano</strong>; el resto son mitigaciones.
+</div>
+
+<div class="tip">
+  Casos que <strong>no</strong> cuentan y que conviene saber para no perseguir fantasmas: los desplazamientos por <code>bfcache</code> (volver con el botón "atrás") se reportan aparte, y un cambio de tamaño de ventana no cuenta como shift. Y en una SPA, históricamente el CLS se acumulaba por toda la vida del documento sin importar cuántas "páginas" navegaste — ese es exactamente el agujero que vienen a tapar las <em>soft navigations</em> (FS4.7).
+</div>
+
+<h2>FS4.5 INP: la métrica que reemplazó a FID y por qué duele mucho más</h2>
+
+<p>El 12 de marzo de 2024, <strong>Interaction to Next Paint</strong> reemplazó a First Input Delay como Core Web Vital de respuesta. No fue un ajuste: fue cambiar la pregunta.</p>
+
+<table>
+<thead><tr><th></th><th>FID (2020–2024, retirado)</th><th>INP (desde 2024)</th></tr></thead>
+<tbody>
+<tr><td>Qué mide</td><td>Solo el <strong>retraso de entrada</strong>: cuánto tardó el navegador en <em>empezar</em> a atender el evento</td><td>La <strong>latencia completa</strong>: desde el input hasta que se pintó el siguiente fotograma</td></tr>
+<tr><td>Cuántas interacciones</td><td>Solo la <strong>primera</strong></td><td><strong>Todas</strong>, y reporta ~la peor</td></tr>
+<tr><td>Incluye tu handler</td><td>❌ No</td><td>✅ Sí, entero</td></tr>
+<tr><td>Incluye el repintado</td><td>❌ No</td><td>✅ Sí</td></tr>
+<tr><td>Dificultad de aprobar</td><td>Casi todos los sitios aprobaban</td><td>Es, por lejos, el vital que más sitios reprueban</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Por qué FID era una métrica generosa.</strong> Medía el tramo en que el hilo principal estaba ocupado <em>antes</em> de poder llamar a tu código — es decir, medía el problema de otro. Tu handler podía tardar 3 segundos y bloquear la pantalla: FID no lo veía. INP mide lo que el usuario experimenta de punta a punta: <em>apreté y no pasó nada durante medio segundo</em>. Por eso INP no se arregla con trucos de carga; se arregla escribiendo mejor código de interacción.
+</div>
+
+<h3>Cómo se elige el valor reportado</h3>
+
+<p>INP no es "la peor interacción" a secas: en páginas con muchas interacciones se ignora aproximadamente <strong>una interacción por cada 50</strong>, y se reporta la peor de las que quedan. Es decir, para una página con pocas interacciones sí es el máximo; con cientos, es un percentil alto. Traducción práctica: <strong>un solo pico horrible sí te arruina el número si el usuario no interactúa mucho</strong>, que es exactamente el caso de un checkout.</p>
+
+<h3>Las tres fases, y quién es el culpable en cada una</h3>
+
+<table>
+<thead><tr><th>Fase</th><th>Qué pasa</th><th>Culpable típico</th><th>Herramienta</th></tr></thead>
+<tbody>
+<tr><td><strong>Input delay</strong></td><td>El evento espera a que se libere el hilo principal</td><td>Tareas largas de carga, hidratación, scripts de terceros, timers</td><td>Long Animation Frames, TBT en lab</td></tr>
+<tr><td><strong>Processing duration</strong></td><td>Corren tus listeners</td><td>Trabajo sincrónico pesado, <code>JSON.stringify</code> gigante, escrituras a <code>localStorage</code>, <code>setState</code> que rerenderiza todo</td><td>Perfilador, <code>longestScript</code> de LoAF</td></tr>
+<tr><td><strong>Presentation delay</strong></td><td>El navegador hace style, layout, paint y compone el fotograma</td><td>DOM enorme, selectores caros, layout thrashing, animaciones no compuestas</td><td>DevTools Performance (FS1)</td></tr>
+</tbody>
+</table>
+
+<h3>Las cuatro estrategias, con su costo</h3>
+
+<p><strong>1. Ceder el hilo (yielding).</strong> Es la palanca más grande, y la más simple. Partir una tarea larga en trozos deja al navegador atender el input entre medio.</p>
+
+<pre><code class="lang-javascript">// Ceder el hilo principal, con fallback: scheduler.yield() todavía NO es Baseline
+// (Chrome/Edge 129+, Firefox 142+; Safari no lo tiene a 2026).
+function cederHilo() {
+  if (typeof scheduler !== 'undefined' &amp;&amp; typeof scheduler.yield === 'function') {
+    return scheduler.yield();               // reencola AL FRENTE: tu código sigue enseguida
+  }
+  return new Promise(function (resolve) {
+    setTimeout(resolve, 0);                 // reencola AL FINAL: funciona, pero más lento
+  });
+}
+
+async function procesarLote(items) {
+  const t0 = performance.now();
+  for (const item of items) {
+    trabajar(item);
+    // Cedemos cada ~50 ms, no cada iteración: ceder también cuesta
+    if (performance.now() - t0 &gt; 50) {
+      await cederHilo();
+    }
+  }
+}</code></pre>
+
+<div class="warn">
+  <strong>El costo del yielding.</strong> El trabajo total tarda <em>más</em>, no menos: cada cesión agrega overhead de scheduling, y con <code>setTimeout</code> te ponés al final de la cola de tareas, detrás de cualquier otra cosa pendiente. Estás cambiando <strong>throughput por responsividad</strong>, conscientemente. Ceder cada iteración de un bucle de 10.000 elementos puede multiplicar por tres el tiempo total: cedé por presupuesto de tiempo (cada 50 ms), no por conteo.
+</div>
+
+<p><strong>2. Actualizar la UI en el fotograma correcto.</strong> El patrón que más INP salva y menos se conoce: <strong>primero pintá la respuesta visible, después hacé el trabajo</strong>. Si el handler hace todo el trabajo y recién al final actualiza la UI, el usuario espera todo el trabajo. Si actualizás primero y cedés, el usuario ve la respuesta en el siguiente fotograma.</p>
+
+<pre><code class="lang-javascript">// ❌ El usuario espera TODO antes de ver cualquier señal
+boton.addEventListener('click', function () {
+  const carrito = recalcularCarrito();      // 180 ms
+  persistir(carrito);                       // 60 ms  (JSON.stringify + localStorage)
+  enviarAnalytics(carrito);                 // 40 ms
+  boton.textContent = 'Agregado ✓';         // recién acá se ve algo -&gt; INP ≈ 300+ ms
+});
+
+// ✅ Feedback inmediato, trabajo después del pintado
+boton.addEventListener('click', async function () {
+  boton.textContent = 'Agregado ✓';         // 1. mutación mínima y visible
+  boton.disabled = true;
+
+  await cederHilo();                        // 2. dejamos que el navegador pinte
+
+  const carrito = recalcularCarrito();      // 3. el trabajo pesado ya no cuenta para INP
+  persistir(carrito);
+  enviarAnalytics(carrito);
+});</code></pre>
+
+<div class="tip">
+  Si necesitás garantía de que el pintado ocurrió (y no solo que cediste), el patrón es esperar un <code>requestAnimationFrame</code> y <em>después</em> ceder: el rAF corre antes del pintado, y el <code>setTimeout</code>/<code>yield</code> posterior corre después. Es más caro en líneas, pero es determinista.
+</div>
+
+<p><strong>3. Mover el trabajo fuera del hilo principal.</strong> Un Web Worker para parsear, filtrar, ordenar o comprimir. El costo no es menor: no hay DOM, los datos viajan por <em>structured clone</em> (copiar 5 MB de objetos puede costar más que el cálculo), y sumás complejidad de sincronización. Vale la pena para trabajo CPU-bound puro y grande; es contraproducente para 200 ítems.</p>
+
+<p><strong>4. Renderizar menos.</strong> En React, el clásico: un <code>setState</code> en la raíz re-renderiza el árbol entero. Las herramientas son <code>memo</code> sobre las filas, estado colocalizado en el componente que lo usa, y marcar la actualización no urgente con <code>startTransition</code> / <code>useTransition</code> para que el navegador pueda interrumpirla. Costo: <code>memo</code> mal usado agrega comparaciones que no ahorran nada, y romper el árbol en cien componentes memoizados es peor que el problema original. Se aplica <strong>donde el perfil dice</strong>, no en todos lados.</p>
+
+<div class="danger">
+  <strong>Lo que NO arregla INP:</strong> comprimir imágenes, mover scripts a <code>defer</code>, achicar el CSS, mejorar el TTFB. Todo eso es carga. INP se juega <em>después</em> de que la página cargó, en el código que corre cuando el usuario toca algo. Es habitual ver equipos que pasan un mes optimizando la carga y ven INP moverse cero — porque nunca fue el problema.
+</div>
+
+<h2>FS4.6 Las métricas de apoyo: TTFB, FCP y TBT</h2>
+
+<p>No son Core Web Vitals: son <strong>diagnósticas</strong>. No se optimizan por sí mismas, se usan para explicar a las tres que sí importan.</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Bueno</th><th>Dónde vive</th><th>Para qué sirve</th></tr></thead>
+<tbody>
+<tr><td><strong>TTFB</strong></td><td>≤ 800 ms</td><td>Campo y lab</td><td>Es la sub-parte 1 del LCP. Un TTFB malo pone un piso a todo lo demás</td></tr>
+<tr><td><strong>FCP</strong></td><td>≤ 1,8 s</td><td>Campo y lab</td><td>Primer píxel de contenido. Separa "el servidor tardó" de "el render tardó"</td></tr>
+<tr><td><strong>TBT</strong></td><td>≤ 200 ms</td><td><strong>Solo lab</strong></td><td>Suma del exceso sobre 50 ms de cada tarea larga entre FCP y TTI</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Por qué TBT es el proxy de INP en el laboratorio.</strong> INP no se puede medir sin un usuario que interactúe, así que no existe en una corrida normal de Lighthouse. Pero <strong>TBT mide exactamente el recurso que INP necesita y no encuentra: hilo principal libre</strong>. Una página con TBT de 1.200 ms tiene el hilo tapado por tareas largas, y cualquier interacción durante esa ventana va a esperar. La correlación no es perfecta —TBT solo cubre la carga, e INP puede fallar por un handler pesado horas después— pero es lo suficientemente fuerte como para que <strong>TBT sea la aserción que ponés en CI</strong> (FS4.9): es barata, estable y adelanta el problema.
+</div>
+
+<div class="tip">
+  <strong>Si querés INP real en laboratorio</strong>, existe: los <em>user flows</em> de Lighthouse en modo <code>timespan</code>, manejados con Puppeteer, sí ejecutan interacciones scripteadas y reportan la latencia. Es más caro de mantener (los selectores se rompen) pero es la única forma de tener una alarma de INP <em>antes</em> del deploy. Vale la pena para dos o tres flujos críticos, no para todo el sitio.
+</div>
+
+<h2>FS4.7 Instrumentar de verdad: <code>web-vitals</code> con atribución</h2>
+
+<p>Sin atribución, tu RUM te dice <em>"INP: 480 ms"</em> y no podés hacer nada con eso. Con atribución te dice <em>"INP: 480 ms, en <code>button.add-to-cart</code>, con 310 ms de processing, y el script más largo fue <code>/assets/cart.a91f.js</code>"</em>. Es la diferencia entre un ticket que se puede tomar y uno que se archiva.</p>
+
+<div class="info">
+  <strong>Estado de la librería a 2026.</strong> <code>web-vitals</code> va por la <strong>versión 6</strong>. Puntos que importan: la v5 <strong>eliminó <code>onFID</code></strong> (si tu código lo importa, no compila), la API es <code>onCLS</code>, <code>onINP</code>, <code>onLCP</code>, <code>onFCP</code> y <code>onTTFB</code>, y la construcción con atribución vive en el sub-módulo <code>web-vitals/attribution</code> (cuesta ~1,5 KB extra). La v6 agrega el reporte de <em>soft navigations</em> con la opción <code>reportSoftNavs</code>, útil para SPAs, disponible en Chrome reciente.
+</div>
+
+<pre><code class="lang-bash">npm install web-vitals
+# El sub-módulo con atribución no se instala aparte: es un export del mismo paquete
+#   import { onLCP } from 'web-vitals/attribution';</code></pre>
+
+<pre><code class="lang-javascript">// rum.js — se carga con defer o dinámicamente; NUNCA bloqueando el render
+import { onLCP, onINP, onCLS, onTTFB, onFCP } from 'web-vitals/attribution';
+
+const cola = [];
+
+function encolar(metric) {
+  const a = metric.attribution || {};
+
+  cola.push({
+    nombre: metric.name,                // 'LCP' | 'INP' | 'CLS' | 'TTFB' | 'FCP'
+    valor: Math.round(metric.value),
+    rating: metric.rating,              // 'good' | 'needs-improvement' | 'poor'
+    id: metric.id,                      // agrupa los reportes de la MISMA carga
+    navType: metric.navigationType,     // 'navigate' | 'reload' | 'back-forward' | 'prerender'
+
+    // ── Atribución: el objetivo es que esto llegue al backend, no el valor solo ──
+    target: a.target || a.interactionTarget || a.largestShiftTarget || null,
+
+    // LCP: las cuatro sub-partes de FS4.3, ya calculadas por la librería
+    ttfb: a.timeToFirstByte,
+    loadDelay: a.resourceLoadDelay,
+    loadDuration: a.resourceLoadDuration,
+    renderDelay: a.elementRenderDelay,
+    lcpUrl: a.url,
+
+    // INP: las tres fases de FS4.5 + el script más largo según Long Animation Frames
+    inputDelay: a.inputDelay,
+    processing: a.processingDuration,
+    presentation: a.presentationDelay,
+    interactionType: a.interactionType,  // 'pointer' | 'keyboard'
+    scriptMasLargo: a.longestScript &amp;&amp; a.longestScript.sourceURL,
+
+    // Contexto sin el cual los números no se pueden comparar
+    ruta: normalizarRuta(location.pathname),
+    conexion: (navigator.connection || {}).effectiveType || 'unknown',
+    memoria: navigator.deviceMemory || null,
+    release: window.__BUILD_SHA__ || 'dev'
+  });
+}
+
+// Reemplaza los ids por :id para no explotar la cardinalidad del dashboard
+function normalizarRuta(path) {
+  return path
+    .replace(/\/\d+/g, '/:id')
+    .replace(/\/[0-9a-f]{8,}/gi, '/:hash');
+}
+
+onLCP(encolar);
+onINP(encolar);
+onCLS(encolar);
+onTTFB(encolar);
+onFCP(encolar);</code></pre>
+
+<div class="warn">
+  <strong>El costo de la instrumentación.</strong> Estás agregando un script y un observador a todas las páginas para medir que las páginas son rápidas. Reglas para que no sea contraproducente: cargalo <strong>después</strong> del contenido (dinámicamente, o con <code>defer</code>), nunca lo pongas en el <code>head</code> bloqueando, y no uses <code>reportAllChanges: true</code> en producción — dispara un callback por cada cambio y multiplica el trabajo en el hilo principal. El default (reportar una vez, al final) es el correcto.
+</div>
+
+<h3>Qué significa cada campo de atribución</h3>
+
+<table>
+<thead><tr><th>Métrica</th><th>Campo</th><th>Qué te dice</th></tr></thead>
+<tbody>
+<tr><td rowspan="3">LCP</td><td><code>target</code> / <code>url</code></td><td>El selector CSS del elemento LCP y la URL del recurso. Lo primero que mirás</td></tr>
+<tr><td><code>timeToFirstByte</code>, <code>resourceLoadDelay</code>, <code>resourceLoadDuration</code>, <code>elementRenderDelay</code></td><td>Las cuatro sub-partes. Suman el LCP total</td></tr>
+<tr><td><code>lcpEntry</code>, <code>navigationEntry</code></td><td>Las entradas crudas, por si querés algo que la librería no expone</td></tr>
+<tr><td rowspan="3">INP</td><td><code>interactionTarget</code>, <code>interactionType</code></td><td>Qué elemento se tocó y con qué (puntero o teclado)</td></tr>
+<tr><td><code>inputDelay</code>, <code>processingDuration</code>, <code>presentationDelay</code></td><td>Las tres fases. Dicen a quién le toca arreglar</td></tr>
+<tr><td><code>longAnimationFrameEntries</code>, <code>longestScript</code></td><td>Los LoAF que se cruzan con la interacción, y el script más largo (solo se reportan los de más de 5 ms)</td></tr>
+<tr><td>CLS</td><td><code>largestShiftTarget</code>, <code>largestShiftValue</code>, <code>largestShiftTime</code></td><td>El elemento que más aportó al peor shift. Casi siempre es la respuesta completa</td></tr>
+</tbody>
+</table>
+
+<h2>FS4.8 Del beacon al dashboard honesto</h2>
+
+<h3>Enviar sin frenar al usuario</h3>
+
+<p><code>navigator.sendBeacon()</code> encola un POST que el navegador manda incluso si la página se está cerrando, sin bloquear la descarga ni requerir que la página siga viva.</p>
+
+<pre><code class="lang-javascript">function enviar() {
+  if (!cola.length) return;
+  const cuerpo = JSON.stringify({ sesion: SESION_ID, metricas: cola.splice(0) });
+
+  // sendBeacon: no bloquea, sobrevive al cierre de la pestaña, límite típico ~64 KB
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon('/rum', new Blob([cuerpo], { type: 'application/json' }));
+  } else {
+    fetch('/rum', { body: cuerpo, method: 'POST', keepalive: true });
+  }
+}
+
+// 'hidden' es el ÚNICO evento confiable de fin de sesión en móvil.
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'hidden') enviar();
+});
+
+// Red de seguridad para bfcache y cierres raros
+addEventListener('pagehide', enviar);</code></pre>
+
+<div class="danger">
+  <strong>Nunca uses <code>unload</code> ni <code>beforeunload</code> para esto.</strong> Registrar un listener de <code>unload</code> <strong>descalifica la página del bfcache</strong> en varios navegadores: rompés la navegación "atrás" instantánea de todos tus usuarios para mandar una métrica. Y encima es poco confiable: en móvil, cuando el sistema mata la pestaña, <code>unload</code> muchas veces no corre. <code>visibilitychange → hidden</code> es el evento correcto y es el que recomienda la propia documentación de la librería.
+</div>
+
+<h3>Qué guardar, y qué no</h3>
+
+<table>
+<thead><tr><th>✅ Guardá</th><th>Por qué</th><th>❌ No guardes</th><th>Por qué no</th></tr></thead>
+<tbody>
+<tr><td>Ruta <strong>normalizada</strong> (<code>/producto/:id</code>)</td><td>Sin esto no podés segmentar; con la URL cruda explota la cardinalidad</td><td>La URL completa con query strings</td><td>Cardinalidad infinita, y suele llevar datos personales</td></tr>
+<tr><td>Clase de dispositivo y <code>effectiveType</code></td><td>Móvil y escritorio se evalúan por separado; la red explica la mitad de la varianza</td><td>User-Agent completo</td><td>Es huella digital, y no lo vas a usar</td></tr>
+<tr><td>SHA del release</td><td>Es lo que convierte "empeoró" en "empeoró con el deploy del martes"</td><td>Identificadores de usuario</td><td>No los necesitás para un p75, y te meten en tema de privacidad</td></tr>
+<tr><td>El objetivo de atribución</td><td>Es lo único que hace accionable el reporte</td><td>El HTML del elemento</td><td>Puede contener datos del usuario. El selector alcanza</td></tr>
+<tr><td><code>metric.id</code> y <code>navigationType</code></td><td>Permite unir métricas de la misma carga y descartar <code>prerender</code>/<code>back-forward</code></td><td>Timestamps con precisión de microsegundo</td><td>Ruido; y con otras señales, identifican</td></tr>
+</tbody>
+</table>
+
+<h3>Un dashboard que no miente</h3>
+
+<pre><code class="lang-javascript">// Agregación mínima honesta: p75 y p95 por ruta, con el n visible.
+function resumir(filas, metrica, minMuestras) {
+  const porRuta = new Map();
+
+  for (const f of filas) {
+    if (f.nombre !== metrica) continue;
+    if (f.navType === 'prerender') continue;   // no lo vivió ningún usuario
+    const clave = f.ruta + ' · ' + f.claseDispositivo;
+    if (!porRuta.has(clave)) porRuta.set(clave, []);
+    porRuta.get(clave).push(f.valor);
+  }
+
+  const salida = [];
+  porRuta.forEach(function (valores, clave) {
+    // Con pocas muestras, un p75 es una anécdota disfrazada de estadística
+    if (valores.length &lt; minMuestras) {
+      salida.push({ clave, n: valores.length, p75: null, nota: 'datos insuficientes' });
+      return;
+    }
+    salida.push({
+      clave: clave,
+      n: valores.length,
+      p75: percentil(valores, 75),
+      p95: percentil(valores, 95)
+    });
+  });
+
+  return salida.sort(function (a, b) { return (b.p75 || 0) - (a.p75 || 0); });
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Las tres reglas de un panel honesto.</strong> <strong>(1)</strong> Nunca un número global sin desglose por ruta y dispositivo. <strong>(2)</strong> Siempre el <code>n</code> al lado del percentil, y un estado explícito de <em>"datos insuficientes"</em> por debajo de un umbral (200 muestras es un piso razonable). <strong>(3)</strong> Una línea vertical por cada deploy: sin eso, cualquier movimiento se atribuye a lo que uno quiera creer.
+</div>
+
+<div class="mistake">
+  <strong>El error de muestreo que sesga todo:</strong> "mandamos solo el 10% de los beacons" implementado como <em>tirar un dado por cada métrica</em>. Eso rompe la correlación: te queda el LCP de una sesión y el INP de otra, y no podés cruzar nada. El muestreo se decide <strong>una vez por sesión</strong>, al principio, y esa sesión manda todo o no manda nada. Y ojo con el sesgo de supervivencia: si solo llegan beacons de sesiones que terminaron bien, los usuarios que abandonaron por lentitud —los que más te importan— son invisibles.
+</div>
+
+<table>
+<thead><tr><th>Opción</th><th>Costo</th><th>Cuándo tiene sentido</th></tr></thead>
+<tbody>
+<tr><td>Solo CrUX / PageSpeed</td><td>$0</td><td>Sitio chico, sin equipo de plataforma. Tenés el número, no la causa</td></tr>
+<tr><td>RUM propio (beacon + tabla + query)</td><td>Días de desarrollo, algo de infra, mantenimiento eterno</td><td>Cuando necesitás dimensiones tuyas (release, variante, segmento de usuario)</td></tr>
+<tr><td>SaaS de RUM</td><td>Suscripción, y el peso de <em>su</em> script en tu página</td><td>Cuando querés el panel mañana y no tenés a quién asignarle el mantenimiento</td></tr>
+</tbody>
+</table>
+
+<h2>FS4.9 Performance budgets: cómo se define uno que no sea arbitrario</h2>
+
+<p>Un presupuesto de performance es un número que, al superarse, <strong>rompe el build</strong>. Si no rompe nada, no es un presupuesto: es un deseo escrito en un README.</p>
+
+<h3>Los cuatro pasos para que el número no sea inventado</h3>
+
+<div class="step"><strong>1. Partí de tu campo, no de la tabla de Google.</strong> Si tu p75 de LCP hoy es 3,8 s, poner el budget en 2,5 s hace que falle el primer día y alguien lo desactive en la semana. El primer budget es <strong>tu número actual, congelado</strong>: "no podés empeorar".</div>
+
+<div class="step"><strong>2. Anclá el objetivo en el negocio, no en el umbral.</strong> 2,5 s es un piso regulatorio de facto, no una meta. La meta sale de un número tuyo: cuánto tarda el competidor con el que te comparan, o qué pasó con la conversión la última vez que mejoraste medio segundo.</div>
+
+<div class="step"><strong>3. Traducí el objetivo de campo a proxies que el CI pueda controlar.</strong> El CI no puede medir el p75 de campo. Sí puede medir bytes, TBT y LCP en lab con throttling. Esos son los que se asertan.</div>
+
+<div class="step"><strong>4. Trinquete (<em>ratchet</em>).</strong> El budget solo baja. Para subirlo hace falta una excepción escrita, con fecha de vencimiento y dueño. Sin trinquete, el budget se erosiona un 3% por sprint hasta volverse irrelevante.</div>
+
+<pre><code class="lang-javascript">// budget.json — los límites por tipo de recurso, en KB y en cantidad
+[
+  {
+    "path": "/*",
+    "resourceSizes": [
+      { "resourceType": "script",     "budget": 170 },
+      { "resourceType": "stylesheet", "budget": 60  },
+      { "resourceType": "image",      "budget": 300 },
+      { "resourceType": "font",       "budget": 100 },
+      { "resourceType": "third-party","budget": 120 },
+      { "resourceType": "total",      "budget": 800 }
+    ],
+    "resourceCounts": [
+      { "resourceType": "third-party", "budget": 8 }
+    ],
+    "timings": [
+      { "metric": "largest-contentful-paint", "budget": 2500 },
+      { "metric": "total-blocking-time",      "budget": 250  }
+    ]
+  }
+]</code></pre>
+
+<pre><code class="lang-javascript">// lighthouserc.js — aserciones de LHCI. Lo que realmente rompe el build.
+module.exports = {
+  ci: {
+    collect: {
+      url: [
+        'http://localhost:4173/',
+        'http://localhost:4173/producto/demo',
+        'http://localhost:4173/checkout'
+      ],
+      numberOfRuns: 5,              // la varianza del runner es real: nunca 1 corrida
+      settings: { preset: 'desktop' }
+    },
+    assert: {
+      // 'median' de las 5 corridas: mucho más estable que 'pessimistic'
+      aggregationMethod: 'median',
+      assertions: {
+        // Baratas y estables -&gt; error: rompen el build
+        'total-blocking-time':        ['error', { maxNumericValue: 250 }],
+        'resource-summary:script:size': ['error', { maxNumericValue: 174080 }],
+        'unused-javascript':          ['error', { maxNumericValue: 40960 }],
+        'uses-responsive-images':     ['error', { minScore: 0.9 }],
+
+        // Ruidosas en CI -&gt; warn: informan, no bloquean
+        'largest-contentful-paint':   ['warn',  { maxNumericValue: 2500 }],
+        'speed-index':                ['warn',  { maxNumericValue: 3400 }],
+
+        // CLS en lab sí es bastante estable
+        'cumulative-layout-shift':    ['error', { maxNumericValue: 0.1 }]
+      }
+    },
+    upload: { target: 'temporary-public-storage' }
+  }
+};</code></pre>
+
+<pre><code class="lang-yaml">name: performance
+on: [pull_request]
+
+jobs:
+  lighthouse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run build
+      - run: npm run preview &amp; npx wait-on http://localhost:4173
+      - name: Lighthouse CI
+        run: npx @lhci/cli autorun    # lee lighthouserc.js; sale con codigo != 0 si falla</code></pre>
+
+<div class="danger">
+  <strong>⚠️ La varianza del CI arruina los budgets mal diseñados.</strong> Un runner compartido de GitHub Actions tiene CPU variable: entre dos corridas idénticas es normal ver <strong>±10–15% en LCP y Speed Index</strong>. Si asertás LCP a 2.500 ms con una sola corrida, el build va a fallar aleatoriamente, el equipo va a aprender a apretar "re-run" sin mirar, y a los dos meses alguien lo saca. La disciplina: <strong>mediana de 5 corridas</strong>, <code>error</code> solo sobre métricas de baja varianza (bytes, TBT, CLS) y <code>warn</code> sobre las ruidosas. Un budget que grita en falso es peor que no tener budget, porque enseña a ignorar la alarma.
+</div>
+
+<table>
+<thead><tr><th>Aserción</th><th>Varianza en CI</th><th>Severidad recomendada</th></tr></thead>
+<tbody>
+<tr><td>Bytes por tipo de recurso</td><td>Nula: es determinista</td><td><code>error</code></td></tr>
+<tr><td>Cantidad de requests de terceros</td><td>Nula</td><td><code>error</code></td></tr>
+<tr><td>CLS (lab)</td><td>Baja</td><td><code>error</code></td></tr>
+<tr><td>TBT</td><td>Media</td><td><code>error</code> con margen (mediana de 5)</td></tr>
+<tr><td>LCP, Speed Index</td><td>Alta</td><td><code>warn</code></td></tr>
+<tr><td>Score global de performance</td><td>Alta y compuesta</td><td>No asertar nunca</td></tr>
+</tbody>
+</table>
+
+<h2>FS4.10 Third-party: el costo más grande que no está en tu código</h2>
+
+<p>Analizás tu bundle, lo bajás de 400 a 180 KB, celebrás — y el campo no se mueve. Mirás una traza real y descubrís que el gestor de etiquetas, el chat, el mapa de calor, el widget de reseñas y dos píxeles publicitarios suman <strong>más peso y más tiempo de hilo principal que toda tu aplicación</strong>.</p>
+
+<div class="concept">
+  <strong>💡 Por qué son tan caros.</strong> Un script de tercero es código arbitrario con los mismos privilegios que el tuyo, corriendo en tu hilo principal, cargado desde un dominio que no controlás, que puede cambiar sin avisarte y que muchas veces <strong>carga a su vez otros scripts</strong> (un tag manager es un cargador de cargadores). No aparece en tu analizador de bundle, no está en tu repo, no pasa por tu code review, y nadie de tu equipo es su dueño.
+</div>
+
+<h3>Cómo medir su impacto real (no el estimado)</h3>
+
+<div class="step"><strong>1. DevTools → Performance → resumen por tercero.</strong> Te da tiempo de hilo principal atribuido a cada dominio. Es la vista más rápida para la primera conversación.</div>
+
+<div class="step"><strong>2. Long Animation Frames en producción.</strong> Es el método honesto: observás LoAF reales, con scripts reales, en dispositivos reales, y atribuís por origen del script.</div>
+
+<div class="step"><strong>3. La prueba A/B de bloqueo.</strong> Medís con y sin el script. En laboratorio con un bloqueador de requests, y —si te lo permiten— en campo con un flag que sirva la página sin el tercero al 5% del tráfico. Ese es el único número que gana una discusión.</div>
+
+<pre><code class="lang-javascript">// Atribuir tiempo de hilo principal a terceros, con datos de producción.
+const porOrigen = new Map();
+
+new PerformanceObserver(function (lista) {
+  for (const frame of lista.getEntries()) {
+    if (frame.duration &lt; 50) continue;         // solo fotogramas realmente largos
+    for (const script of frame.scripts) {
+      let origen;
+      try { origen = new URL(script.sourceURL).origin; } catch (e) { origen = 'inline'; }
+      porOrigen.set(origen, (porOrigen.get(origen) || 0) + script.duration);
+    }
+  }
+}).observe({ type: 'long-animation-frame', buffered: true });
+
+// A los 20 s mandamos el ranking: quién se comió el hilo principal, en ms
+setTimeout(function () {
+  const ranking = [...porOrigen.entries()]
+    .sort(function (a, b) { return b[1] - a[1]; })
+    .slice(0, 10)
+    .map(function (e) { return { origen: e[0], ms: Math.round(e[1]) }; });
+  navigator.sendBeacon('/rum/terceros', JSON.stringify(ranking));
+}, 20000);</code></pre>
+
+<h3>Las cinco estrategias, ordenadas por efectividad</h3>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Ganancia típica</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><strong>Sacarlo</strong></td><td>100% de su costo</td><td>Político. Alguien tiene que aceptar perder el dato o la función</td></tr>
+<tr><td><strong>Facade</strong>: un placeholder liviano que carga el widget al primer clic</td><td>80–95%. Un chat de 300 KB pasa a 2 KB para el 97% que nunca lo abre</td><td>Un clic extra para quien sí lo usa; el widget tarda en abrir la primera vez</td></tr>
+<tr><td><strong>Diferir a <em>idle</em></strong> (<code>requestIdleCallback</code>, o tras el LCP)</td><td>Saca el costo de la ventana crítica, no lo elimina</td><td>Analytics pierde eventos tempranos; los píxeles miden distinto</td></tr>
+<tr><td><strong>Iframe aislado</strong> con <code>sandbox</code> y <code>loading="lazy"</code></td><td>Aísla el layout y parte del costo</td><td>El iframe tiene su propio costo; comunicación por <code>postMessage</code></td></tr>
+<tr><td><strong>Tagging del lado del servidor</strong></td><td>Saca el JS del cliente casi por completo</td><td>Infraestructura propia, costo mensual, y el debugging se muda al backend</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-html">&lt;!-- Facade: 2 KB en vez de 300 KB para el 97% que nunca abre el chat --&gt;
+&lt;button id="abrir-chat" class="chat-facade" aria-haspopup="dialog"&gt;
+  💬 Hablar con nosotros
+&lt;/button&gt;
+
+&lt;script&gt;
+  document.getElementById('abrir-chat').addEventListener('click', function cargar() {
+    const s = document.createElement('script');
+    s.src = 'https://widget.chat-proveedor.com/loader.js';
+    s.async = true;
+    document.head.appendChild(s);
+    this.removeEventListener('click', cargar);   // una sola vez
+    this.textContent = 'Abriendo…';
+  }, { once: true });
+&lt;/script&gt;</code></pre>
+
+<div class="warn">
+  <strong>El costo real de un facade no es técnico.</strong> El widget deja de estar presente desde el segundo cero, y eso cambia métricas que otro equipo mira: sesiones de chat iniciadas, grabaciones capturadas, eventos de analytics tempranos. Si aparecés con el facade puesto y sin avisar, se revierte en una semana. Lo que funciona es llegar con el número: <em>"este widget nos cuesta 340 ms de INP en el p75 móvil; con el facade el 97% de los usuarios no lo paga y el 3% que lo abre espera 400 ms más"</em>. Con eso la decisión la toma el dueño del widget, con información, y suele decir que sí.
+</div>
+
+<h2>FS4.11 Fuentes web: FOIT, FOUT y su impacto en LCP y CLS</h2>
+
+<p>Las fuentes son el único recurso que puede empeorar <strong>las tres métricas a la vez</strong>: retrasan el pintado del texto (LCP), provocan un reflow al intercambiarse (CLS) y compiten por ancho de banda en el momento crítico.</p>
+
+<table>
+<thead><tr><th>Fenómeno</th><th>Qué ve el usuario</th><th>Impacto</th></tr></thead>
+<tbody>
+<tr><td><strong>FOIT</strong> (<em>Flash of Invisible Text</em>)</td><td>Espacio en blanco donde va el texto, hasta que llega la fuente</td><td>🔴 LCP: si el texto es tu elemento LCP, no se pinta. CLS: cero</td></tr>
+<tr><td><strong>FOUT</strong> (<em>Flash of Unstyled Text</em>)</td><td>El texto aparece con la fuente de sistema y después "salta" a la fuente real</td><td>🟢 LCP: rápido. 🔴 CLS: garantizado, salvo que las métricas coincidan</td></tr>
+</tbody>
+</table>
+
+<h3><code>font-display</code>: elegís cuál de los dos males</h3>
+
+<table>
+<thead><tr><th>Valor</th><th>Bloqueo</th><th>Intercambio</th><th>Resultado</th></tr></thead>
+<tbody>
+<tr><td><code>auto</code></td><td>Depende del navegador (≈3 s)</td><td>Sí</td><td>FOIT largo. No lo uses por omisión</td></tr>
+<tr><td><code>block</code></td><td>~3 s</td><td>Sí</td><td>FOIT máximo. Solo para logotipos o iconos donde el fallback sería inaceptable</td></tr>
+<tr><td><code>swap</code></td><td>0 ms</td><td>Infinito</td><td>FOUT. Mejor LCP, peor CLS. El default sensato <em>si</em> ajustás las métricas</td></tr>
+<tr><td><code>fallback</code></td><td>~100 ms</td><td>~3 s</td><td>Punto medio. FOIT corto, y si la fuente llega tarde ya no se intercambia</td></tr>
+<tr><td><code>optional</code></td><td>~100 ms</td><td>Ninguno</td><td><strong>CLS cero garantizado.</strong> Si la fuente no llegó a tiempo, esa visita usa el fallback y punto</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La decisión, en una frase.</strong> Si tu marca sobrevive a que la primera visita en una red mala se vea con la fuente de sistema, <code>optional</code> es la respuesta correcta: es la única que garantiza CLS cero y LCP sin bloqueo. Si la fuente es innegociable para la identidad, es <code>swap</code> <strong>más overrides de métricas</strong> — <code>swap</code> a secas es firmar un CLS y esperar que sea chico.
+</div>
+
+<h3>El arreglo que hace el 90% del trabajo: igualar las métricas del fallback</h3>
+
+<p>El salto de FOUT existe porque la fuente de sistema y la tuya tienen anchos y alturas distintos. Si declarás un <code>@font-face</code> "falso" que apunta a la fuente local y le corregís las métricas, el texto ocupa <strong>exactamente el mismo espacio</strong> antes y después del intercambio: el salto desaparece.</p>
+
+<pre><code class="lang-html">&lt;style&gt;
+/* 1. La fuente real, subseteada a latin, con swap */
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-latin-400.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+2000-206F, U+2074, U+20AC;  /* solo latin */
+}
+
+/* 2. El fallback con métricas ajustadas para que ocupe lo mismo.
+      Los valores salen de comparar las métricas de ambas fuentes (hay
+      generadores automáticos; NO los inventes a ojo). */
+@font-face {
+  font-family: 'Inter Fallback';
+  src: local('Arial');
+  size-adjust: 107%;
+  ascent-override: 90%;
+  descent-override: 22.5%;
+  line-gap-override: 0%;
+}
+
+/* 3. La cascada: mientras Inter no esté, se usa el fallback CORREGIDO */
+body {
+  font-family: 'Inter', 'Inter Fallback', system-ui, sans-serif;
+}
+&lt;/style&gt;
+
+&lt;!-- 4. Preload SOLO de la fuente que se usa arriba del pliegue.
+     crossorigin es OBLIGATORIO aunque sea del mismo origen: sin él,
+     el navegador la descarga DOS veces. --&gt;
+&lt;link rel="preload" href="/fonts/inter-latin-400.woff2"
+      as="font" type="font/woff2" crossorigin&gt;</code></pre>
+
+<h3>Subsetting: los números</h3>
+
+<table>
+<thead><tr><th>Archivo</th><th>Peso típico</th><th>Nota</th></tr></thead>
+<tbody>
+<tr><td>Variable completa (latin + cyrillic + greek + vietnamese)</td><td>110–180 KB</td><td>Lo que te dan por defecto si no pedís nada</td></tr>
+<tr><td>Variable, subset latin</td><td>25–40 KB</td><td>El caso normal de un sitio en español</td></tr>
+<tr><td>Estática 400, subset latin</td><td>15–22 KB</td><td>Una sola weight</td></tr>
+<tr><td>Estáticas 400 + 700, subset latin</td><td>30–45 KB</td><td><strong>Más que la variable con 5 pesos</strong> — de ahí el cálculo</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Cuándo la fuente variable es peor.</strong> Una variable trae todo el eje de pesos en un archivo. Si usás <strong>dos</strong> pesos, dos estáticas subseteadas suelen pesar lo mismo o menos. El punto de equilibrio está alrededor de <strong>tres pesos</strong>: de ahí para arriba, la variable gana; de ahí para abajo, medí. Y contá siempre el <em>subset</em>: una variable subseteada a latin le gana a casi cualquier combinación de estáticas sin subsetear.
+</div>
+
+<div class="mistake">
+  <strong>Google Fonts vía <code>&lt;link&gt;</code> es un tercero con dos saltos.</strong> Primero una petición a <code>fonts.googleapis.com</code> por el CSS —que <strong>bloquea el render</strong>— y recién cuando ese CSS llega, el navegador descubre el <code>woff2</code> en <code>fonts.gstatic.com</code>: segunda conexión, segundo handshake. Son cientos de milisegundos de <em>resource load delay</em> puro. Auto-hospedar la fuente (bajar el <code>woff2</code>, ponerlo en tu dominio, escribir el <code>@font-face</code> a mano) elimina el salto entero y te habilita el preload correcto. Es media hora de trabajo y es de las mejoras más rentables que existen.
+</div>
+
+<h2>FS4.12 Cuándo NO perseguir el 100 de Lighthouse</h2>
+
+<p>Todo lo anterior asume que mejorar la métrica vale la pena. A veces no.</p>
+
+<div class="rule">
+  <strong>📌 La métrica es un proxy del negocio, no el objetivo.</strong> LCP importa porque la gente abandona páginas lentas. Si en tu contexto la gente no abandona —una herramienta interna, un backoffice, una app con usuarios cautivos en una LAN— entonces el proxy se desconectó de la cosa que representaba, y seguir optimizándolo es trabajo puro sin retorno. <strong>El sitio más rápido que nadie usa no le sirve a nadie.</strong>
+</div>
+
+<h3>Las cuatro señales de que hay que parar</h3>
+
+<div class="step"><strong>1. Rendimientos decrecientes medidos.</strong> Bajar de 4,0 a 2,5 s de LCP suele ser semanas de trabajo con impacto claro. Bajar de 1,4 a 1,1 s es el mismo esfuerzo con un impacto que probablemente no puedas ni detectar estadísticamente. Si no podés medir la mejora en una métrica de negocio, no es una mejora: es una preferencia.</div>
+
+<div class="step"><strong>2. El score de Lighthouse es lo único que se mueve.</strong> Si el p75 de campo lleva tres sprints plano y solo sube el número del laboratorio, estás optimizando el instrumento y no el fenómeno. Frená.</div>
+
+<div class="step"><strong>3. El costo es una función que da plata.</strong> Sacar el widget de reseñas mejora el INP 90 ms y baja la conversión 4%. Es un mal negocio y hay que decirlo con esos números, no con el score.</div>
+
+<div class="step"><strong>4. Hay algo más roto.</strong> Accesibilidad rota (FS6), un bug de checkout, un formulario que pierde datos. La performance <em>nunca</em> gana la prioridad contra correctitud o contra "hay gente que directamente no puede usar el sitio".</div>
+
+<div class="danger">
+  <strong>Cuidado con la estadística prestada.</strong> "100 ms de mejora = 1% más de conversión" es un titular de un caso de estudio de una empresa que no es la tuya, en un mercado que no es el tuyo, en un año que ya pasó. Sirve para conseguir presupuesto para <em>medir</em>, no como resultado. La forma honesta de saber cuánto vale medio segundo en tu sitio es un <strong>holdout</strong>: servís la versión optimizada al 90% y la vieja al 10%, y comparás la métrica de negocio con su intervalo de confianza. Si no podés hacer eso, decí "creemos" en vez de "sabemos".
+</div>
+
+<h2>🧑‍🎓 Worked Example — "el carrito responde en medio segundo"</h2>
+
+<blockquote>E-commerce con SPA. El panel de campo muestra <strong>INP p75 = 480 ms en móvil</strong>, categoría "malo". El equipo ya pasó un sprint optimizando imágenes y bajó el LCP de 3,1 a 2,2 s. INP no se movió un milisegundo. ¿Por dónde se empieza?</blockquote>
+
+<p><strong>Paso 0 — Confirmar que el problema está donde parece.</strong> Lo primero no es abrir DevTools: es segmentar el campo. El p75 global es un promedio disfrazado (FS4.2).</p>
+
+<table>
+<thead><tr><th>Ruta · dispositivo</th><th>n</th><th>INP p75</th><th>INP p95</th></tr></thead>
+<tbody>
+<tr><td><code>/</code> · móvil</td><td>41.200</td><td>112 ms</td><td>240 ms</td></tr>
+<tr><td><code>/producto/:id</code> · móvil</td><td>28.700</td><td><strong>604 ms</strong></td><td>1.180 ms</td></tr>
+<tr><td><code>/checkout</code> · móvil</td><td>3.900</td><td>190 ms</td><td>420 ms</td></tr>
+<tr><td><code>/producto/:id</code> · escritorio</td><td>19.400</td><td>140 ms</td><td>310 ms</td></tr>
+</tbody>
+</table>
+
+<p>El problema es <strong>una ruta, en un tipo de dispositivo</strong>. En escritorio el mismo código corre en 140 ms: no es un bug lógico, es un problema de presupuesto de CPU. Optimizar la home habría sido tiempo tirado.</p>
+
+<p><strong>Paso 1 — Atribución: qué elemento y qué fase.</strong> Agrupamos los reportes de INP de esa ruta por <code>interactionTarget</code>:</p>
+
+<table>
+<thead><tr><th><code>interactionTarget</code></th><th>% de los INP de la ruta</th><th>p75</th></tr></thead>
+<tbody>
+<tr><td><code>button.add-to-cart</code></td><td><strong>62%</strong></td><td>648 ms</td></tr>
+<tr><td><code>.gallery-thumb</code></td><td>21%</td><td>210 ms</td></tr>
+<tr><td><code>select.talle</code></td><td>11%</td><td>180 ms</td></tr>
+<tr><td>resto</td><td>6%</td><td>—</td></tr>
+</tbody>
+</table>
+
+<p>Y el desglose de fases de ese botón, promediado sobre las peores interacciones:</p>
+
+<table>
+<thead><tr><th>Fase</th><th>ms</th><th>%</th><th>Lectura</th></tr></thead>
+<tbody>
+<tr><td>Input delay</td><td>40</td><td>8%</td><td>Poco. El hilo estaba razonablemente libre: no es un problema de carga</td></tr>
+<tr><td><strong>Processing duration</strong></td><td><strong>310</strong></td><td><strong>65%</strong></td><td>Acá está. Es <em>nuestro</em> handler</td></tr>
+<tr><td>Presentation delay</td><td>130</td><td>27%</td><td>Significativo: el repintado también es caro</td></tr>
+</tbody>
+</table>
+
+<p>El campo <code>longestScript.sourceURL</code> apunta a <code>/assets/cart.a91f.js</code>. No queda nada por adivinar.</p>
+
+<p><strong>Paso 2 — Leer el código culpable.</strong></p>
+
+<pre><code class="lang-javascript">// ❌ El handler original: todo sincrónico, y recién al final se ve algo
+function onAddToCart(producto) {
+  const carrito = agregarItem(estado.carrito, producto);
+
+  // (a) recalcula totales, impuestos y envío para los ~60 items del carrito
+  const totales = recalcularTotales(carrito);          // ~150 ms en gama media
+
+  // (b) serializa el carrito COMPLETO y lo escribe sincrónicamente
+  localStorage.setItem('carrito', JSON.stringify(carrito));   // ~55 ms
+
+  // (c) analytics sincrónico
+  window.dataLayer.push({ event: 'add_to_cart', items: carrito.items });  // ~40 ms
+
+  // (d) un setState en la raíz: re-renderiza las 60 filas del carrito
+  setEstado({ carrito: carrito, totales: totales });    // presentation delay ~130 ms
+}</code></pre>
+
+<p><strong>Paso 3 — Tres correcciones, cada una atacando una fase distinta.</strong></p>
+
+<pre><code class="lang-javascript">// ✅ Corrección 1: actualización optimista + yielding.
+//    Lo visible ocurre YA; lo caro ocurre después del pintado.
+async function onAddToCart(producto) {
+  // 1. Mutación mínima y visible: el usuario ve la respuesta en el próximo frame
+  setEstado(function (s) {
+    return { ...s, badgeCarrito: s.badgeCarrito + 1, ultimoAgregado: producto.id };
+  });
+
+  await cederHilo();   // el navegador pinta ANTES de que empiece el trabajo pesado
+
+  // 2. Corrección 2: cálculo incremental, no recálculo total.
+  //    El delta de un item no requiere recorrer los 60.
+  const carrito = agregarItem(estado.carrito, producto);
+  const totales = aplicarDelta(estado.totales, producto);      // ~4 ms en vez de ~150
+
+  // 3. La persistencia y el analytics no son urgentes: van cuando haya hueco
+  const idle = window.requestIdleCallback || function (f) { return setTimeout(f, 200); };
+  idle(function () {
+    localStorage.setItem('carrito', JSON.stringify(carrito));
+    window.dataLayer.push({ event: 'add_to_cart', items: carrito.items });
+  });
+
+  setEstado(function (s) { return { ...s, carrito: carrito, totales: totales }; });
+}</code></pre>
+
+<p>Y la tercera corrección ataca el <em>presentation delay</em>: la lista del carrito re-renderizaba sus 60 filas porque cada fila recibía un callback nuevo en cada render.</p>
+
+<pre><code class="lang-javascript">// ✅ Corrección 3: la fila se memoiza y el callback es estable.
+//    Ahora un "agregar" repinta 1 fila, no 60.
+const FilaCarrito = React.memo(function FilaCarrito(props) {
+  return (
+    &lt;li&gt;
+      &lt;span&gt;{props.nombre}&lt;/span&gt;
+      &lt;button onClick={function () { props.onQuitar(props.id); }}&gt;Quitar&lt;/button&gt;
+    &lt;/li&gt;
+  );
+});
+
+// El callback vive fuera del render: la identidad no cambia entre renders,
+// asi que React.memo puede cortar la propagacion de verdad.
+const onQuitar = useCallback(function (id) {
+  setEstado(function (s) { return { ...s, carrito: quitarItem(s.carrito, id) }; });
+}, []);</code></pre>
+
+<p><strong>Paso 4 — El antes y después, en campo, 14 días después del deploy.</strong></p>
+
+<table>
+<thead><tr><th>Fase / métrica</th><th>Antes (p75)</th><th>Después (p75)</th><th>Δ</th><th>Qué lo movió</th></tr></thead>
+<tbody>
+<tr><td>Input delay</td><td>40 ms</td><td>18 ms</td><td>−55%</td><td>Efecto secundario: menos trabajo en cola tras cada clic</td></tr>
+<tr><td>Processing duration</td><td>310 ms</td><td>95 ms</td><td><strong>−69%</strong></td><td>Cálculo incremental + persistencia diferida</td></tr>
+<tr><td>Presentation delay</td><td>130 ms</td><td>52 ms</td><td>−60%</td><td><code>memo</code> + callback estable: 1 fila en vez de 60</td></tr>
+<tr><td><strong>INP p75 · <code>/producto/:id</code> móvil</strong></td><td><strong>604 ms</strong></td><td><strong>165 ms</strong></td><td><strong>−73%</strong></td><td>🟢 pasó de "malo" a "bueno"</td></tr>
+<tr><td>INP p95 · misma ruta</td><td>1.180 ms</td><td>390 ms</td><td>−67%</td><td>La cola también se acomodó</td></tr>
+<tr><td>INP p75 global del sitio</td><td>480 ms</td><td>148 ms</td><td>−69%</td><td>La ruta era el 34% de las cargas</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 5 — Que no se degrade solo.</strong> Un arreglo sin guardia dura hasta el próximo refactor. Se dejan dos cosas:</p>
+
+<pre><code class="lang-javascript">// (1) Guardia en CI: un user flow de Lighthouse que hace clic en el boton
+//     y aserta la latencia de la interaccion. Rompe el build si vuelve a subir.
+//     Corre solo sobre /producto/:id, que es donde importa.
+const PRESUPUESTO_INTERACCION_MS = 200;
+
+// (2) Alerta de RUM: si el p75 de INP de esta ruta supera 250 ms
+//     durante 2 horas con n &gt;= 500, se abre un incidente automatico.
+//     El umbral de alerta va POR ENCIMA del objetivo (200), para no
+//     despertar a nadie por ruido estadistico.</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá <code>memo</code>".</strong> Es la secuencia: <strong>segmentar el campo → atribuir a un elemento → desglosar en fases → leer el código de esa fase → arreglar cada fase con su técnica → verificar en campo → dejar una guardia</strong>. Sin el paso de atribución, el equipo habría seguido optimizando imágenes tres sprints más, con toda la buena fe del mundo y cero resultado. Y notá el detalle que casi siempre se olvida: el <strong>presentation delay</strong> era el 27% del problema. Si solo hubieran cedido el hilo, se quedaban en ~250 ms y seguían reprobando.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>PageSpeed Insights te da 99 de performance y abajo dice que la URL no aprueba los Core Web Vitals. ¿Está roto?</summary>
+<p>No, están midiendo dos cosas distintas. El 99 es el <strong>score de laboratorio</strong>: una sola carga simulada, en un dispositivo emulado, sin caché, sin extensiones, y sobre todo <strong>sin nadie que interactúe</strong> — por eso INP ni siquiera aparece en ese número. El cartel de abajo es <strong>campo</strong>: el p75 de usuarios reales de Chrome en los últimos 28 días. Lo más probable es que estés fallando INP, que es invisible en el lab, o que tu tráfico real esté en dispositivos bastante peores que el emulado. Manda el campo: es lo que sienten los usuarios y es lo que usa Google. El laboratorio sirve para averiguar <em>por qué</em>, no para decidir <em>si</em>.</p></details>
+
+<details><summary>Tu INP p75 es 420 ms. El desglose muestra input delay 30 ms, processing 90 ms, presentation 300 ms. ¿Qué NO tiene sentido hacer?</summary>
+<p>No tiene sentido meter <code>scheduler.yield()</code> en los handlers, ni mover trabajo a un Web Worker, ni memoizar callbacks: todo eso ataca el <em>processing</em>, que ya son 90 ms y es la fase chica. El 71% del problema está en <strong>presentation delay</strong>, o sea en lo que hace el navegador después de tu código: style, layout, paint y composición. Las causas ahí son otras — DOM gigante, selectores CSS caros, layout thrashing, animar propiedades que disparan layout en vez de <code>transform</code>, o un re-render que toca demasiados nodos. La herramienta también es otra: el perfilador de DevTools y el pipeline de render de FS1, no el scheduler. Elegir la técnica sin mirar la fase es la forma más común de trabajar mucho y no mover el número.</p></details>
+
+<details><summary>¿Por qué un budget de LCP a 2.500 ms como <code>error</code> en CI suele terminar desactivado?</summary>
+<p>Por varianza. Los runners compartidos de CI tienen CPU variable, y entre dos corridas idénticas de la misma commit es normal ver ±10–15% en LCP. Con el umbral justo, el build empieza a fallar de forma aleatoria; el equipo aprende que "a veces falla y hay que re-correr"; a partir de ahí la alarma dejó de significar algo, y en algún sprint alguien la saca porque "molesta". La forma que sobrevive: asertar como <code>error</code> solo lo determinista o de baja varianza (bytes por tipo de recurso, cantidad de terceros, CLS, TBT con margen), dejar LCP y Speed Index en <code>warn</code>, y siempre sobre la <strong>mediana de 5 corridas</strong>. Un budget que grita en falso es peor que no tener budget, porque entrena al equipo a ignorar las alarmas.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>El campo manda, el laboratorio explica.</strong> CrUX y tu RUM dicen qué pasa; Lighthouse y DevTools dicen por qué. Optimizar contra el score de Lighthouse es optimizar el instrumento.</li>
+  <li><strong>p75, nunca promedio</strong>, y siempre segmentado por ruta × dispositivo, con el <code>n</code> a la vista. Un p75 global esconde la ruta que paga los sueldos.</li>
+  <li><strong>Umbrales vigentes a 2026</strong> (sin cambios desde 2024): LCP ≤ 2,5 s · INP ≤ 200 ms · CLS ≤ 0,10, en el p75.</li>
+  <li><strong>LCP se diagnostica por sus cuatro sub-partes</strong> (TTFB, load delay, load duration, render delay). Sin esa descomposición estás probando cosas al azar. Y jamás <code>loading="lazy"</code> en el elemento LCP.</li>
+  <li><strong>CLS usa ventana de sesión</strong>: se reporta la peor ráfaga, no la suma. El arreglo casi siempre es reservar el espacio correcto de antemano; <code>contain</code> no borra shifts visibles.</li>
+  <li><strong>INP reemplazó a FID en 2024</strong> y es mucho más duro porque incluye tu handler y el repintado. Se ataca por fase: input delay → yielding; processing → hacer menos y ceder; presentation → renderizar menos nodos.</li>
+  <li><strong>TBT es el proxy de INP en laboratorio</strong>: es lo que se asertá en CI, porque INP necesita un usuario que no existe ahí.</li>
+  <li><strong>Sin atribución no hay acción.</strong> <code>web-vitals</code> v6 con <code>web-vitals/attribution</code> te da el selector del elemento, las sub-partes y el script más largo vía LoAF. Enviar con <code>sendBeacon</code> en <code>visibilitychange → hidden</code>; nunca con <code>unload</code>, que rompe el bfcache.</li>
+  <li><strong>Un budget que no rompe el build es un deseo.</strong> Y uno que falla en falso se desactiva: <code>error</code> sobre métricas de baja varianza, <code>warn</code> sobre las ruidosas, mediana de 5 corridas, y trinquete que solo baja.</li>
+  <li><strong>Los terceros suelen ser el costo más grande</strong> y no están en tu repo. Se miden con LoAF por origen y con la prueba de bloqueo; se atacan con facades y carga diferida. El obstáculo es político, y se gana con números.</li>
+  <li><strong>Las fuentes tocan las tres métricas.</strong> <code>optional</code> garantiza CLS cero; <code>swap</code> exige overrides de métricas en el fallback. Auto-hospedar elimina dos saltos de red; <code>crossorigin</code> en el preload no es opcional.</li>
+  <li><strong>La métrica es un proxy del negocio.</strong> Si no podés medir la mejora en algo que le importe a alguien, ya no estás optimizando: estás decorando.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Elegí una URL pública con tráfico y compará su score de laboratorio de PageSpeed Insights con sus datos de campo. Escribí en tres líneas por qué difieren, usando las cinco razones de FS4.1.</li>
+  <li>Tomá 30 valores de LCP inventados pero realistas (con dos outliers) y calculá media, mediana, p75 y p95. Armá la tabla y explicá cuál usarías para un reporte a negocio y por qué.</li>
+  <li>Instrumentá una página tuya con <code>web-vitals/attribution</code> y volcá a la consola las cuatro sub-partes del LCP. Identificá cuál se lleva más del 40% y proponé un arreglo específico para <em>esa</em>.</li>
+  <li>Provocá un CLS deliberado: una imagen sin <code>width</code>/<code>height</code> más un banner inyectado con <code>setTimeout</code>. Medí el valor, arreglalo con <code>aspect-ratio</code> y espacio reservado, y documentá el antes y después.</li>
+  <li>Escribí un handler que haga trabajo sincrónico de ~300 ms y medí su INP en DevTools. Aplicale las dos técnicas de FS4.5 (actualización optimista y yielding con fallback) y comparalas por fase, no solo por el total.</li>
+  <li>Implementá <code>cederHilo()</code> con detección de <code>scheduler.yield</code>. Probá el mismo bucle cediendo cada iteración y cediendo cada 50 ms: medí el tiempo total en ambos casos y explicá el trade-off.</li>
+  <li>Armá un <code>lighthouserc.js</code> para un proyecto tuyo con al menos cinco aserciones, decidiendo cuáles van como <code>error</code> y cuáles como <code>warn</code>. Justificá cada elección con el criterio de varianza.</li>
+  <li>Instalá el observador de <code>long-animation-frame</code> de FS4.10 en una página con al menos dos scripts de terceros y armá el ranking de milisegundos por origen. ¿Cuánto de tu hilo principal no es tuyo?</li>
+  <li>Elegí una fuente web y calculá su costo real: peso completo vs subset latin, y el CLS con <code>swap</code> sin overrides vs con overrides vs <code>optional</code>. Recomendá una configuración y defendela.</li>
+  <li>Escribí el caso de "no optimizar": encontrá en algún proyecto una mejora de performance técnicamente correcta que <em>no</em> harías, y justificá la decisión con costo, beneficio esperado y qué medirías para cambiar de opinión.</li>
+</ol>
+
+<section class="quiz" id="quizFS4">
+  <style>
+    #quizFS4{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizFS4 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizFS4 .q{margin-bottom:1.5rem}
+    #quizFS4 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizFS4 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizFS4 .opt:hover{border-color:var(--accent)}
+    #quizFS4 .opt:disabled{cursor:default}
+    #quizFS4 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizFS4 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizFS4 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizFS4 .exp.show{display:block}
+    #quizFS4 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu equipo pasó un sprint comprimiendo imágenes y moviendo scripts a <code>defer</code>. El LCP p75 bajó de 3,1 a 2,2 s, pero el INP p75 sigue clavado en 470 ms. ¿Qué explica mejor lo que pasó?</p>
+    <button class="opt">El cambio todavía no llegó al campo: hay que esperar los 28 días de la ventana de CrUX</button>
+    <button class="opt">Las imágenes comprimidas empeoraron el <em>presentation delay</em> y compensaron la mejora</button>
+    <button class="opt">Todo lo que hicieron ataca la carga, y INP se juega después de cargar, en el código que corre cuando el usuario interactúa</button>
+    <div class="exp">Es el malentendido más caro del módulo. Comprimir imágenes, diferir scripts y mejorar el TTFB son palancas de <strong>carga</strong>: mueven LCP y FCP. INP mide la latencia de las interacciones —input delay + processing + presentation— y su causa habitual es un handler que hace trabajo sincrónico pesado o un re-render que toca demasiados nodos. Es perfectamente normal ver LCP mejorar 30% e INP no moverse un milisegundo. La opción de los 28 días no aplica acá: si estás mirando tu propio RUM, el dato es de horas, y aunque fuera CrUX, el LCP sí se movió con la misma latencia de reporte.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. En CI, ¿por qué se recomienda asertar el peso del bundle de JavaScript como <code>error</code> pero el LCP solo como <code>warn</code>?</p>
+    <button class="opt">Porque los bytes son deterministas y el LCP en un runner compartido varía ±10–15% entre corridas idénticas</button>
+    <button class="opt">Porque el LCP no se puede medir en laboratorio, solo en campo</button>
+    <button class="opt">Porque Lighthouse CI no soporta aserciones numéricas sobre métricas de tiempo</button>
+    <div class="exp">Es una decisión sobre varianza, no sobre importancia. El peso de un bundle es una función determinista del código: dos corridas del mismo commit dan el mismo número, así que un fallo siempre significa algo. El LCP en un runner compartido depende de la CPU que te tocó, y oscila lo suficiente como para fallar en falso con umbrales ajustados. Un build que falla al azar entrena al equipo a re-correr sin mirar, y a los dos meses alguien saca la aserción. La mitigación es mediana de varias corridas y severidad acorde a la varianza. LCP <em>sí</em> se mide en lab (lo que no se puede medir sin interacción es INP), y LHCI sí soporta <code>maxNumericValue</code>.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tenés una fuente de marca innegociable y tu elemento LCP es un titular grande. Elegís <code>font-display: swap</code> sin tocar nada más. ¿Cuál es la consecuencia más probable?</p>
+    <button class="opt">FOIT largo: el titular queda invisible hasta 3 segundos y el LCP se dispara</button>
+    <button class="opt">Buen LCP porque el texto pinta enseguida con el fallback, pero un CLS garantizado cuando la fuente real entra y cambia las métricas del texto</button>
+    <button class="opt">Ningún efecto medible: <code>font-display</code> solo afecta a los iconos y a las fuentes decorativas</button>
+    <div class="exp"><code>swap</code> tiene período de bloqueo cero: el texto se pinta de inmediato con la fuente de respaldo, así que el LCP queda bien. El precio es el FOUT: cuando llega la fuente real, el texto se re-mide con anchos y alturas distintos, se reacomoda y eso es un <em>layout shift</em> — encima en un titular grande, que ocupa mucho viewport, o sea con fracción de impacto alta. El arreglo no es cambiar de valor sino <strong>igualar las métricas del fallback</strong> con <code>size-adjust</code>, <code>ascent-override</code> y <code>descent-override</code> en un <code>@font-face</code> local. Si la marca sí fuera negociable, <code>optional</code> garantizaría CLS cero a costa de que algunas primeras visitas no vean la fuente.</div>
+  </div>
+
+  <div class="score" id="scoreFS4"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizFS4');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreFS4').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con FS5.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../fs3-red-protocolos/lecture.html">← FS3: Red y protocolos</a>
+  <a href="../fs5-css-escala/lecture.html">FS5: CSS a escala →</a>
+</nav>
+
+</div>
+</body>
+</html>

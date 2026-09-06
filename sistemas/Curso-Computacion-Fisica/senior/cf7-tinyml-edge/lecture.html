@@ -1,0 +1,947 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CF7 — TinyML: inferencia en un microcontrolador de 256 KB · Computación Física Senior</title>
+  <meta name="description" content="Desplegar un modelo en un MCU bajo restricciones extremas: presupuesto de RAM, flash, ciclos y energía; cuantización int8, pruning y destilación; el pipeline hasta el array en C; preprocesamiento idéntico al del entrenamiento; medición en el dispositivo; y cuándo un umbral bien puesto le gana al modelo.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física Senior</a>
+  <a href="../../index.html">⚡ Curso de Computación Física</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CF7</span>
+  <span class="badge">⏱ 50–115 min</span>
+  <span class="badge">🎯 Pre-req: E07 DSP · CF2 · CF3</span>
+  <span class="badge">🧠 TinyML / Edge AI</span>
+</div>
+
+<article>
+
+<h1>CF7 — TinyML: inferencia en un microcontrolador de 256 KB</h1>
+
+<h2>CF7.0 Por qué este módulo</h2>
+
+<p>Hay una forma cómoda y equivocada de contar TinyML: "es lo mismo que hacés en la nube, pero con un modelo más chico". Si arrancás por ahí, vas a terminar con un modelo que anda impecable en el notebook y que en la placa no entra, o entra pero tarda 4 segundos, o entra y es rápido pero clasifica cualquier cosa porque el preprocesamiento no es el mismo.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Correr un modelo en el dispositivo no es "IA en chiquito": es una <strong>disciplina de restricciones</strong>. Tenés cuatro presupuestos simultáneos —RAM, flash, ciclos y energía— y las cuatro cuentas tienen que cerrar al mismo tiempo. Cada técnica que vas a aprender acá (cuantizar, podar, destilar) compra espacio en uno de esos presupuestos <em>pagando</em> en otro lado: exactitud, tiempo de ingeniería o capacidad de depurar.
+</div>
+
+<p>Y hay una segunda tesis, incómoda, que la industria tarda en decir en voz alta: <strong>la primera pregunta honesta no es "qué modelo uso", es "hace falta un modelo?"</strong>. Una porción enorme de los problemas que se plantean como TinyML se resuelven con un umbral bien puesto, una FFT y una máquina de estados de veinte líneas — más barato, determinista, explicable y depurable. Este módulo te da las herramientas para desplegar el modelo, y también el criterio para no desplegarlo.</p>
+
+<div class="info">
+  <strong>Qué NO vas a encontrar acá.</strong> No explicamos la FFT ni el diseño de filtros: eso es <a href="../../e07-dsp/lecture.html">E07 — DSP</a>. Tampoco explicamos cómo se entrena una red, cómo se evalúa ni cómo se elige la arquitectura: eso es el <a href="../../../../datos-ia/Curso-Datos-ML/index.html">Curso de Datos &amp; ML</a> y su track senior. Acá empezamos donde ese curso termina: <strong>tenés un modelo entrenado y tenés que meterlo en un chip de tres dólares</strong>.
+</div>
+
+<h2>CF7.1 Por qué en el borde y no en la nube</h2>
+
+<p>La arquitectura por defecto de la última década fue: el dispositivo mide, transmite, y un servidor decide. Funciona, es fácil de actualizar y te deja usar el modelo que quieras. Hay cuatro razones concretas —no ideológicas— por las que a veces no sirve.</p>
+
+<div class="step"><strong>1. Latencia.</strong> Un lazo de control o una parada de emergencia no puede depender de un round-trip. Un enlace celular decente son 80–200 ms de ida y vuelta; uno malo, o congestionado, son segundos. Si tu decisión tiene que ocurrir en menos de 50 ms de forma <em>garantizada</em>, la red no es una opción — es un requisito de tiempo real, y eso es <a href="../cf1-tiempo-real-rtos/lecture.html">CF1</a>.</div>
+
+<div class="step"><strong>2. Privacidad.</strong> Si el dato no sale del dispositivo, no hay brecha posible, no hay retención que auditar y no hay transferencia internacional que justificar. Un detector de palabra clave que procesa el audio localmente y solo emite un booleano cambia por completo la conversación regulatoria respecto de uno que sube el audio.</div>
+
+<div class="step"><strong>3. Energía.</strong> El argumento que más sorprende: <strong>transmitir es dramáticamente más caro que calcular</strong>. En el equipo del ejemplo de este módulo, mandar un byte por BLE cuesta unos 6 µJ; un ciclo del Cortex-M4 a 80 MHz cuesta 0,375 nJ. Es decir: <strong>transmitir un byte equivale a unos 16.000 ciclos de CPU</strong>. Si podés reemplazar 2 KB de señal cruda por 1 byte de veredicto, la cuenta ni se discute. Esto se desarrolla en <a href="../cf3-energia/lecture.html">CF3 — Energía</a>.</div>
+
+<div class="step"><strong>4. Funcionamiento sin conectividad.</strong> Un sensor en un subsuelo, un tractor en el campo, un contenedor en un barco. Si el requisito es "tiene que seguir decidiendo cuando no hay red", la nube deja de ser una arquitectura y pasa a ser una dependencia.</div>
+
+<table>
+<thead><tr><th>Situación</th><th>Gana la nube</th><th>Gana el borde</th><th>Gana el híbrido</th></tr></thead>
+<tbody>
+<tr><td>Modelo grande, cambia seguido, hay red y energía</td><td>✅</td><td></td><td></td></tr>
+<tr><td>Decisión en &lt;50 ms garantizados</td><td></td><td>✅</td><td></td></tr>
+<tr><td>Dato sensible (audio, video, salud)</td><td></td><td>✅</td><td>Borde filtra, nube analiza lo relevante</td></tr>
+<tr><td>Batería, años de autonomía</td><td></td><td>✅</td><td></td></tr>
+<tr><td>Conectividad intermitente</td><td></td><td>✅</td><td>Borde decide, sincroniza cuando puede</td></tr>
+<tr><td>Hay que auditar y reentrenar con datos reales</td><td>✅</td><td></td><td>Borde detecta, sube solo los casos dudosos</td></tr>
+<tr><td>Muchos dispositivos, hardware barato, poca lógica</td><td>✅</td><td></td><td></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El patrón que gana casi siempre no es "borde" ni "nube": es el híbrido asimétrico.</strong> El dispositivo corre un modelo chico y barato que descarta el 99% de los casos aburridos, y solo cuando duda —o cuando detecta algo— manda datos. La nube tiene el modelo grande y el histórico. La energía y la privacidad se cuidan en el borde; la capacidad y la evolución, en el servidor. Diseñar ese reparto <em>es</em> el trabajo de arquitectura.
+</div>
+
+<h2>CF7.2 El presupuesto real: qué significa "cabe"</h2>
+
+<p>Vamos a fijar un objetivo concreto para que todos los números del módulo signifiquen algo. El equipo de referencia:</p>
+
+<table>
+<thead><tr><th>Recurso</th><th>Total</th><th>Ya comprometido</th><th>Libre para ML</th></tr></thead>
+<tbody>
+<tr><td>Flash</td><td>256 KB</td><td>78 KB (HAL, drivers, scheduler, protocolo)</td><td><strong>178 KB</strong></td></tr>
+<tr><td>RAM</td><td>64 KB</td><td>22 KB (stack, colas, buffers de driver)</td><td><strong>42 KB</strong></td></tr>
+<tr><td>CPU</td><td>Cortex-M4F @ 80 MHz</td><td>Ciclo de 60 s, ~5% de uso</td><td><strong>~40 ms por ciclo</strong></td></tr>
+<tr><td>Energía</td><td>CR2032, 225 mAh @ 3,0 V ≈ 2430 J</td><td>Objetivo: 2 años</td><td><strong>~2,7 mJ por ciclo</strong></td></tr>
+</tbody>
+</table>
+
+<p>Ese último renglón sale de una división que conviene hacer antes de escribir una línea de código: <code>1944 J útiles / (2 años × 365 × 1440 ciclos) ≈ 1,85 mJ</code> por ciclo, dejando margen. Si tu inferencia sola cuesta más que eso, el producto no existe — y lo sabés en el minuto cero, no después de tres meses.</p>
+
+<div class="concept">
+  <strong>💡 "Cabe" son tres cosas distintas, y se calculan por separado.</strong>
+  <br><strong>(1) Flash</strong> = pesos del modelo + runtime + kernels + tablas de preprocesamiento. Es estático y lo sabés en tiempo de compilación.
+  <br><strong>(2) RAM</strong> = la <em>arena de tensores</em>, que <strong>no</strong> es la suma de todas las activaciones: el runtime reutiliza buffers, así que el pico es aproximadamente el par de tensores más grande que coexiste, más los buffers de trabajo de los kernels.
+  <br><strong>(3) Ciclos</strong> = MAC totales × ciclos por MAC ÷ frecuencia. Y la energía es potencia × ese tiempo.
+</div>
+
+<p>Antes de convertir nada, medí el modelo con el que pensás salir. Este script contesta las tres preguntas en la PC:</p>
+
+<pre><code class="lang-python">import numpy as np, tensorflow as tf
+
+def presupuesto(ruta_tflite: str, ciclos_por_mac: float = 2.0, f_cpu_hz: int = 80_000_000):
+    """Estima flash, RAM de arena y latencia de un .tflite ya cuantizado."""
+    interp = tf.lite.Interpreter(model_path=ruta_tflite)
+    interp.allocate_tensors()
+
+    pesos = len(open(ruta_tflite, "rb").read())
+
+    # Pico de activaciones: aproximación por el mayor par consecutivo.
+    tam = []
+    for d in interp.get_tensor_details():
+        n = int(np.prod(d["shape"])) if len(d["shape"]) else 0
+        tam.append(n * np.dtype(d["dtype"]).itemsize)
+    pico = max(a + b for a, b in zip(tam, tam[1:])) if len(tam) &gt; 1 else max(tam)
+
+    macs = estimar_macs(interp)          # ver ejercicio 1
+    ciclos = macs * ciclos_por_mac
+    ms = 1000 * ciclos / f_cpu_hz
+
+    print(f"flash del modelo : {pesos/1024:7.1f} KB")
+    print(f"arena estimada   : {pico/1024:7.1f} KB   (+ scratch de kernels)")
+    print(f"MAC              : {macs/1000:7.0f} K")
+    print(f"latencia estimada: {ms:7.1f} ms  @ {f_cpu_hz/1e6:.0f} MHz")
+    return pesos, pico, macs</code></pre>
+
+<div class="warn">
+  <strong>La estimación de arena es un piso, no el número final.</strong> Los kernels de convolución de CMSIS-NN piden un buffer de trabajo (<em>im2col</em>) que puede sumar varios KB, y el planificador de memoria del runtime tiene su propio <em>overhead</em>. El único número que vale es el que reporta <code>arena_used_bytes()</code> <strong>en la placa</strong> — lo vemos en CF7.8. Usá esta estimación para descartar rápido, no para aprobar.
+</div>
+
+<h3>Por qué un modelo de 4 MB simplemente no entra</h3>
+
+<p>Tomemos MobileNetV2 (1.0, 224×224), el caballito de batalla de la visión móvil: 3,5 M de parámetros. En float32 son <strong>14 MB</strong>. Cuantizado a int8 son <strong>3,5 MB</strong>. Contra 178 KB libres, la cuantización te dejó a un factor 20 de distancia. Y aunque un genio te consiguiera la memoria:</p>
+
+<pre><code class="lang-bash"># MobileNetV2 224x224 hace ~300 M MAC por inferencia.
+# En un Cortex-M4F a 80 MHz, con CMSIS-NN, ~2 ciclos por MAC:
+#   300e6 * 2 / 80e6  =  7,5 segundos por imagen
+#   7,5 s * 30 mW     =  225 mJ por inferencia
+# El presupuesto era 1,85 mJ por ciclo. Estás 120 veces afuera.</code></pre>
+
+<div class="rule">
+  <strong>📌 La cuantización te da 4×, no 40×.</strong> Es un factor fijo y conocido. Si tu modelo está a más de un factor 4 de entrar, <strong>el problema no es el cuantizador: es la arquitectura</strong>. Cambiar de MobileNetV2 a una red diseñada para el borde no es una optimización, es una decisión de diseño que se toma antes de entrenar.
+</div>
+
+<div class="analogy">
+  <strong>Pensalo como una mudanza.</strong> Cuantizar es meter la ropa al vacío: siempre te da el mismo 4×, sin discusión. Podar es tirar lo que no usás: te da mucho o poco según cuánto acumulaste. Destilar es comprar muebles del tamaño del departamento nuevo en vez de tratar de encoger los viejos. Y si el sillón mide el doble que la puerta, ninguna de las tres te salva: necesitás otro sillón.
+</div>
+
+<h2>CF7.3 Cuantización: de float32 a int8</h2>
+
+<p>Cuantizar es representar cada tensor con enteros de 8 bits más dos números que describen cómo mapearlos de vuelta a reales. El esquema afín que usa el ecosistema es:</p>
+
+<pre><code class="lang-python"># r = valor real,  q = entero de 8 bits,  S = escala (float),  Z = punto cero (int)
+#
+#     r  =  S * (q - Z)
+#     q  =  round(r / S) + Z,   saturado a [-128, 127]
+#
+# S y Z salen del RANGO observado del tensor:
+#     S = (r_max - r_min) / 255
+#     Z = round(-r_min / S) - 128</code></pre>
+
+<p>Tres consecuencias que hay que tener presentes:</p>
+
+<div class="step"><strong>1. Ganás memoria y ancho de banda por igual.</strong> 4× menos flash para los pesos, y 4× menos tráfico entre la RAM y la CPU. En un MCU, donde el cuello de botella suele ser la memoria y no la ALU, ese segundo efecto vale tanto como el primero.</div>
+
+<div class="step"><strong>2. Ganás velocidad, y cuánto depende del núcleo.</strong> En un Cortex-M4F —que tiene FPU de precisión simple— int8 con CMSIS-NN rinde unas 2–4× más que float32, porque las instrucciones SIMD (<code>SMLAD</code>) hacen dos MAC de 16 bits por ciclo. En un Cortex-M0+, que <strong>no tiene FPU</strong>, el float se emula por software y la diferencia sube a 10–30×. En un M55 con Helium, más todavía.</div>
+
+<div class="step"><strong>3. Perdés exactitud, y cuánto depende de cómo lo hagas.</strong> Este es el punto donde se juega todo.</div>
+
+<h3>Post-training (PTQ) versus quantization-aware training (QAT)</h3>
+
+<table>
+<thead><tr><th></th><th>PTQ (post-entrenamiento)</th><th>QAT (entrenamiento consciente)</th></tr></thead>
+<tbody>
+<tr><td>Qué necesitás</td><td>El modelo entrenado + 100–500 muestras representativas</td><td>El pipeline de entrenamiento completo + datos + GPU</td></tr>
+<tr><td>Tiempo</td><td>Minutos</td><td>Horas o días (re-entrenamiento o fine-tuning)</td></tr>
+<tr><td>Caída típica en CNN de visión</td><td>0,1 – 1 punto porcentual</td><td>&lt; 0,5 pp, a veces mejor que el float</td></tr>
+<tr><td>Caída en modelos chicos o mal condicionados</td><td>2 – 8 pp, y a veces catastrófica</td><td>Normalmente recupera casi todo</td></tr>
+<tr><td>Cuándo usarlo</td><td>Siempre primero — es tu línea base</td><td>Cuando PTQ pierde más de lo que podés tolerar</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Números publicados de referencia para PTQ int8 sobre redes de visión clásicas: ResNet50 pierde ~0,07 pp, MobileNetV2 ~0,58 pp, SqueezeNet ~0,65 pp. <strong>Esas cifras son de redes grandes, sobreparametrizadas y bien condicionadas.</strong> Tu red de 40 K parámetros no tiene esa redundancia: no supongas que te va a ir igual. Medilo.
+</div>
+
+<h3>El rango dinámico y la calibración: donde se pierde de verdad</h3>
+
+<p>La escala <code>S</code> se calcula a partir del rango observado del tensor. Si tu conjunto de calibración no contiene los extremos que el sensor va a ver en producción, la escala queda mal y todo el resto se degrada en cascada. Y si un tensor tiene un rango enorme por unos pocos valores atípicos, esos atípicos se comen toda la resolución de los 256 niveles.</p>
+
+<div class="mistake">
+  <strong>El error clásico:</strong> calibrar con datos limpios de laboratorio y desplegar en una planta. El acelerómetro que en la mesa nunca pasó de ±2 g en la planta ve golpes de ±8 g. La escala se calculó para ±2 g, todo lo que exceda satura a 127, y el modelo deja de distinguir "vibración fuerte" de "impacto". No falla con un error: falla clasificando mal, en silencio, justo en los casos que más importan.
+</div>
+
+<pre><code class="lang-python">import numpy as np, tensorflow as tf
+from typing import Iterator
+
+VENTANA = (1, 64, 32, 1)      # espectrograma: 64 bandas x 32 tramas
+
+def dataset_representativo(x_cal: np.ndarray) -&gt; Iterator[list]:
+    """100-500 muestras que CUBRAN el rango real de operacion:
+    reposo, carga nominal, sobrecarga, arranque, y las fallas conocidas."""
+    for i in range(min(len(x_cal), 300)):
+        yield [x_cal[i].reshape(VENTANA).astype(np.float32)]
+
+conv = tf.lite.TFLiteConverter.from_saved_model("modelo_float/")
+conv.optimizations = [tf.lite.Optimize.DEFAULT]
+conv.representative_dataset = lambda: dataset_representativo(x_cal)
+
+# Full-integer: TODO en int8, incluidas entrada y salida.
+# Sin estas tres lineas quedan operadores en float y el MCU no los puede correr.
+conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+conv.inference_input_type  = tf.int8
+conv.inference_output_type = tf.int8
+
+modelo_int8 = conv.convert()
+open("modelo_int8.tflite", "wb").write(modelo_int8)</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Verificá que la cuantización fue completa, siempre.</strong> Si te olvidás de <code>supported_ops</code> o el conversor no puede cuantizar un operador, obtenés un modelo <em>híbrido</em>: pesos en int8 pero activaciones en float. Eso funciona perfecto en la PC y en la placa te tira un error de operador no soportado — o peor, arrastra kernels de float que inflan el binario 15 KB sin que entiendas por qué. El chequeo es de tres líneas y va en tu CI.
+</div>
+
+<pre><code class="lang-python">def verificar_int8_completo(ruta: str) -&gt; None:
+    interp = tf.lite.Interpreter(model_path=ruta)
+    interp.allocate_tensors()
+    ent, sal = interp.get_input_details()[0], interp.get_output_details()[0]
+    assert ent["dtype"] == np.int8, f"entrada quedo en {ent['dtype']}"
+    assert sal["dtype"] == np.int8, f"salida quedo en {sal['dtype']}"
+
+    flotantes = [d["name"] for d in interp.get_tensor_details()
+                 if d["dtype"] == np.float32 and d["shape"].size]
+    assert not flotantes, f"tensores en float32 sobrevivientes: {flotantes[:5]}"
+
+def medir_caida(x_test, y_test, ruta_int8: str, acc_float: float) -&gt; float:
+    interp = tf.lite.Interpreter(model_path=ruta_int8); interp.allocate_tensors()
+    ent, sal = interp.get_input_details()[0], interp.get_output_details()[0]
+    S, Z = ent["quantization"]                       # escala y punto cero de la ENTRADA
+    ok = 0
+    for x, y in zip(x_test, y_test):
+        q = np.clip(np.round(x / S) + Z, -128, 127).astype(np.int8)
+        interp.set_tensor(ent["index"], q.reshape(ent["shape"]))
+        interp.invoke()
+        ok += int(np.argmax(interp.get_tensor(sal["index"])) == y)
+    acc_int8 = ok / len(y_test)
+    print(f"float32 {acc_float:.3%} -&gt; int8 {acc_int8:.3%} "
+          f"(caida {100*(acc_float-acc_int8):.2f} pp)")
+    return acc_int8</code></pre>
+
+<div class="tip">
+  Cuando PTQ pierde demasiado, antes de saltar a QAT probá dos cosas más baratas: <strong>(a)</strong> cuantización <em>per-channel</em> para los pesos de convolución (es el default del conversor moderno, pero verificá que esté activa) y <strong>(b)</strong> ampliar y diversificar el set de calibración. En la práctica, más de la mitad de las "caídas inaceptables de PTQ" son en realidad sets de calibración pobres.
+</div>
+
+<pre><code class="lang-python"># QAT: se entrena con la cuantizacion simulada en el grafo (fake-quant),
+# asi el optimizador aprende pesos que sobreviven al redondeo.
+import tensorflow_model_optimization as tfmot
+
+modelo_qat = tfmot.quantization.keras.quantize_model(modelo_float)
+modelo_qat.compile(optimizer=tf.keras.optimizers.Adam(1e-4),   # LR bajo: es fine-tuning
+                   loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+modelo_qat.fit(x_train, y_train, epochs=8, validation_data=(x_val, y_val))
+
+# El conversor reconoce los nodos fake-quant y usa ESAS escalas.
+conv = tf.lite.TFLiteConverter.from_keras_model(modelo_qat)
+conv.optimizations = [tf.lite.Optimize.DEFAULT]
+conv.representative_dataset = lambda: dataset_representativo(x_cal)
+conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+conv.inference_input_type = conv.inference_output_type = tf.int8
+open("modelo_qat_int8.tflite", "wb").write(conv.convert())</code></pre>
+
+<div class="warn">
+  <strong>El costo real de QAT no es la GPU: es el pipeline.</strong> QAT te obliga a tener el entrenamiento reproducible, los datos versionados y la validación automatizada — porque vas a reentrenar cada vez que cambie algo. Si tu entrenamiento vive en un notebook que solo corre en la máquina de una persona, QAT no es una técnica: es una deuda. Eso se resuelve en <a href="../../../../datos-ia/Curso-Datos-ML/senior/ds2-entrenamiento/lecture.html">Datos &amp; ML Senior · DS2</a>.
+</div>
+
+<h2>CF7.4 Podar, destilar y elegir bien la arquitectura</h2>
+
+<p>Cuantizar es obligatorio y casi gratis. Las otras tres técnicas son opcionales, y cada una tiene una condición de aplicabilidad que conviene conocer antes de gastar una semana.</p>
+
+<h3>Pruning (poda)</h3>
+
+<p>Poner en cero los pesos de menor magnitud y reentrenar para recuperar. Podés llegar a 50–90% de ceros con poca pérdida. El detalle que decide todo:</p>
+
+<div class="mistake">
+  <strong>La poda no estructurada no te ahorra ni un ciclo en un MCU.</strong> Un peso en cero sigue ocupando su byte y sigue pasando por la multiplicación, salvo que tengas un formato disperso y un kernel que lo aproveche — y los kernels de MCU son densos. Lo único que ganás es <strong>compresión del binario</strong>: un tensor con 80% de ceros comprime muy bien, así que sirve si el cuello está en el <em>tamaño de la actualización OTA</em>, no en la RAM ni en la latencia.
+  <br><br>Lo que sí sirve en un MCU es la <strong>poda estructurada</strong>: eliminar canales o filtros enteros. Eso cambia la forma del tensor, y ahí sí desaparecen los pesos, las activaciones y los MAC. Cuesta más exactitud por parámetro eliminado, pero es la única que se traduce en milisegundos.
+</div>
+
+<h3>Destilación de conocimiento</h3>
+
+<p>Entrenás una red chica (<em>alumno</em>) para imitar las salidas blandas de una red grande (<em>maestro</em>), en vez de imitar solo las etiquetas duras. Las probabilidades del maestro cargan información que la etiqueta no tiene: que un rodamiento gastado "se parece" un poco a un desbalanceo, por ejemplo. El alumno aprende esa estructura.</p>
+
+<div class="tip">
+  <strong>Dónde la destilación paga de verdad:</strong> cuando tenés pocos datos etiquetados pero muchos <em>sin</em> etiquetar. Etiquetás lo no etiquetado con el maestro y entrenás al alumno sobre ese conjunto ampliado. Es la forma más eficiente de convertir un modelo grande que ya funciona en uno chico que también funciona, y suele dar 1–3 pp por encima de entrenar la red chica desde cero.
+</div>
+
+<h3>Arquitecturas pensadas para el borde</h3>
+
+<p>La familia MobileNet popularizó la <strong>convolución separable en profundidad</strong> (<em>depthwise separable</em>), que es la técnica estructural más importante de TinyML. Reemplaza una convolución estándar por dos:</p>
+
+<pre><code class="lang-python"># Convolucion estandar 3x3, C_in=64 -&gt; C_out=128, sobre un mapa de 8x4
+#   MAC = 8*4*128*3*3*64          = 2.359.296
+#   pesos = 3*3*64*128            =    73.728
+#
+# Separable: depthwise 3x3 (un filtro por canal) + pointwise 1x1 (mezcla canales)
+#   MAC = 8*4*64*3*3  +  8*4*64*128 = 18.432 + 262.144 = 280.576   (8,4x menos)
+#   pesos = 3*3*64    +  64*128     =    576 +   8.192 =   8.768   (8,4x menos)
+#
+# La ganancia tiende a  1/C_out + 1/k^2  =  1/128 + 1/9  ~=  0,119</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué funciona.</strong> Una convolución estándar hace dos trabajos a la vez: filtrar espacialmente y mezclar canales. La separable los divide, y resulta que hacerlos por separado con más capas cuesta casi un orden de magnitud menos y pierde muy poca capacidad representativa. <strong>Ese es el motivo por el que una red del borde no es "una red grande recortada": es una red con otra estructura interna.</strong>
+</div>
+
+<table>
+<thead><tr><th>Técnica</th><th>Ganancia típica</th><th>Qué te cuesta</th><th>Cuándo NO usarla</th></tr></thead>
+<tbody>
+<tr><td>Cuantización int8</td><td>4× flash, 2–4× velocidad (M4F)</td><td>0,1–2 pp de exactitud, calibrar bien</td><td>Nunca: siempre se hace</td></tr>
+<tr><td>QAT</td><td>Recupera casi toda la caída de PTQ</td><td>Reentrenar; pipeline reproducible</td><td>Si PTQ ya te da lo que necesitás</td></tr>
+<tr><td>Poda no estructurada</td><td>Solo comprime el binario (OTA)</td><td>Reentrenar; ninguna ganancia en RAM/ciclos</td><td>Si el problema es RAM o latencia</td></tr>
+<tr><td>Poda estructurada</td><td>Proporcional a los canales quitados</td><td>Más pérdida por parámetro; reentrenar</td><td>Si la red ya nació chica</td></tr>
+<tr><td>Destilación</td><td>1–3 pp sobre entrenar la chica sola</td><td>Necesitás un maestro bueno + datos sin etiquetar</td><td>Si no tenés un maestro que funcione</td></tr>
+<tr><td>Arquitectura separable</td><td>5–10× MAC y pesos</td><td>Se decide antes de entrenar</td><td>Redes ya diseñadas para el borde</td></tr>
+</tbody>
+</table>
+
+<h2>CF7.5 El pipeline completo: de la PC al array en C</h2>
+
+<p>Cinco etapas, y cada una tiene su forma de fallar en silencio.</p>
+
+<div class="step"><strong>1. Entrenar en la PC.</strong> Con datos que se parezcan a los del sensor real, no a los del dataset público. Esto es <a href="../../../../datos-ia/Curso-Datos-ML/senior/ds2-entrenamiento/lecture.html">DS2 — Entrenamiento</a>, y no se toca en este módulo.</div>
+<div class="step"><strong>2. Convertir</strong> a un formato que el runtime del MCU entienda (FlatBuffer <code>.tflite</code>).</div>
+<div class="step"><strong>3. Cuantizar</strong> a int8 completo, con set de calibración representativo.</div>
+<div class="step"><strong>4. Empotrar</strong> el modelo como un arreglo de bytes en la flash del firmware.</div>
+<div class="step"><strong>5. Inferir</strong> desde C++, con una arena de tensores estática y sin una sola llamada a <code>malloc</code>.</div>
+
+<pre><code class="lang-bash"># Paso 4 — el .tflite se convierte en un array C alineado.
+xxd -i modelo_int8.tflite &gt; modelo_int8.cc
+
+# Verificaciones que van en el Makefile, no en tu cabeza:
+ls -l modelo_int8.tflite               # 47104 bytes -&gt; contra el presupuesto de flash
+sha256sum modelo_int8.tflite           # el hash va al firmware Y al registro de despliegue
+
+# Si tu toolchain no trae xxd, cualquiera de estas sirve:
+python -c "import sys;d=open('modelo_int8.tflite','rb').read();\
+print(','.join(str(b) for b in d))" &gt; modelo_bytes.txt</code></pre>
+
+<pre><code class="lang-c">/* modelo_int8.cc — generado, NO se edita a mano.
+   La alineacion a 16 bytes NO es opcional: el FlatBuffer se lee con
+   accesos alineados y en Cortex-M un desalineado te da un HardFault. */
+#include &lt;stdint.h&gt;
+
+alignas(16) const unsigned char g_modelo_int8[] = {
+  0x1c, 0x00, 0x00, 0x00, 0x54, 0x46, 0x4c, 0x33, /* ... 47104 bytes ... */
+};
+const unsigned int g_modelo_int8_len = 47104;
+
+/* El hash viaja con el modelo: sin esto no podes saber que binario
+   esta corriendo un equipo en campo (ver CF7.11). */
+const char g_modelo_sha256[] = "9f2c...";
+const uint16_t g_modelo_version = 7;</code></pre>
+
+<pre><code class="lang-cpp">// inferencia.cc — inicializacion. Se hace UNA vez, en el arranque.
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "modelo_int8.h"
+
+// La arena se dimensiona MIDIENDO (CF7.8), no adivinando. Es estatica:
+// en un MCU no hay heap dinamico en el camino critico.
+constexpr int kArenaBytes = 18 * 1024;
+alignas(16) static uint8_t g_arena[kArenaBytes];
+
+static tflite::MicroInterpreter* g_interp = nullptr;
+static TfLiteTensor* g_in  = nullptr;
+static TfLiteTensor* g_out = nullptr;
+
+bool ml_init(void) {
+  const tflite::Model* modelo = tflite::GetModel(g_modelo_int8);
+  if (modelo-&gt;version() != TFLITE_SCHEMA_VERSION) return false;
+
+  // Resolver EXPLICITO: solo los 8 operadores que este modelo usa.
+  // El resolver "todos los operadores" agrega ~60 KB de kernels muertos.
+  static tflite::MicroMutableOpResolver&lt;8&gt; resolver;
+  resolver.AddConv2D();
+  resolver.AddDepthwiseConv2D();
+  resolver.AddFullyConnected();
+  resolver.AddMean();          // global average pooling
+  resolver.AddSoftmax();
+  resolver.AddReshape();
+  resolver.AddQuantize();
+  resolver.AddDequantize();
+
+  static tflite::MicroInterpreter interp(modelo, resolver, g_arena, kArenaBytes);
+  if (interp.AllocateTensors() != kTfLiteOk) return false;   // arena chica -&gt; falla ACA
+
+  g_interp = &amp;interp;
+  g_in  = interp.input(0);
+  g_out = interp.output(0);
+  return (g_in-&gt;type == kTfLiteInt8) &amp;&amp; (g_out-&gt;type == kTfLiteInt8);
+}</code></pre>
+
+<pre><code class="lang-cpp">// El bucle de inferencia. Nota que la cuantizacion de la ENTRADA la hace
+// tu codigo: el modelo espera int8 con la escala que fijo el conversor.
+int ml_clasificar(const float* rasgos, int n, float* confianza) {
+  const float  S = g_in-&gt;params.scale;
+  const int    Z = g_in-&gt;params.zero_point;
+
+  for (int i = 0; i &lt; n; ++i) {
+    int32_t q = (int32_t)lroundf(rasgos[i] / S) + Z;
+    if (q &gt; 127)  q = 127;                 // saturar, NUNCA envolver
+    if (q &lt; -128) q = -128;
+    g_in-&gt;data.int8[i] = (int8_t)q;
+  }
+
+  if (g_interp-&gt;Invoke() != kTfLiteOk) return -1;
+
+  const float So = g_out-&gt;params.scale;
+  const int   Zo = g_out-&gt;params.zero_point;
+  int mejor = 0; int8_t vmax = g_out-&gt;data.int8[0];
+  for (int c = 1; c &lt; g_out-&gt;dims-&gt;data[1]; ++c) {
+    if (g_out-&gt;data.int8[c] &gt; vmax) { vmax = g_out-&gt;data.int8[c]; mejor = c; }
+  }
+  *confianza = So * ((float)vmax - Zo);
+  return mejor;
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Los tres HardFault clásicos de esta etapa.</strong>
+  <br><strong>(1)</strong> El array del modelo sin <code>alignas(16)</code>: el FlatBuffer se lee desalineado y el Cortex-M aborta.
+  <br><strong>(2)</strong> La arena declarada dentro de una función: se va al stack, que en un MCU son 4–8 KB. Tiene que ser estática o global.
+  <br><strong>(3)</strong> El <code>MicroInterpreter</code> declarado sin <code>static</code> dentro de <code>ml_init()</code>: se destruye al salir y el puntero global apunta a basura. Anda "casi siempre", hasta que otra función pisa ese stack.
+</div>
+
+<h2>CF7.6 Preprocesamiento en el dispositivo: el train/serve skew</h2>
+
+<p>Esta sección es la que más problemas evita, y la que más gente saltea. En un despliegue típico de TinyML, <strong>el preprocesamiento es más código, más RAM y más ciclos que la inferencia misma</strong>. En nuestro ejemplo son 11 ms de preprocesado contra 18 ms de red — y 4 KB de buffers contra 18 KB de arena, sí, pero también son ~120 líneas de C delicado contra 30 de llamadas al runtime.</p>
+
+<div class="concept">
+  <strong>💡 El train/serve skew es la causa número uno de "anda en la PC y no en la placa".</strong> Entrenaste con rasgos calculados por <code>librosa</code>/<code>scipy</code> en float64, con su ventana, su normalización y sus constantes. En la placa calculás rasgos con CMSIS-DSP en q15, con otra ventana, otro escalado y otro epsilon en el logaritmo. Los dos son "un espectrograma logarítmico", y no son el mismo espectrograma. El modelo, que aprendió sobre el primero, recibe el segundo. No falla: <strong>clasifica mal, con confianza alta, y no hay nada en el log que te lo diga.</strong>
+</div>
+
+<p>Para vibración de un motor, la cadena es: ventana → enventanado (Hann) → FFT → magnitud → bandas logarítmicas → normalización. Un detalle de criterio: <strong>para audio se usan MFCC, para vibración no</strong>. Las MFCC incorporan la escala mel, que modela la percepción del oído humano; a un rodamiento la percepción humana no le importa. Para vibración, bandas logarítmicamente espaciadas sobre la FFT dan mejor separación y son más baratas de calcular.</p>
+
+<pre><code class="lang-c">/* preproc.c — la version que corre en la placa. CMSIS-DSP, aritmetica q15. */
+#include "arm_math.h"
+
+#define N_FFT     1024
+#define N_BANDAS    64
+
+static arm_rfft_instance_q15 s_fft;
+static q15_t s_ventana[N_FFT];          /* Hann, precalculada en flash */
+static q15_t s_buf[2 * N_FFT];          /* entrada y salida compleja */
+
+/* Bordes de las 64 bandas log entre 10 Hz y 2000 Hz, precalculados
+   con el MISMO script que genero los del entrenamiento. */
+extern const uint16_t g_bordes[N_BANDAS + 1];
+
+void preproc_trama(const q15_t* muestras, int8_t* salida_q8) {
+  arm_mult_q15(muestras, s_ventana, s_buf, N_FFT);      /* enventanar */
+  arm_rfft_q15(&amp;s_fft, s_buf, s_buf);                   /* FFT real */
+  arm_cmplx_mag_q15(s_buf, s_buf, N_FFT / 2);           /* magnitud */
+
+  for (int b = 0; b &lt; N_BANDAS; ++b) {
+    int32_t suma = 0;
+    for (int k = g_bordes[b]; k &lt; g_bordes[b + 1]; ++k) suma += s_buf[k];
+
+    /* log2 con la MISMA constante epsilon que en Python: 1e-6 en q15 = 33 */
+    float e  = (float)suma + 33.0f;
+    float lg = log2f(e);
+
+    /* Normalizacion y cuantizacion con la escala del modelo. */
+    float z = (lg - PREPROC_MEDIA) / PREPROC_DESVIO;
+    int32_t q = (int32_t)lroundf(z / MODELO_ESCALA) + MODELO_ZERO;
+    salida_q8[b] = (int8_t)(q &gt; 127 ? 127 : (q &lt; -128 ? -128 : q));
+  }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla no negociable: una sola fuente de verdad para el preprocesamiento.</strong> Los bordes de banda, la ventana, el epsilon, la media y el desvío de normalización se generan con <strong>un solo script</strong> que emite <em>a la vez</em> el <code>.h</code> para C y el <code>.json</code> que consume el entrenamiento. Si esos números viven duplicados en dos archivos, se van a desincronizar — no es una posibilidad, es cuestión de tiempo.
+</div>
+
+<p>Y el test que cierra el círculo: correr el preprocesamiento de la placa en la PC y comparar con el de entrenamiento sobre las mismas muestras.</p>
+
+<pre><code class="lang-python"># test_paridad.py — compila preproc.c como una extension y compara
+# rasgo por rasgo contra la implementacion de entrenamiento.
+import numpy as np, ctypes
+lib = ctypes.CDLL("./preproc_host.so")     # el MISMO .c, compilado para x86
+
+def rasgos_dispositivo(muestras: np.ndarray) -&gt; np.ndarray:
+    salida = np.zeros(64, dtype=np.int8)
+    lib.preproc_trama(muestras.astype(np.int16).ctypes.data_as(ctypes.c_void_p),
+                      salida.ctypes.data_as(ctypes.c_void_p))
+    return salida
+
+def test_paridad_preprocesamiento():
+    """Si este test falla, el modelo va a andar mal en la placa
+    aunque su exactitud en el notebook sea perfecta."""
+    for muestras in cargar_ventanas_de_referencia():          # 200 ventanas reales
+        a = rasgos_dispositivo(muestras)
+        b = rasgos_entrenamiento(muestras)                    # el pipeline de Python
+        assert np.max(np.abs(a.astype(int) - b.astype(int))) &lt;= 1, \
+            "los rasgos del dispositivo difieren de los del entrenamiento"</code></pre>
+
+<div class="tip">
+  Ese <code>&lt;= 1</code> no es pereza: en aritmética de punto fijo la coincidencia exacta con float64 es imposible, y exigirla te condena a un test que falla siempre. Un nivel de diferencia sobre 256 es ruido de redondeo. <strong>Diez</strong> niveles ya no lo son. Fijá la tolerancia con criterio y hacé que rompa el build cuando se pase.
+</div>
+
+<h2>CF7.7 El ecosistema en 2026: qué usar y a qué te ata</h2>
+
+<div class="info">
+  <strong>Nota sobre nombres.</strong> Google renombró TensorFlow Lite a <strong>LiteRT</strong> en 2024, y por extensión TensorFlow Lite Micro pasó a llamarse <strong>LiteRT for Microcontrollers</strong>. El repositorio sigue siendo <code>tensorflow/tflite-micro</code>, los headers siguen diciendo <code>tflite::</code> y el paquete de PyPI sigue siendo <code>tflite-micro</code>. Vas a encontrar los dos nombres mezclados en documentación, foros y código durante bastante tiempo. <strong>No están muerto ni reemplazado: es el mismo proyecto con otro cartel.</strong>
+</div>
+
+<table>
+<thead><tr><th>Opción</th><th>Qué aporta</th><th>A qué te ata</th><th>Cuándo elegirla</th></tr></thead>
+<tbody>
+<tr><td><strong>LiteRT Micro</strong> (ex TFLM)</td><td>El estándar de facto. Intérprete de ~20–25 KB, kernels para Cortex-M, HiFi, ARC y RISC-V; <em>backends</em> de fabricante para Ethos-U, NXP eIQ y ST X-CUBE-AI</td><td>Al formato <code>.tflite</code> y al ecosistema TensorFlow para entrenar</td><td>Caso general. Es la apuesta segura y la que más ejemplos tiene</td></tr>
+<tr><td><strong>ExecuTorch</strong></td><td>Runtime de PyTorch para el borde; 1.0 GA con Arm. Integración con Zephyr, kernels CMSIS-NN y soporte de Ethos-U; hay despliegues documentados en menos de 400 KB</td><td>A PyTorch y a su cadena de exportación</td><td>Si tu equipo entrena en PyTorch y no quiere el puente por ONNX</td></tr>
+<tr><td><strong>Edge Impulse</strong> (Qualcomm)</td><td>Plataforma MLOps de punta a punta: captura de datos, diseño de rasgos, entrenamiento, perfilado por placa y generación del firmware. Acelera muchísimo el prototipo</td><td>A la plataforma. Exporta C++ y modelos, pero el flujo de trabajo es suyo</td><td>Equipos chicos, tiempo corto, o cuando el valor está en el producto y no en el pipeline</td></tr>
+<tr><td><strong>microTVM</strong></td><td>Compila el modelo a C sin intérprete: elimina el runtime y a veces gana bastante. Autotuning por objetivo</td><td>A un compilador complejo cuyo soporte para MCU ha sido irregular</td><td>Casos extremos donde 20 KB de intérprete son la diferencia, y hay quien lo mantenga</td></tr>
+<tr><td><strong>Cadena del fabricante</strong> (X-CUBE-AI, eIQ, ESP-DL)</td><td>Máximo rendimiento en <em>ese</em> silicio, con soporte comercial</td><td>Al fabricante. Cambiar de MCU es rehacer el despliegue</td><td>Cuando el chip ya está elegido y no se va a cambiar</td></tr>
+</tbody>
+</table>
+
+<h3>El hardware cambió más que el software</h3>
+
+<p>Hasta hace poco "TinyML" significaba un Cortex-M sin acelerador. Eso ya no es toda la historia:</p>
+
+<div class="step"><strong>NPU integrada en el MCU.</strong> El <strong>STM32N6</strong> trae el acelerador Neural-ART de ST: hasta 600 GOPS a ~3 TOPS/W, sobre un Cortex-M55 a 800 MHz con Helium. Los <strong>Arm Ethos-U55 / U85</strong> son NPU licenciables que aparecen en silicio de varios fabricantes y aceleran los operadores de LiteRT de forma bit-exacta. Recordá el MobileNetV2 que en nuestro M4F tardaba 7,5 s: en esa categoría de parte baja a decenas de milisegundos.</div>
+
+<div class="step"><strong>Sin NPU, pero con vector.</strong> El <strong>ESP32-S3</strong> es un caballito de batalla de TinyML —doble núcleo, PSRAM, instrucciones vectoriales— pero <strong>no tiene NPU dedicada</strong>; su ventaja es memoria y ancho de banda, no un acelerador. El <strong>nRF54L15</strong> (2 MB de NVM, 512 KB de RAM) apunta al mismo lugar desde el lado del bajísimo consumo y la radio integrada.</div>
+
+<div class="warn">
+  <strong>Una NPU no es un upgrade del mismo diseño: es otra categoría de producto.</strong> Un STM32N6 no compite con un STM32L4 — cuesta cinco veces más, necesita flash externa, consume otro orden de magnitud y cambia el diseño de la placa entera. Si tu problema entra en un M4F, meterle una NPU es tirar plata, energía y área de PCB. Si tu problema es visión en tiempo real, ninguna cantidad de cuantización te va a llevar ahí. <strong>La elección de silicio ocurre antes que la elección de modelo</strong>, y es la decisión más cara de revertir (ver <a href="../cf8-prototipo-a-producto/lecture.html">CF8</a>).
+</div>
+
+<h2>CF7.8 Medir en el dispositivo</h2>
+
+<p>Los números del datasheet, del blog del fabricante y de tu estimación en Python son todos ajenos. Tu firmware corre con <em>tu</em> compilador, <em>tus</em> flags, <em>tu</em> caché configurada de <em>esa</em> manera, y <em>tus</em> interrupciones metiéndose en el medio. Hay tres cosas que se miden en la placa y solo en la placa.</p>
+
+<pre><code class="lang-c">/* 1) LATENCIA con el contador de ciclos del DWT (Cortex-M3/M4/M7).
+      Resolucion de un ciclo: es la unica medicion que no miente. */
+#include "core_cm4.h"
+
+static void dwt_init(void) {
+  CoreDebug-&gt;DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT-&gt;CYCCNT = 0;
+  DWT-&gt;CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+void medir_inferencia(void) {
+  uint32_t t0 = DWT-&gt;CYCCNT;
+  preproc_ventana(g_muestras, g_rasgos);
+  uint32_t t1 = DWT-&gt;CYCCNT;
+  g_interp-&gt;Invoke();
+  uint32_t t2 = DWT-&gt;CYCCNT;
+
+  printf("preproc %lu ciclos (%.2f ms) | inferencia %lu ciclos (%.2f ms)\n",
+         t1 - t0, (t1 - t0) / 80000.0f,
+         t2 - t1, (t2 - t1) / 80000.0f);
+}</code></pre>
+
+<pre><code class="lang-cpp">// 2) RAM PICO: cuanto de la arena se uso REALMENTE.
+//    Se llama despues de AllocateTensors() y de la primera Invoke().
+void reportar_arena(void) {
+  size_t usado = g_interp-&gt;arena_used_bytes();
+  printf("arena: %u / %u bytes (%.0f%% de uso, %u libres)\n",
+         (unsigned)usado, (unsigned)kArenaBytes,
+         100.0 * usado / kArenaBytes, (unsigned)(kArenaBytes - usado));
+}
+
+// 3) High-water mark del STACK: rellenar con un patron al arrancar
+//    y contar cuanto sobrevivio. La arena no es la unica RAM que se te va.
+extern uint32_t _stack_bottom, _stack_top;
+size_t stack_maximo_usado(void) {
+  uint32_t* p = &amp;_stack_bottom;
+  while (p &lt; &amp;_stack_top &amp;&amp; *p == 0xDEADBEEF) ++p;
+  return (size_t)((&amp;_stack_top - p) * sizeof(uint32_t));
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Dimensioná la arena con el número medido, más un margen explícito.</strong> Si <code>arena_used_bytes()</code> devuelve 16.240, no pongas 16.240: poné 18 KB y documentá por qué. Un cambio de versión del runtime, un operador que cambia de kernel o una recompilación con otro nivel de optimización pueden mover ese número unos cientos de bytes. Que se caiga en un <code>AllocateTensors()</code> al arrancar es aceptable; que se caiga por un desborde silencioso a los tres meses, no.
+</div>
+
+<h3>Energía: el número que nadie mide y todos citan</h3>
+
+<p>Para la energía por inferencia no alcanza un multímetro: la corriente varía tres órdenes de magnitud en milisegundos. Hace falta un analizador de potencia con resolución temporal (Nordic PPK2, Otii Arc, Joulescope) que integre la corriente durante la ventana de interés. El procedimiento que funciona:</p>
+
+<div class="step"><strong>1. Poné un GPIO en alto justo antes de <code>Invoke()</code> y en bajo justo después.</strong> Ese pin es tu disparador, y también entra al analizador como canal digital.</div>
+<div class="step"><strong>2. Integrá la corriente entre los dos flancos</strong>, con la placa alimentada a la tensión real de la batería —no a los 3,3 V del programador, que es otro punto de operación.</div>
+<div class="step"><strong>3. Repetí con las tres clases de entrada.</strong> Sí: en una red con ramas o con <em>early exit</em> el consumo depende del dato. Si es una CNN pura, no — pero verificalo en vez de suponerlo.</div>
+
+<div class="mistake">
+  <strong>El error de medición más común:</strong> medir con el depurador conectado. El SWD mantiene despierto el dominio de depuración, bloquea los modos de bajo consumo profundo y te puede inflar el reposo en dos órdenes de magnitud. La medición vale con la placa alimentada por batería y sin el programador enchufado — es decir, con el firmware final, no con el de desarrollo.
+</div>
+
+<h2>CF7.9 Dónde TinyML gana de verdad (y qué no poner en un MCU)</h2>
+
+<table>
+<thead><tr><th>Caso</th><th>Por qué funciona en un MCU</th><th>Orden de magnitud típico</th></tr></thead>
+<tbody>
+<tr><td><strong>Detección de palabra clave</strong> ("oye, dispositivo")</td><td>Vocabulario de 2–10 palabras, entrada de baja tasa, tolera falsos negativos porque el usuario repite</td><td>20–60 KB, 10–30 ms, siempre encendido a &lt;1 mW</td></tr>
+<tr><td><strong>Clasificación de vibración</strong> (mantenimiento predictivo)</td><td>La señal ya es de baja dimensión tras la FFT; las clases son pocas y estables</td><td>20–80 KB, 10–40 ms, un ciclo por minuto</td></tr>
+<tr><td><strong>Detección de anomalías</strong> (autoencoder)</td><td>No necesitás ejemplos de falla: aprendés lo normal y medís el error de reconstrucción</td><td>10–50 KB, 5–20 ms</td></tr>
+<tr><td><strong>Reconocimiento de gestos</strong> (IMU)</td><td>6 canales a 50–100 Hz: entrada minúscula, ventanas cortas</td><td>5–30 KB, &lt;10 ms</td></tr>
+<tr><td><strong>Conteo de personas</strong> (visión de muy baja resolución)</td><td>Con 96×96 en escala de grises y una red separable alcanza para contar, no para identificar</td><td>100–300 KB, 100–800 ms</td></tr>
+<tr><td><strong>Clasificación de calidad de aire / gases</strong></td><td>Fusión de pocos sensores lentos; el modelo compensa deriva y cruzamiento</td><td>5–20 KB, &lt;5 ms</td></tr>
+</tbody>
+</table>
+
+<table>
+<thead><tr><th>Qué NO poner en un MCU</th><th>Por qué</th><th>Dónde va</th></tr></thead>
+<tbody>
+<tr><td>Reconocimiento facial / identificación de personas</td><td>Necesita embeddings grandes y una base de datos; además es un problema legal antes que técnico</td><td>Gateway o servidor, con consentimiento explícito</td></tr>
+<tr><td>Transcripción de voz continua</td><td>Modelos de cientos de MB y decodificación con lenguaje</td><td>Nube. El MCU solo detecta la palabra de activación</td></tr>
+<tr><td>Cualquier LLM, por chico que se venda</td><td>El más pequeño usable son cientos de MB; el ancho de banda de memoria de un MCU lo hace inviable aunque cupiera</td><td>Nube, o un SoC de clase Linux</td></tr>
+<tr><td>Detección de objetos multi-clase en tiempo real</td><td>Decenas a cientos de M MAC por cuadro</td><td>MCU con NPU (Ethos-U, Neural-ART) o SoC con GPU</td></tr>
+<tr><td>Cualquier cosa que requiera reentrenar en el dispositivo</td><td>El backward pass necesita mucha más RAM que el forward, y datos etiquetados que el equipo no tiene</td><td>Servidor. El dispositivo aporta datos, no gradientes</td></tr>
+<tr><td>Decisiones de seguridad funcional sin respaldo determinista</td><td>Un modelo no es certificable como única barrera</td><td>El modelo <em>asiste</em>; el corte lo hace lógica determinista (ver <a href="../cf6-seguridad-embebida/lecture.html">CF6</a>)</td></tr>
+</tbody>
+</table>
+
+<h2>CF7.10 Cuándo NO usar ML</h2>
+
+<div class="concept">
+  <strong>💡 La sección más importante del módulo.</strong> Una fracción muy grande de los problemas que llegan planteados como TinyML se resuelven con un umbral, una FFT o una máquina de estados. Y no "casi tan bien": muchas veces <strong>mejor</strong>, porque la solución determinista es explicable, depurable, no necesita datos etiquetados y no se degrada sola. El ML es la herramienta correcta cuando la regla existe pero no la podés escribir. Si la podés escribir, escribila.
+</div>
+
+<p>Las cuatro preguntas que hay que contestar antes de abrir un notebook:</p>
+
+<div class="step"><strong>1. ¿Existe una regla física?</strong> Si la falla se manifiesta como energía en una banda de frecuencia conocida —y en máquinas rotativas casi siempre es así, porque las frecuencias características las da la geometría del rodamiento y las RPM— entonces la "detección" es medir esa banda y compararla. Eso es una FFT y una resta, y lo cubre <a href="../../e07-dsp/lecture.html">E07</a>.</div>
+
+<div class="step"><strong>2. ¿Cuántas clases hay, y son estables?</strong> Dos o tres clases con fronteras nítidas rara vez necesitan una red. Diez clases con solapamiento y variabilidad entre instalaciones, sí.</div>
+
+<div class="step"><strong>3. ¿Tenés datos etiquetados de las fallas?</strong> Esta es la que hunde la mayoría de los proyectos. Para entrenar un clasificador supervisado de fallas necesitás <em>ejemplos de fallas</em>, y las fallas —por definición— son raras. Si tenés 40 horas de motor sano y once minutos de motor roto, no tenés un problema de clasificación: tenés un problema de detección de anomalías, que es otra técnica, o directamente un problema de umbral.</div>
+
+<div class="step"><strong>4. ¿Quién va a mantener esto en tres años?</strong> Un umbral lo ajusta cualquier técnico con un destornillador y el manual. Un modelo lo reentrena alguien que sepa ML, con los datos originales, en el pipeline original. Si esa persona y ese pipeline no van a existir, el modelo es un pasivo con fecha de vencimiento.</div>
+
+<pre><code class="lang-c">/* La linea base honesta: ~40 lineas, 3 KB de flash, determinista.
+   Antes de proponer una red, ESTO tiene que estar medido. */
+typedef struct {
+  float rms;              /* energia total de la ventana */
+  float pico_hz;          /* frecuencia del pico dominante */
+  float ratio_banda;      /* energia en la banda de falla / energia total */
+} rasgos_t;
+
+int clasificar_umbral(const rasgos_t* r) {
+  /* Umbrales calibrados durante la puesta en marcha de CADA equipo:
+     10 minutos de motor sano fijan la referencia. */
+  if (r-&gt;rms &lt; UMBRAL_REPOSO)                  return CLASE_APAGADO;
+  if (r-&gt;ratio_banda &gt; UMBRAL_RODAMIENTO)      return CLASE_RODAMIENTO;
+  if (fabsf(r-&gt;pico_hz - 2.0f * F_GIRO) &lt; 1.5f
+      &amp;&amp; r-&gt;rms &gt; UMBRAL_DESBALANCEO)          return CLASE_DESBALANCEO;
+  return CLASE_NORMAL;
+}</code></pre>
+
+<pre><code class="lang-c">/* Y la maquina de estados de confirmacion, que mejora AMBOS caminos.
+   Una deteccion aislada no alarma: N consecutivas, si. */
+#define N_CONFIRMA 5
+
+static int  s_ultima  = CLASE_NORMAL;
+static int  s_racha   = 0;
+static int  s_estable = CLASE_NORMAL;
+
+int confirmar(int clase_cruda) {
+  s_racha = (clase_cruda == s_ultima) ? s_racha + 1 : 1;
+  s_ultima = clase_cruda;
+  if (s_racha &gt;= N_CONFIRMA) s_estable = clase_cruda;
+  return s_estable;
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Esa máquina de estados de doce líneas vale más que dos puntos de exactitud del modelo.</strong> Con 88% de especificidad por ciclo y 1440 ciclos por día, un clasificador crudo genera ~173 falsas alarmas diarias — inutilizable. Exigiendo 5 detecciones consecutivas la tasa cae varios órdenes de magnitud, para <em>cualquier</em> clasificador. <strong>Antes de mejorar el modelo, mejorá la lógica que consume su salida.</strong> Es más barato, es determinista y se puede razonar.
+</div>
+
+<div class="warn">
+  <strong>Un caveat honesto sobre esa cuenta:</strong> multiplicar probabilidades supone independencia entre ciclos, y los falsos positivos <em>no</em> son independientes — se agrupan, porque los causa una condición externa que dura (un golpe, una máquina vecina, un cambio de carga). La reducción real es grande pero menor que la teórica. Medila con datos de campo, no con la fórmula.
+</div>
+
+<h2>CF7.11 Ciclo de vida: actualizar un modelo en 5.000 equipos</h2>
+
+<p>El modelo se desplegó. Ahora vienen los tres años difíciles, y acá es donde TinyML se parece mucho más a firmware que a MLOps.</p>
+
+<h3>Actualizar</h3>
+
+<div class="danger">
+  <strong>⚠️ El presupuesto de flash y el esquema de actualización compiten.</strong> Nuestro firmware ocupa 167 KB de 256 KB. Un esquema OTA A/B clásico necesita dos ranuras iguales: 128 KB cada una. <strong>El firmware no entra en su propia ranura.</strong> Esto no se descubre al final del proyecto: se descubre al final del proyecto <em>si no lo calculaste al principio</em>.
+</div>
+
+<p>Las salidas, en orden de preferencia:</p>
+
+<div class="step"><strong>(a) Separar el modelo del firmware.</strong> El modelo vive en un sector de flash propio, con su encabezado (versión, hash, longitud, forma de entrada y escala de cuantización), y el firmware lo lee de ahí en vez de tenerlo como array enlazado. Ahora podés actualizar 47 KB de modelo sin tocar los 120 KB de firmware — y la actualización más frecuente pasa a ser la más barata. Es la opción correcta en casi todos los casos.</div>
+<div class="step"><strong>(b) Flash externa QSPI</strong> para la ranura de descarga. Cuesta un chip y unos pines.</div>
+<div class="step"><strong>(c) Actualización sin A/B</strong>, con bootloader y recuperación. Más barato en memoria, mucho más caro en riesgo: un corte de energía a mitad de camino te deja un ladrillo.</div>
+
+<pre><code class="lang-c">/* Encabezado del modelo como artefacto independiente.
+   Sin esto no podes saber que corre un equipo, ni evitar cargarle
+   un modelo cuyo preprocesamiento el firmware no sabe generar. */
+typedef struct __attribute__((packed)) {
+  uint32_t magia;             /* 'M','D','L','1' */
+  uint16_t version_modelo;    /* 7 */
+  uint16_t version_preproc;   /* 3 — DEBE coincidir con la del firmware */
+  uint32_t longitud;          /* 47104 */
+  uint8_t  sha256[32];
+  int8_t   entrada_zero;      /* punto cero de la entrada */
+  float    entrada_escala;    /* escala de la entrada */
+  uint16_t n_clases;
+} cabecera_modelo_t;
+
+bool modelo_compatible(const cabecera_modelo_t* h) {
+  if (h-&gt;magia != MAGIA_MDL)                       return false;
+  if (h-&gt;version_preproc != FW_VERSION_PREPROC)    return false;  /* la clave */
+  if (h-&gt;longitud &gt; MAX_MODELO_BYTES)              return false;
+  return sha256_verificar((const uint8_t*)(h + 1), h-&gt;longitud, h-&gt;sha256);
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 El modelo y el preprocesamiento son un solo artefacto versionado.</strong> Si actualizás el modelo pero el firmware sigue calculando los rasgos de la versión anterior, reintrodujiste el train/serve skew de CF7.6 — esta vez a distancia, en 5.000 equipos, sin poder depurarlo. El campo <code>version_preproc</code> de esa cabecera es lo que impide que eso ocurra: un modelo que pide rasgos v4 simplemente no se carga en un firmware que genera rasgos v3.
+</div>
+
+<h3>Saber que se degradó, sin ground truth</h3>
+
+<p>En el borde no tenés etiquetas. Nadie te va a decir que la predicción de ayer estuvo mal. Entonces no podés monitorear exactitud — tenés que monitorear <strong>proxies</strong>, que son baratos de calcular y de transmitir:</p>
+
+<table>
+<thead><tr><th>Señal</th><th>Qué detecta</th><th>Costo de transmitir</th></tr></thead>
+<tbody>
+<tr><td>Histograma de clases predichas (por día)</td><td>Deriva de concepto: si un equipo pasa de 2% a 30% de "rodamiento", algo cambió — el motor o el modelo</td><td>~16 bytes/día</td></tr>
+<tr><td>Distribución de la confianza máxima</td><td>Entradas fuera de distribución: la confianza baja de forma sostenida</td><td>~24 bytes/día (8 percentiles)</td></tr>
+<tr><td>Estadísticos de los rasgos de entrada (media, desvío, % de saturación)</td><td><strong>Deriva del sensor</strong>: envejecimiento, aflojamiento del montaje, cambio de escala</td><td>~40 bytes/día</td></tr>
+<tr><td>Tasa de saturación en la cuantización de entrada</td><td>La calibración de CF7.3 quedó vieja para este equipo</td><td>2 bytes/día</td></tr>
+<tr><td>Ventanas crudas de los casos de baja confianza</td><td>Material para reentrenar, elegido por el propio dispositivo</td><td>2 KB por caso, con presupuesto diario</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  Ese último renglón es el patrón más valioso del ciclo de vida en el borde: <strong>que el dispositivo elija qué datos vale la pena mandar</strong>. Un presupuesto de "hasta 3 ventanas crudas por día, las de menor confianza" te construye, a lo largo de una flota, exactamente el conjunto de reentrenamiento que necesitás: los casos difíciles reales, no los fáciles que ya clasificás bien. Es aprendizaje activo hecho con 20 líneas de C. La contraparte en el servidor —cómo se versiona, se reentrena y se vuelve a servir eso— es <a href="../../../../datos-ia/Curso-Datos-ML/senior/ds4-serving/lecture.html">DS4 — Serving</a>.
+</div>
+
+<div class="mistake">
+  <strong>Por qué esto se parece más a firmware que a MLOps.</strong> En un servicio en la nube, desplegar un modelo nuevo es cambiar un puntero y poder revertir en treinta segundos. Acá el despliegue tarda semanas —los equipos se conectan cuando quieren—, la flota queda fragmentada en varias versiones a la vez, revertir es otra campaña completa, y un modelo malo puede dejar equipos sin batería. Las prácticas que te salvan son las de <a href="../cf2-arquitectura-firmware/lecture.html">CF2</a>: despliegue por anillos (1% → 10% → 100%), watchdog, imagen de respaldo y capacidad de volver atrás sin intervención humana en el sitio.
+</div>
+
+<h2>🧑‍🎓 Worked Example — detección de fallas en un motor por vibración</h2>
+
+<blockquote>Una planta tiene 340 motores de inducción de 7,5 kW. Quieren detectar rodamiento gastado y desbalanceo antes de que rompan. El sensor va pegado a la carcasa, alimentado con una CR2032, y tiene que durar dos años. Cuatro clases: apagado, normal, rodamiento, desbalanceo.</blockquote>
+
+<h3>Paso 1 — La línea base honesta, antes de cualquier modelo</h3>
+
+<p>Se instrumentan 6 motores durante 5 semanas. Con la FFT de <a href="../../e07-dsp/lecture.html">E07</a> y tres rasgos —RMS, frecuencia del pico dominante y energía relativa en la banda característica del rodamiento— se calibran umbrales por equipo con 10 minutos de motor sano en la puesta en marcha. Resultado sobre el conjunto de prueba:</p>
+
+<pre><code class="lang-bash">Linea base: umbral sobre RMS + pico de FFT
+  exactitud balanceada : 82,0 %   (sensibilidad 76 % / especificidad 88 %)
+  flash                :  3,1 KB  (codigo + tabla de umbrales)
+  RAM pico             :  4,3 KB  (buffers de la FFT)
+  latencia             :  9,0 ms
+  datos necesarios     :  ninguno etiquetado — solo 10 min de sano por equipo</code></pre>
+
+<div class="rule">
+  <strong>📌 Este paso no es opcional, es el que da sentido a todos los demás.</strong> Sin una línea base medida, cualquier número del modelo es incomparable. "94% de exactitud" no significa nada; "94% contra 82% de la línea base, por 44 KB más y 20 ms más" es una decisión de ingeniería.
+</div>
+
+<h3>Paso 2 — El modelo</h3>
+
+<p>Se etiquetan 40 horas de los 6 motores (incluidas 11 fallas provocadas). La arquitectura es una CNN separable sobre el espectrograma de 64 bandas × 32 tramas:</p>
+
+<pre><code class="lang-bash">Arquitectura (entrada 64x32x1 int8)
+  L1  Conv2D 3x3 -&gt; 16,  s2            144 pesos     73.728 MAC
+  L2  DWConv 3x3 s2 + PW 16-&gt;32        656 pesos     83.968 MAC
+  L3  DWConv 3x3 s2 + PW 32-&gt;64      2.336 pesos     74.752 MAC
+  L4  DWConv 3x3 s1 + PW 64-&gt;128     8.768 pesos    280.576 MAC
+  L5  DWConv 3x3 s2 + PW 128-&gt;160   21.632 pesos    173.056 MAC
+  GAP + Dense 160-&gt;48 -&gt; 4           7.872 pesos      7.872 MAC
+  -------------------------------------------------------------
+  TOTAL                             41.408 pesos    693.952 MAC
+
+Medido en la placa (Cortex-M4F @ 80 MHz, CMSIS-NN):
+  1.437.204 ciclos = 17,97 ms   -&gt;  2,07 ciclos por MAC
+  arena_used_bytes() = 16.240   -&gt;  arena declarada: 18 KB
+  modelo_int8.tflite = 47.104 B (41,4 KB de pesos + 5,6 KB de biases,
+                                 escalas por canal y grafo FlatBuffer)</code></pre>
+
+<p>Y la cuantización, medida en vez de supuesta:</p>
+
+<table>
+<thead><tr><th>Variante</th><th>Exactitud balanceada</th><th>Tamaño</th><th>Comentario</th></tr></thead>
+<tbody>
+<tr><td>float32 (en la PC)</td><td>94,6 %</td><td>166 KB</td><td>No entra en el presupuesto de flash</td></tr>
+<tr><td>PTQ int8, calibración pobre (30 muestras de laboratorio)</td><td>88,1 %</td><td>47 KB</td><td><strong>−6,5 pp</strong>: la escala no cubría la sobrecarga</td></tr>
+<tr><td>PTQ int8, calibración representativa (300 muestras de campo)</td><td>94,0 %</td><td>47 KB</td><td>−0,6 pp. <strong>Es el que se despliega</strong></td></tr>
+<tr><td>QAT int8</td><td>94,8 %</td><td>47 KB</td><td>+0,8 pp sobre PTQ, a costa de 8 épocas y del pipeline</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Leé bien esa tabla.</strong> La diferencia entre la calibración pobre y la buena (6,5 pp) es <strong>ocho veces mayor</strong> que la diferencia entre PTQ y QAT (0,8 pp). Y la primera cuesta una tarde de recolectar datos representativos; la segunda cuesta reconstruir el pipeline de entrenamiento. El orden en que atacás los problemas importa más que las técnicas que conocés.
+</div>
+
+<h3>Paso 3 — La comparación completa</h3>
+
+<table>
+<thead><tr><th>Dimensión</th><th>Umbral + FFT</th><th>Modelo int8</th><th>Diferencia</th></tr></thead>
+<tbody>
+<tr><td>Exactitud balanceada</td><td>82,0 %</td><td>94,0 %</td><td><strong>+12 pp</strong></td></tr>
+<tr><td>Sensibilidad (fallas detectadas)</td><td>76 %</td><td>92 %</td><td>+16 pp</td></tr>
+<tr><td>Especificidad</td><td>88 %</td><td>96 %</td><td>+8 pp</td></tr>
+<tr><td>Falsas alarmas/día tras confirmar ×5</td><td>≈ 0,04</td><td>≈ 0,0001</td><td>Ambas aceptables gracias a la máquina de estados</td></tr>
+<tr><td>Flash</td><td>3,1 KB</td><td>47 KB modelo + 22 KB runtime = <strong>69 KB</strong></td><td>+66 KB (37% de la flash total)</td></tr>
+<tr><td>RAM pico</td><td>4,3 KB</td><td>18 KB arena + 4,1 KB preproc + 2 KB anillo = <strong>24,1 KB</strong></td><td>+19,8 KB (31% de la RAM total)</td></tr>
+<tr><td>Latencia por ciclo</td><td>9,0 ms</td><td>11,0 preproc + 18,0 inferencia = <strong>29,0 ms</strong></td><td>+20 ms</td></tr>
+<tr><td>Energía por ciclo</td><td>1,20 mJ</td><td>1,73 mJ</td><td>+44 %</td></tr>
+<tr><td>Vida con CR2032 (ciclo de 60 s)</td><td><strong>3,1 años</strong></td><td><strong>2,1 años</strong></td><td><strong>−1 año</strong></td></tr>
+<tr><td>Datos necesarios</td><td>10 min de sano por equipo</td><td>40 h etiquetadas de 6 motores + 11 fallas</td><td>Meses de recolección</td></tr>
+<tr><td>Puesta en marcha de un equipo nuevo</td><td>10 minutos, cualquier técnico</td><td>Cero (el modelo generaliza) <em>si</em> el motor se parece a los 6</td><td>Depende del parecido</td></tr>
+<tr><td>Depurar un caso raro</td><td>Dos números en el log</td><td>Volcar el tensor de entrada y reproducir en la PC</td><td>Otro orden de dificultad</td></tr>
+<tr><td>Mantenimiento a 3 años</td><td>Ajustar un umbral</td><td>Reentrenar, revalidar, recalibrar, redesplegar</td><td>Necesitás el equipo de ML vivo</td></tr>
+</tbody>
+</table>
+
+<h3>Paso 4 — En qué escenario gana cada uno</h3>
+
+<div class="step"><strong>Gana el umbral</strong> si la planta tiene motores heterogéneos —marcas, potencias y montajes distintos— y hay un técnico que hace la puesta en marcha de cada equipo. Los umbrales por equipo compensan la heterogeneidad; un modelo entrenado con 6 motores no. Y gana también si el requisito de autonomía es duro: ese año extra de batería son 340 visitas a campo que no se hacen.</div>
+
+<div class="step"><strong>Gana el modelo</strong> si los 340 motores son del mismo tipo y montaje —entonces los 6 instrumentados representan bien a la flota—, si la instalación tiene que ser sin calibración porque no hay quien la haga equipo por equipo, y si el costo de una falla no detectada (una parada de línea) supera holgadamente el costo de cambiar baterías un año antes. Con un 76% de sensibilidad, el umbral se pierde una de cada cuatro fallas; con 92%, el modelo se pierde una de cada doce.</div>
+
+<div class="step"><strong>Gana el híbrido, y es lo que se implementó.</strong> El umbral corre siempre —cuesta 9 ms y detecta el 76% de los casos con certeza física—. El modelo corre <strong>solo cuando el umbral está en la zona gris</strong>, que resultó ser el 23% de los ciclos. Energía media: 1,20 + 0,23 × 0,53 = <strong>1,32 mJ</strong> por ciclo → <strong>2,8 años</strong> de batería. Exactitud: 93,1%, apenas por debajo del modelo solo, porque el umbral acierta con confianza justo donde no duda.</div>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá el modelo" ni "usá el umbral".</strong> Es que la línea base determinista no es un paso previo que se descarta: es un <strong>componente del sistema final</strong>. Corre primero, resuelve barato la mayoría de los casos, y le pasa al modelo únicamente aquello para lo que el modelo hace falta. Esa arquitectura en cascada es más exacta que el umbral, más barata que el modelo y más fácil de depurar que cualquiera de los dos — porque cuando algo sale mal, sabés en qué etapa mirar.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu modelo da 94% en el notebook y 61% en la placa. La cuantización la verificaste y la caída fue de 0,6 pp. ¿Qué revisás?</summary>
+<p>El preprocesamiento, casi con seguridad. Es el train/serve skew de CF7.6: los rasgos que calcula el firmware en punto fijo no son los mismos que calculó <code>scipy</code> en float64 durante el entrenamiento. Basta una ventana distinta, otro epsilon en el logaritmo, bordes de banda calculados con otro redondeo o una normalización con constantes viejas. La forma de confirmarlo en diez minutos: volcar por UART el vector de rasgos que produce la placa para una ventana conocida, correr el pipeline de Python sobre la misma ventana, y comparar elemento a elemento. Si difieren en más de uno o dos niveles de cuantización, ahí está. El arreglo estructural es el test de paridad automatizado y una sola fuente de verdad para las constantes.</p></details>
+
+<details><summary>Tenés 40 horas de motor sano y once minutos de motor con falla. ¿Entrenás un clasificador?</summary>
+<p>No con esos datos. Once minutos no alcanzan para que un clasificador supervisado aprenda a distinguir tipos de falla; lo que va a aprender es a memorizar esos once minutos, y va a fallar en el primer motor distinto. Con ese desbalance hay tres caminos honestos. <strong>(a)</strong> Detección de anomalías: entrenás un autoencoder solo con lo sano y alarmás por error de reconstrucción — no te dice <em>qué</em> falla, pero te dice que algo cambió, y no necesita ejemplos de falla. <strong>(b)</strong> Umbrales sobre rasgos físicos, que en máquinas rotativas funcionan bien porque las frecuencias características las da la geometría. <strong>(c)</strong> Desplegar (a) o (b) ahora y usar el propio dispositivo para juntar los casos difíciles —las ventanas de baja confianza— hasta tener datos suficientes para un clasificador dentro de un año. La respuesta equivocada es entrenar igual y reportar la exactitud sobre un test que contiene los mismos once minutos.</p></details>
+
+<details><summary>El equipo propone pasar de un STM32L4 a un MCU con NPU para "dejar lugar a modelos futuros". ¿Qué preguntás?</summary>
+<p>Cuál es el modelo futuro concreto y cuánto cuesta el cambio completo. Una NPU no es un upgrade del mismo diseño: es otra categoría de producto. Cambian el precio unitario (unos pocos dólares a decenas), el consumo en reposo, la necesidad de flash externa, el diseño de la placa, la integridad de señal a frecuencias más altas (CF5) y toda la certificación. Si el modelo actual entra en 47 KB y corre en 18 ms, la NPU no compra nada: el presupuesto de energía y batería casi seguro empeora. La NPU se justifica cuando el requisito de producto —visión en tiempo real, por ejemplo— es imposible en el M4F, no cuando alguien quiere margen para un modelo que todavía no existe. Y si la duda es genuina, la respuesta no es cambiar de chip: es dejar el modelo como un artefacto separado y actualizable (CF7.11), que es lo que realmente te da margen futuro sin rediseñar el hardware.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>TinyML es una disciplina de restricciones</strong>: cuatro presupuestos simultáneos —flash, RAM, ciclos y energía— que tienen que cerrar a la vez. Calculalos antes de entrenar, no después de convertir.</li>
+  <li>El borde gana por <strong>latencia, privacidad, energía y autonomía</strong>. El argumento energético es el más contundente y el menos intuitivo: transmitir un byte cuesta lo mismo que 16.000 ciclos de CPU. La arquitectura que gana casi siempre es el <strong>híbrido asimétrico</strong>.</li>
+  <li>La <strong>cuantización int8</strong> es obligatoria y da un 4× fijo, con 0,1–2 pp de caída si la calibración es representativa. <strong>El set de calibración importa más que la elección entre PTQ y QAT</strong> — en el ejemplo, 6,5 pp contra 0,8 pp.</li>
+  <li>Si tu modelo está a más de un factor 4 de entrar, el problema es la arquitectura, no el cuantizador. Las <strong>convoluciones separables</strong> dan 5–10× y se deciden antes de entrenar. La <strong>poda no estructurada no ahorra ciclos en un MCU</strong>: solo comprime el binario.</li>
+  <li>El <strong>preprocesamiento es más código, más RAM y más riesgo que la inferencia</strong>. Una sola fuente de verdad para sus constantes, y un test de paridad automatizado contra el pipeline de entrenamiento. El train/serve skew es la causa número uno de "anda en la PC y no en la placa".</li>
+  <li><strong>Ecosistema 2026:</strong> LiteRT Micro (ex TFLite Micro — mismo proyecto, otro nombre) sigue siendo el estándar; ExecuTorch 1.0 llegó a GA con Arm y ya despliega en Cortex-M; Edge Impulse es de Qualcomm desde 2025 y sigue siendo multi-fabricante; microTVM existe pero es el camino menos transitado. Y el hardware cambió más que el software: MCU con NPU integrada (STM32N6 con Neural-ART, Ethos-U55/U85) movieron el techo, a costa de ser otra categoría de producto.</li>
+  <li><strong>Medí en la placa:</strong> latencia con el contador DWT, RAM con <code>arena_used_bytes()</code>, energía con un analizador y sin el depurador conectado. Ningún número del datasheet es el tuyo.</li>
+  <li><strong>Cuándo NO usar ML:</strong> si existe una regla física, si las clases son pocas y estables, si no tenés ejemplos de falla, o si nadie va a poder reentrenar en tres años. Un umbral, una FFT y una máquina de estados de doce líneas resuelven muchísimo, y son explicables, deterministas y depurables.</li>
+  <li><strong>El ciclo de vida se parece a firmware, no a MLOps:</strong> el modelo y su preprocesamiento son un artefacto versionado con hash; separalo del firmware para poder actualizarlo solo; monitoreá proxies (histograma de clases, confianza, saturación de entrada) porque no vas a tener etiquetas; y dejá que el dispositivo elija qué datos difíciles mandar.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Completá la función <code>estimar_macs()</code> de CF7.2 recorriendo los operadores del <code>.tflite</code>. Contrastá su estimación con el tiempo real medido con el DWT en una placa y calculá tus ciclos-por-MAC efectivos.</li>
+  <li>Tomá cualquier modelo pre-entrenado de clasificación y calculá su presupuesto para un MCU de 256 KB de flash y 64 KB de RAM. Determiná, con números, cuántos factores de reducción te faltan y qué combinación de técnicas podría (o no) cerrarlos.</li>
+  <li>Cuantizá el mismo modelo tres veces: PTQ con 20 muestras de calibración, PTQ con 300 muestras diversas, y QAT. Armá la tabla de exactitud versus esfuerzo con <em>tus</em> números y decidí cuál desplegarías.</li>
+  <li>Implementá el chequeo <code>verificar_int8_completo()</code> y hacelo fallar a propósito: quitá la línea de <code>supported_ops</code> y observá exactamente qué tensores quedan en float y cuánto crece el binario del firmware.</li>
+  <li>Escribí un preprocesamiento en C que calcule 32 bandas logarítmicas de una FFT de 512 puntos, compilalo para tu PC como biblioteca compartida y armá el test de paridad contra una implementación en NumPy. Rompelo cambiando un solo epsilon y medí cuánto se desvían los rasgos.</li>
+  <li>Instrumentá una inferencia con el contador DWT y con un GPIO. Medí la latencia con los dos métodos y explicá la diferencia (pista: el GPIO también mide la latencia de la interrupción y del propio <code>toggle</code>).</li>
+  <li>Para un problema tuyo, escribí primero la línea base determinista completa —umbral o máquina de estados— y medila. Recién después entrená un modelo. Reportá la mejora en puntos porcentuales <em>por KB</em> y <em>por mJ</em>.</li>
+  <li>Diseñá el encabezado de modelo actualizable de CF7.11 para tu proyecto y escribí el caso de prueba que verifica que un modelo con <code>version_preproc</code> incompatible es rechazado en vez de cargado.</li>
+  <li>Calculá, para tu hardware, cuánta energía cuesta transmitir un kilobyte por tu radio y cuántos ciclos de CPU comprás con esa misma energía. Usá ese número para decidir qué se procesa localmente y qué se envía.</li>
+</ol>
+
+<section class="quiz" id="quizCF_S7">
+  <style>
+    #quizCF_S7{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCF_S7 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCF_S7 .q{margin-bottom:1.5rem}
+    #quizCF_S7 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCF_S7 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCF_S7 .opt:hover{border-color:var(--accent)}
+    #quizCF_S7 .opt:disabled{cursor:default}
+    #quizCF_S7 .opt.ok{background:rgba(63,185,80,.16);border-color:var(--success)}
+    #quizCF_S7 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizCF_S7 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCF_S7 .exp.show{display:block}
+    #quizCF_S7 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. El modelo da 94% en el notebook y 61% en la placa. Ya verificaste que la cuantización a int8 costó solo 0,6 pp. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">La arena de tensores quedó chica y el runtime está descartando capas</button>
+    <button class="opt">El Cortex-M4F redondea distinto que la PC y eso degrada la red</button>
+    <button class="opt">El preprocesamiento del firmware no produce los mismos rasgos que el del entrenamiento</button>
+    <div class="exp">Es el <em>train/serve skew</em>, la causa número uno de "anda en la PC y no en la placa". Una ventana distinta, otro epsilon en el logaritmo, bordes de banda con otro redondeo o constantes de normalización viejas alcanzan para que el modelo reciba una entrada que nunca vio. No falla con un error: clasifica mal con confianza alta. Se confirma volcando el vector de rasgos de la placa y comparándolo elemento a elemento contra el de Python; se previene con una sola fuente de verdad para las constantes y un test de paridad automatizado. La opción de la arena es falsa: si la arena no alcanza, <code>AllocateTensors()</code> falla en el arranque, no degrada en silencio.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu modelo pesa 4 MB en float32 y el MCU tiene 256 KB de flash. ¿Qué esperás de la cuantización a int8?</p>
+    <button class="opt">Que lo lleve a 1 MB — sigue sin entrar, y el problema es la arquitectura, no el cuantizador</button>
+    <button class="opt">Que lo lleve a unos 130 KB, porque int8 comprime también las activaciones y el grafo</button>
+    <button class="opt">Que entre, si además le aplicás poda no estructurada al 80%</button>
+    <div class="exp">La cuantización int8 da un factor <strong>4 fijo y conocido</strong>: 4 MB pasan a 1 MB, todavía cuatro veces por encima de la flash entera. Y la poda no estructurada no ayuda: un peso en cero sigue ocupando su byte en un kernel denso de MCU, así que solo mejora la compresión del binario para la actualización OTA, no la memoria residente. Si el modelo está a más de un factor 4 de entrar, la salida es una arquitectura distinta —convoluciones separables, menos canales, entrada más chica— decidida antes de entrenar. Y aunque cupiera: 300 M MAC a 2 ciclos por MAC y 80 MHz son 7,5 segundos por inferencia.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Te piden detectar si una bomba está cavitando. La cavitación se manifiesta como energía en una banda de frecuencia conocida, hay dos estados posibles y no tenés ni un minuto de datos etiquetados de cavitación. ¿Por dónde empezás?</p>
+    <button class="opt">Entrenás una CNN chica con datos sintéticos generados a partir de la física del fenómeno</button>
+    <button class="opt">Por una FFT y un umbral sobre la energía de esa banda, con una máquina de estados de confirmación — y medís antes de proponer un modelo</button>
+    <button class="opt">Por un modelo de detección de anomalías, porque sin etiquetas de falla es la única opción viable</button>
+    <div class="exp">Hay una regla física conocida, dos clases con frontera nítida y cero datos etiquetados: es el caso de manual donde el ML no aporta. Una FFT (E07), un umbral sobre la banda característica y una máquina de estados que exija N detecciones consecutivas resuelven el problema con unos pocos KB, de forma determinista, explicable, depurable y sin necesidad de que exista un equipo de ML dentro de tres años. La detección de anomalías es la respuesta correcta cuando <em>no</em> hay una regla física identificable — acá la hay. Y entrenar con datos sintéticos agrega todos los costos del ML sin ninguna de sus ventajas. La línea base determinista no es un paso previo que se descarta: si es suficiente, es el sistema final.</div>
+  </div>
+
+  <div class="score" id="scoreCF_S7"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCF_S7');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCF_S7').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CF8.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cf6-seguridad-embebida/lecture.html">← CF6: Seguridad embebida</a>
+  <a href="../cf8-prototipo-a-producto/lecture.html">CF8: De prototipo a producto →</a>
+</nav>
+
+</div>
+</body>
+</html>

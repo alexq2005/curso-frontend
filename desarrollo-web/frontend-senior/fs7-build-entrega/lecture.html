@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FS7 — Build y entrega: qué hace realmente tu bundler · Frontend Senior</title>
+  <meta name="description" content="El grafo de módulos por dentro: resolución, transformación y chunks. Tree shaking y sus límites, code splitting, análisis de treemap, la generación Rust (Rolldown en Vite 8, Turbopack, Oxc), source maps sin filtrar código, el costo real de una dependencia y presupuestos de bundle que no se vuelven ruido.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Frontend Senior</a>
+  <a href="../../modulo-00-sillabus/lecture.html">🎨 Curso Frontend</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">FS7</span>
+  <span class="badge">⏱ 40–125 min</span>
+  <span class="badge">🎯 Pre-req: Curso Frontend M00–M13</span>
+  <span class="badge">📦 Build &amp; delivery</span>
+</div>
+
+<article>
+
+<h1>FS7 — Build y entrega: qué hace realmente tu bundler</h1>
+
+<h2>FS7.0 Por qué este módulo</h2>
+
+<p>En el M09 configuraste Vite, instalaste dependencias con npm y pusiste ESLint. Eso alcanza para trabajar. Deja de alcanzar exactamente el día en que alguien te manda un mensaje que dice: <em>"el bundle inicial pesa 940 KB, ¿por qué?"</em>. Ahí no sirve saber qué archivo de configuración tocar: hay que saber <strong>qué construyó el bundler y con qué criterio</strong>.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un bundler no es una caja negra que "empaqueta": es un programa que construye un <strong>grafo dirigido de módulos</strong> a partir de un punto de entrada, y después decide cómo cortar ese grafo en archivos. Todo lo demás —tree shaking, code splitting, por qué una dependencia CommonJS arruina la optimización, por qué el vendor chunk gigante te invalida la caché— son consecuencias de esas dos operaciones. Entendé el grafo y el resto se deduce.
+</div>
+
+<p>Y hay una razón de coyuntura para estudiarlo <em>ahora</em>. Entre 2024 y 2026 el ecosistema se reescribió en Rust y Go. En <strong>marzo de 2026, Vite 8</strong> reemplazó sus <em>dos</em> bundlers históricos —esbuild en desarrollo, Rollup en producción— por uno solo escrito en Rust, <strong>Rolldown</strong>, sin opción de opt-out. En Next.js 16, <strong>Turbopack</strong> pasó a ser el bundler estable y por defecto tanto en <code>dev</code> como en <code>build</code>. Los tiempos de build cayeron un orden de magnitud, los mensajes de error cambiaron y algunas suposiciones que tenías dejaron de valer. Este módulo es el mapa de ese terreno.</p>
+
+<div class="rule">
+  <strong>📌 Lo que separa configurar de decidir.</strong> Configurar es copiar un <code>vite.config.js</code> de un blog. Decidir es poder responder, con un número, estas cuatro preguntas: ¿cuánto JavaScript descarga y ejecuta un usuario nuevo en la ruta más importante? ¿Qué porcentaje de eso se usa en los primeros 5 segundos? ¿Qué se invalida de la caché en cada deploy? ¿Cuánto de todo eso lo puse yo y cuánto vino de arrastre?
+</div>
+
+<h2>FS7.1 El grafo de módulos: las cuatro etapas de un build</h2>
+
+<p>Todo bundler moderno hace lo mismo, en el mismo orden. Cambian los lenguajes de implementación y las heurísticas, no las etapas:</p>
+
+<div class="step"><strong>1. Entry.</strong> Arranca de uno o varios puntos de entrada (<code>src/main.tsx</code>, o el <code>&lt;script type="module"&gt;</code> del HTML). Cada entry es la raíz de un grafo.</div>
+
+<div class="step"><strong>2. Resolución.</strong> Por cada <code>import</code>, traduce el especificador a un archivo real en disco. <code>"./boton"</code> → <code>./boton.tsx</code>. <code>"react"</code> → <code>node_modules/react/index.js</code>, o lo que digan los campos <code>exports</code> / <code>module</code> / <code>main</code> del <code>package.json</code>. Es una operación de I/O intensiva y en proyectos grandes es donde se va muchísimo tiempo.</div>
+
+<div class="step"><strong>3. Transformación.</strong> Cada archivo pasa por los <em>loaders</em>/plugins: TypeScript se despoja de tipos, JSX se convierte en llamadas a función, el CSS se procesa, los assets se convierten en URLs o en data URIs. El resultado es JavaScript que el navegador entiende, más un registro de qué importa y qué exporta cada módulo.</div>
+
+<div class="step"><strong>4. Chunking y emisión.</strong> Con el grafo completo se decide en cuántos archivos se corta: se aplica tree shaking, se agrupan módulos en chunks, se minifica, se calculan los hashes de contenido para el nombre de archivo y se escribe todo a <code>dist/</code>.</div>
+
+<pre><code class="lang-bash"># El grafo, dibujado a mano
+#
+#   main.tsx  (entry)
+#     ├─ App.tsx
+#     │    ├─ Header.tsx ──── logo.svg
+#     │    ├─ Tabla.tsx ───── date-fns/format
+#     │    └─ Grafico.tsx ─── recharts  (350 KB)
+#     └─ estilos.css
+#
+# El bundler visita cada nodo UNA vez, lo cachea, y después
+# decide qué nodos van juntos en cada archivo de salida.</code></pre>
+
+<h3>Dónde se va el tiempo del build</h3>
+
+<table>
+<thead><tr><th>Etapa</th><th>Peso típico</th><th>Qué la hace lenta</th><th>Cómo se acelera</th></tr></thead>
+<tbody>
+<tr><td>Resolución</td><td>10–25%</td><td>Miles de <code>stat()</code> al filesystem; <code>node_modules</code> profundo</td><td>Caché en disco; resolución paralela (Rust/Go)</td></tr>
+<tr><td>Transformación</td><td><strong>40–60%</strong></td><td>Parsear y regenerar AST por archivo — el cuello clásico de Babel</td><td>Parsers nativos (Oxc, SWC, esbuild), paralelismo real por core</td></tr>
+<tr><td>Tree shaking + chunking</td><td>10–20%</td><td>Análisis global: no se puede paralelizar del todo</td><td>Grafos incrementales; menos módulos</td></tr>
+<tr><td>Minificación</td><td>15–30%</td><td>Terser en JS puro era lo más caro de todo</td><td>Minificadores nativos (Oxc, esbuild)</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Por eso la migración a Rust/Go dio saltos tan grandes: las dos etapas que más pesan —transformar y minificar— son <strong>vergonzosamente paralelas</strong> (cada archivo es independiente) y Node.js, con un solo hilo por proceso, no podía aprovecharlas. No fue magia: fue usar los ocho cores que ya tenías.
+</div>
+
+<h2>FS7.2 ESM vs CommonJS: por qué el análisis estático lo habilita todo</h2>
+
+<p>La diferencia entre los dos sistemas de módulos no es de sintaxis. Es que <strong>uno se puede analizar sin ejecutarlo y el otro no</strong>.</p>
+
+<pre><code class="lang-javascript">// ESM — la estructura es ESTÁTICA.
+// Los import van arriba, no pueden estar dentro de un if,
+// y los nombres son literales. El bundler sabe todo sin ejecutar nada.
+import { format } from "date-fns";
+export function fecha(d) { return format(d, "yyyy-MM-dd"); }</code></pre>
+
+<pre><code class="lang-javascript">// CommonJS — la estructura es DINÁMICA.
+// require() es una función normal: puede recibir cualquier expresión.
+const nombre = process.env.MODO === "rapido" ? "./rapido" : "./lento";
+const mod = require(nombre);          // ¿qué módulo es? Se sabe en runtime.
+
+module.exports.util = mod.util;
+if (features.beta) module.exports.beta = require("./beta");   // exports condicionales</code></pre>
+
+<div class="rule">
+  <strong>📌 La consecuencia.</strong> Con ESM, el bundler puede afirmar <em>"del módulo <code>date-fns</code> solo se usa <code>format</code>"</em> y descartar el resto con certeza matemática. Con CommonJS, la única respuesta honesta es <em>"no sé qué se usa, incluyo todo"</em>. Tree shaking, code splitting automático y <code>import()</code> analizable son <strong>todos</strong> corolarios del análisis estático de ESM.
+</div>
+
+<h3>Una sola dependencia CJS puede arruinarlo</h3>
+
+<p>El problema no es tener una dependencia CommonJS: es dónde está. Si un paquete CJS está en el camino de tus imports, todo lo que pase por él pierde el análisis:</p>
+
+<pre><code class="lang-javascript">// tu-app importa un wrapper que es CJS,
+// y ese wrapper importa la librería grande.
+//
+//   app.tsx (ESM)  →  @empresa/ui-kit (CJS)  →  recharts (ESM, 350 KB)
+//
+// El bundler NO puede saber qué re-exporta ui-kit, así que
+// arrastra recharts entero, aunque vos uses un solo componente.</code></pre>
+
+<pre><code class="lang-bash"># Cómo detectar dependencias CJS en tu grafo
+npx are-the-types-wrong@latest @empresa/ui-kit   # verifica exports/tipos ESM
+npx publint @empresa/ui-kit                      # audita el package.json publicado
+
+# Y en Vite: qué tuvo que convertir de CJS a ESM en el pre-bundle
+npx vite build --debug 2&gt;&amp;1 | grep -i "commonjs"</code></pre>
+
+<div class="mistake">
+  <strong>El error de diagnóstico más común:</strong> ver un paquete inflado en el treemap y culpar al bundler por "no sacudirlo". En nueve de cada diez casos la causa está una capa más arriba: un <em>barrel file</em> (<code>index.js</code> que re-exporta 300 módulos), un <code>package.json</code> sin campo <code>exports</code>, o un intermediario CommonJS. El bundler hizo exactamente lo que podía hacer con la información que le diste.
+</div>
+
+<h3>Cómo se ve un paquete que se deja optimizar</h3>
+
+<pre><code class="lang-json">{
+  "name": "mi-lib",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".":        { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./boton":  { "types": "./dist/boton.d.ts", "import": "./dist/boton.js" },
+    "./estilos.css": "./dist/estilos.css"
+  },
+  "files": ["dist"]
+}</code></pre>
+
+<div class="tip">
+  Tres señales de que una dependencia va a jugar limpio con tu bundle: <strong>(1)</strong> <code>"type": "module"</code>, <strong>(2)</strong> campo <code>exports</code> con subpaths reales en vez de un único barrel, <strong>(3)</strong> <code>sideEffects</code> declarado. Si un paquete tiene las tres, tree shaking va a funcionar. Si no tiene ninguna, asumí que vas a cargar el paquete entero y decidí sabiendo eso.
+</div>
+
+<h2>FS7.3 Tree shaking de verdad y sus límites</h2>
+
+<p>La definición de folleto es "elimina el código que no usás". La definición honesta es: <strong>elimina las exportaciones que puede demostrar que nadie referencia y cuya eliminación puede demostrar que no cambia el comportamiento observable</strong>. Las dos demostraciones fallan más seguido de lo que la gente cree.</p>
+
+<h3>Por qué <code>sideEffects: false</code> importa tanto</h3>
+
+<p>Considerá este módulo:</p>
+
+<pre><code class="lang-javascript">// analytics.js
+export function trackear(evento) { /* ... */ }
+
+// ⚠️ esto corre en el momento en que el módulo se IMPORTA
+window.__analytics_listo = true;
+document.addEventListener("click", registrarClick);</code></pre>
+
+<p>Si nadie usa <code>trackear</code>, ¿el bundler puede borrar el módulo entero? No: tiene <strong>efectos de nivel superior</strong> que alguien podría estar esperando. Ante la duda, el bundler conserva. Multiplicá esa duda por 800 módulos de <code>node_modules</code> y ahí está tu bundle inflado.</p>
+
+<pre><code class="lang-json">// package.json — la declaración que resuelve la duda
+{
+  "sideEffects": false
+}
+
+// O, lo correcto en el 90% de los casos reales: declarar las excepciones.
+{
+  "sideEffects": ["*.css", "*.scss", "./src/polyfills.js"]
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El error que se paga en producción.</strong> Poner <code>"sideEffects": false</code> en un paquete que importa CSS es la forma más rápida de que <strong>los estilos desaparezcan del build de producción y solo del de producción</strong>. En desarrollo no hay tree shaking, así que todo se ve bien; el bug aparece recién en el deploy. Un <code>import "./boton.css"</code> no exporta nada, así que el bundler lo considera código muerto y lo borra. La declaración correcta es <code>"sideEffects": ["*.css"]</code>.
+</div>
+
+<h3>Los cuatro límites reales</h3>
+
+<table>
+<thead><tr><th>Límite</th><th>Qué pasa</th><th>Qué hacer</th></tr></thead>
+<tbody>
+<tr><td><strong>Barrel files</strong></td><td>Un <code>index.ts</code> que re-exporta 300 módulos obliga a evaluarlos todos para resolver uno</td><td>Importar por subpath: <code>from "lib/boton"</code>, no <code>from "lib"</code></td></tr>
+<tr><td><strong>CommonJS en el camino</strong></td><td>Sin análisis estático, entra el paquete completo</td><td>Buscar la versión ESM, o aislar la dependencia en un chunk perezoso</td></tr>
+<tr><td><strong>Clases con métodos</strong></td><td>Se sacuden mucho peor que las funciones sueltas: el bundler no puede saber qué método se llama</td><td>Preferir funciones exportadas por separado en código de librería</td></tr>
+<tr><td><strong>Efectos que el compilador no ve</strong></td><td>Un <code>Object.defineProperty</code>, un decorador, un polyfill, un <code>import</code> por su efecto</td><td>Anotar con <code>/*#__PURE__*/</code> lo que sí es puro</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-javascript">// La anotación que le da permiso al bundler para borrar
+// Sin ella, el bundler asume que crear el cliente puede tener efectos.
+export const cliente = /*#__PURE__*/ crearCliente({ url: API });
+
+// Barrel vs subpath: el mismo componente, muy distinto costo
+import { Boton } from "@empresa/ui";          // ❌ evalúa el índice completo
+import { Boton } from "@empresa/ui/boton";    // ✅ solo ese módulo</code></pre>
+
+<h3>Cómo comprobar qué quedó adentro (no adivinar)</h3>
+
+<p>Hay dos preguntas distintas y se responden con herramientas distintas:</p>
+
+<pre><code class="lang-bash"># 1. "¿QUÉ hay en mi bundle?" — análisis estático del build
+npx vite-bundle-analyzer                    # treemap interactivo
+grep -c "nombreDeLaFuncion" dist/assets/*.js   # la comprobación bruta y honesta
+
+# 2. "¿Qué se EJECUTA de lo que hay?" — Coverage, en el navegador
+#    DevTools → Ctrl+Shift+P → "Show Coverage" → recargar
+#    Te da el % de bytes no usados por archivo. Es la métrica que importa.</code></pre>
+
+<div class="warn">
+  <strong>Coverage no es una lista de código para borrar.</strong> Un 70% de "código no usado" en la carga inicial puede ser perfectamente correcto: es el manejador del formulario que el usuario todavía no abrió. Coverage responde <em>"¿esto tenía que descargarse AHORA?"</em>, no <em>"¿esto sirve?"</em>. Lo que señala un porcentaje alto no es código muerto: es una <strong>oportunidad de code splitting</strong>.
+</div>
+
+<h2>FS7.4 Code splitting: menos requests contra mejor caché</h2>
+
+<p>Cortar el grafo en varios archivos tiene tres criterios útiles, y se combinan:</p>
+
+<h3>1. Por ruta</h3>
+
+<pre><code class="lang-javascript">// El import() dinámico es la única instrucción que necesitás saber:
+// crea un punto de corte en el grafo y devuelve una promesa.
+const Dashboard = lazy(() =&gt; import("./rutas/Dashboard"));
+const Reportes  = lazy(() =&gt; import("./rutas/Reportes"));
+
+// Todo lo que Dashboard importe —y nada más— va a su propio chunk.</code></pre>
+
+<h3>2. Por interacción</h3>
+
+<pre><code class="lang-javascript">// El caso de mayor retorno: una librería pesada detrás de un click.
+// El editor de texto enriquecido pesa 280 KB y lo usa el 4% de las sesiones.
+async function abrirEditor() {
+  const { montarEditor } = await import("./editor-pesado");
+  montarEditor(contenedor);
+}
+
+// 🎯 Precarga en hover: el usuario no percibe la espera
+boton.addEventListener("mouseenter", () =&gt; import("./editor-pesado"), { once: true });</code></pre>
+
+<div class="tip">
+  El <code>mouseenter</code> compra entre 150 y 400 ms de ventaja: es el tiempo promedio entre que el puntero entra en un botón y el click efectivo. En móvil el equivalente es <code>touchstart</code>, que adelanta unos 80–100 ms respecto del <code>click</code>. Es la optimización de mejor relación esfuerzo/resultado de todo este módulo.
+</div>
+
+<h3>3. Vendor chunks — y por qué el gigante es una trampa</h3>
+
+<p>La idea intuitiva es: "las dependencias cambian poco, van a un archivo aparte que el usuario cachea para siempre". La idea es correcta. La implementación ingenua no:</p>
+
+<pre><code class="lang-javascript">// ❌ El vendor monolítico
+// Un solo archivo de 420 KB con react, react-dom, lodash, recharts,
+// date-fns y 40 paquetes más.
+manualChunks(id) {
+  if (id.includes("node_modules")) return "vendor";
+}</code></pre>
+
+<div class="mistake">
+  <strong>Por qué esto se rompe.</strong> Los nombres de archivo llevan un hash del contenido: <code>vendor.a3f9c1.js</code>. Si actualizás <em>una sola</em> dependencia —un patch de <code>date-fns</code>— el contenido cambia, el hash cambia, y los <strong>420 KB completos</strong> se vuelven a descargar para todos tus usuarios. Un chunk de vendor gigante convierte cada actualización menor en una invalidación total de caché.
+</div>
+
+<pre><code class="lang-javascript">// ✅ Vendor segmentado por frecuencia de cambio
+manualChunks(id) {
+  if (!id.includes("node_modules")) return;
+  // Núcleo: cambia dos veces por año
+  if (/[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/.test(id)) return "core";
+  // Librerías pesadas de un solo uso: que vivan en su propio chunk
+  if (id.includes("recharts") || id.includes("d3-")) return "charts";
+  // El resto
+  return "vendor";
+}</code></pre>
+
+<h3>El trade-off, con números</h3>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Requests</th><th>Reutilización de caché</th><th>Cuándo conviene</th></tr></thead>
+<tbody>
+<tr><td>1 solo bundle</td><td>1</td><td>0% tras cualquier cambio</td><td>Landing estática, app &lt; 150 KB</td></tr>
+<tr><td>App + 1 vendor grande</td><td>2</td><td>Alta… hasta que actualizás algo</td><td>Casi nunca. Es el default que hay que revisar</td></tr>
+<tr><td>Por ruta + vendor segmentado</td><td>4–8 en la ruta</td><td><strong>Alta y estable</strong></td><td>El default sano de una SPA real</td></tr>
+<tr><td>Granularidad extrema (&gt; 30 chunks)</td><td>30+</td><td>Máxima en teoría</td><td>Contraproducente: cadena de requests, overhead por archivo</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Con <strong>HTTP/2 y HTTP/3</strong> el costo de un request extra bajó muchísimo (multiplexado sobre una conexión), pero <strong>no llegó a cero</strong>: cada chunk paga su compresión por separado —comprimir 10 archivos de 20 KB da más bytes que uno de 200 KB— y, sobre todo, los chunks anidados crean <em>cadenas de descubrimiento</em>: el navegador no sabe que necesita <code>C</code> hasta que descargó y parseó <code>B</code>. Esa latencia en serie es lo que arruina el LCP, no la cantidad de archivos en sí. Con conexión móvil de 150 ms de RTT, tres niveles de anidamiento son casi medio segundo de nada.
+</div>
+
+<pre><code class="lang-javascript">// Romper la cadena: declarar en el HTML lo que se sabe que hace falta
+// &lt;link rel="modulepreload" href="/assets/core.a3f9.js"&gt;
+//
+// modulepreload descarga Y parsea el módulo en paralelo, sin ejecutarlo.
+// Es la diferencia entre descubrir el chunk en el paso 3 o en el paso 1.</code></pre>
+
+<h2>FS7.5 Analizar el bundle: cómo se lee un treemap</h2>
+
+<p>Un treemap muestra el bundle como rectángulos anidados donde <strong>el área es proporcional al tamaño</strong>. Es la herramienta con la que se responde "¿por qué pesa 940 KB?" en cinco minutos en vez de en dos días.</p>
+
+<pre><code class="lang-bash"># Opción A — treemap interactivo, funciona con Vite/Rollup/Rolldown
+npx vite-bundle-analyzer
+
+# Opción B — plugin en el config, se genera con cada build
+npm i -D rollup-plugin-visualizer
+
+# Opción C — reporte JSON del propio Rolldown, ideal para CI
+#   bundleAnalyzerPlugin() emite chunks, módulos, dependencias y alcanzabilidad
+
+# Opción D — la clásica, parte del source map en vez del grafo
+npx source-map-explorer 'dist/assets/*.js'</code></pre>
+
+<div class="rule">
+  <strong>📌 Leé el treemap en este orden.</strong> <strong>(1)</strong> Los 3 rectángulos más grandes: ahí está el 60% del problema. <strong>(2)</strong> Buscá <em>el mismo nombre dos veces</em>: son versiones duplicadas. <strong>(3)</strong> Mirá qué hay en el chunk de <em>entrada</em> que no debería estar ahí. <strong>(4)</strong> Recién después, el resto. La tentación de empezar por lo chico y "prolijo" es fuerte y es una pérdida de tiempo.
+</div>
+
+<h3>Las tres sorpresas de siempre</h3>
+
+<div class="step"><strong>1. La librería de fechas con todos los idiomas.</strong> El caso arquetípico es <code>moment</code>, que empaqueta ~160 locales por defecto y suma unos 230 KB minificados cuando tu app está solo en español. Está deprecado desde 2020 y sigue apareciendo, casi siempre <em>como dependencia transitiva de otra cosa</em>. El reemplazo moderno es <code>date-fns</code> (modular, ESM, tree-shakeable) o directamente <code>Intl.DateTimeFormat</code>, que ya está en el navegador y pesa 0 KB.</div>
+
+<div class="step"><strong>2. El pack de iconos entero.</strong> <code>import { IconoUsuario } from "@paquete/icons"</code> con un barrel de 4.000 iconos puede meter 180–200 KB para dibujar tres flechitas. Se detecta al instante en el treemap: un rectángulo enorme, uniforme, con cientos de módulos diminutos adentro.</div>
+
+<div class="step"><strong>3. La misma librería en dos versiones.</strong> Tu app usa <code>date-fns@4</code> y una dependencia trae <code>date-fns@2</code>. npm las anida en distintos <code>node_modules</code>, el bundler las trata como paquetes distintos y las incluye a las dos. Es peso puro, sin ningún beneficio.</div>
+
+<pre><code class="lang-bash"># Detectar duplicados ANTES de mirar el treemap
+npm ls date-fns          # muestra el árbol y todas las versiones instaladas
+npx npm-why date-fns     # explica QUIÉN pidió cada versión
+
+# Forzar una sola versión (npm 8.3+)
+#   package.json:
+#   "overrides": { "date-fns": "^4.1.0" }
+#
+# En pnpm: "pnpm": { "overrides": { ... } }   ·   En yarn: "resolutions"</code></pre>
+
+<div class="warn">
+  <strong>Un <code>override</code> es una promesa que hacés vos.</strong> Le estás diciendo al gestor de paquetes "usá esta versión aunque la dependencia haya pedido otra". Si hubo cambios incompatibles entre v2 y v4, rompés en runtime y no en el build. Antes de forzar, leé el changelog de las APIs que la dependencia realmente usa, y dejá un test que ejercite ese camino.
+</div>
+
+<h2>FS7.6 La generación en Rust y Go: qué cambió de verdad</h2>
+
+<p>Entre 2020 y 2026 toda la cadena de herramientas se reescribió en lenguajes compilados. No fue moda: fue que las dos etapas más caras del build eran paralelizables y Node.js no podía paralelizarlas.</p>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Lenguaje</th><th>Qué es</th><th>Estado en 2026</th></tr></thead>
+<tbody>
+<tr><td><strong>esbuild</strong></td><td>Go</td><td>Bundler + transformador + minificador. El que abrió la puerta en 2020</td><td>Vivo y sólido, pero <strong>fuera del core de Vite</strong> desde la v8</td></tr>
+<tr><td><strong>SWC</strong></td><td>Rust</td><td>Transformador (reemplazo de Babel). No es un bundler</td><td>Estable; es la base de compilación de Next.js</td></tr>
+<tr><td><strong>Oxc</strong></td><td>Rust</td><td>Parser, linter, transformador y minificador</td><td>Transformador estable; minificador todavía alpha pero ya supera a esbuild en tamaño de salida. Es el compilador de Vite 8</td></tr>
+<tr><td><strong>Rolldown</strong></td><td>Rust</td><td>Bundler, drop-in de la API de Rollup</td><td><strong>1.0 estable (mayo 2026)</strong>. Bundler único de Vite 8</td></tr>
+<tr><td><strong>Rspack</strong></td><td>Rust</td><td>Bundler compatible con la config y los loaders de webpack</td><td>Estable. La ruta de migración para monolitos webpack</td></tr>
+<tr><td><strong>Turbopack</strong></td><td>Rust</td><td>Bundler incremental (cachea a nivel de <em>función</em>, no de archivo)</td><td>Estable y por defecto en Next.js 16, en <code>dev</code> y en <code>build</code></td></tr>
+</tbody>
+</table>
+
+<h3>Vite 8: el cambio que ya te afecta</h3>
+
+<div class="concept">
+  <strong>💡 Qué pasó exactamente.</strong> Vite tenía una arquitectura de <em>dos</em> bundlers: esbuild para el dev server (velocidad) y Rollup para producción (calidad de salida y ecosistema de plugins). Eso significaba que dev y prod nunca eran idénticos. <strong>Vite 8, publicado el 12 de marzo de 2026</strong>, reemplazó a los dos por <strong>Rolldown</strong> — un bundler en Rust construido como reemplazo directo de la API de Rollup — y usa <strong>Oxc</strong> para transformar y minificar. Un solo motor para dev y prod, por primera vez. No es opcional: es el comportamiento por defecto y único.
+</div>
+
+<pre><code class="lang-bash"># Requisitos de Vite 8 — los mismos que Vite 7
+node -v          # se necesita Node 20.19+ o 22.12+
+
+npm create vite@latest mi-app
+npm i vite@latest        # a septiembre de 2026, la línea 8.2.x
+
+# Migración desde Vite 7 en dos pasos, si el proyecto es complejo:
+#   1. npm i -D rolldown-vite   → Vite 7 con el bundler nuevo, para detectar roturas
+#   2. después sí, subir a Vite 8</code></pre>
+
+<h3>Los números, y lo que cuestan</h3>
+
+<table>
+<thead><tr><th>Caso medido</th><th>Antes</th><th>Después</th></tr></thead>
+<tbody>
+<tr><td>Benchmark del equipo de Vite (19.000 módulos)</td><td>40,10 s (Rollup)</td><td><strong>1,61 s</strong> (Rolldown) ≈ 25×</td></tr>
+<tr><td>Linear</td><td>46 s</td><td>6 s</td></tr>
+<tr><td>Beehiiv</td><td>—</td><td>−64% de tiempo de build</td></tr>
+<tr><td>Ramp</td><td>—</td><td>−57%</td></tr>
+<tr><td>Mercedes-Benz.io</td><td>—</td><td>−38%</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Qué se resigna. Esto no aparece en los anuncios.</strong>
+  <strong>(1) El puente JS↔Rust cuesta.</strong> Un plugin escrito en JavaScript obliga a serializar datos en cada hook: si tenés un plugin que toca los 3.000 módulos, buena parte de la ganancia se evapora ahí. <strong>(2) Los plugins que manipulaban el AST de Rollup</strong> son los que más probabilidades tienen de romper. <strong>(3) El minificador de Oxc sigue en alpha:</strong> comprime mejor que esbuild, pero un caso raro puede darte una salida distinta de la que esperabas — hay que <em>probar el build de producción</em>, no solo confiar. <strong>(4) Los mensajes de error cambiaron</strong>, y depurar el bundler mismo es más opaco cuando el stack trace muere en Rust.
+</div>
+
+<div class="tip">
+  <strong>Regla práctica para 2026.</strong> Proyecto nuevo con Vite: no pensás en nada, ya tenés Rolldown. Proyecto Next.js: no pensás en nada, ya tenés Turbopack. Monolito con webpack y 60 loaders: la migración barata es <strong>Rspack</strong>, que lee tu configuración casi sin cambios, no reescribir todo a Vite. Y si tu build ya tarda 20 segundos, migrar por velocidad es optimizar donde no duele.
+</div>
+
+<h2>FS7.7 El dev server: por qué arranca instantáneo y el build no</h2>
+
+<p>La pregunta que casi nadie se hace: si <code>npm run build</code> tarda 40 segundos, ¿por qué <code>npm run dev</code> levanta en 300 ms? Porque <strong>en desarrollo no se bundlea</strong>.</p>
+
+<div class="analogy">
+  <strong>La analogía.</strong> El build de producción es cocinar el banquete entero antes de que llegue el primer invitado: todo tiene que estar listo, optimizado y emplatado. El dev server es un restaurante à la carte: no cocina nada hasta que alguien lo pide. Por eso abre en un minuto y por eso el primer plato de cada mesa tarda un poquito más.
+</div>
+
+<pre><code class="lang-bash"># Lo que realmente pasa cuando abrís localhost:5173
+#
+# 1. El navegador pide index.html
+# 2. Ve  &lt;script type="module" src="/src/main.tsx"&gt;  y lo pide
+# 3. El servidor transforma SOLO ese archivo (TS → JS) y lo devuelve
+# 4. El navegador ve sus import y pide cada uno
+# 5. Repetir
+#
+# Nunca se construye el grafo completo. Solo se transforma lo que
+# la ruta que estás mirando efectivamente necesita.</code></pre>
+
+<h3>El pre-bundling de dependencias, y por qué existe</h3>
+
+<p>Si el dev server no bundlea nada, ¿por qué la primera vez tarda unos segundos "optimizando dependencias"? Porque hay una excepción, y tiene una razón concreta:</p>
+
+<pre><code class="lang-javascript">// lodash-es publica cada función como un módulo aparte.
+// Sin pre-bundle, esta línea genera ~600 peticiones HTTP al dev server.
+import { debounce } from "lodash-es";
+
+// Vite lo convierte UNA vez a un solo módulo ESM cacheado en
+// node_modules/.vite/deps/  →  1 petición en vez de 600.</code></pre>
+
+<pre><code class="lang-bash"># Cuándo tenés que forzar el re-optimizado
+rm -rf node_modules/.vite      # el martillo
+npm run dev -- --force         # el bisturí
+
+# Síntoma típico de caché rancia: "Failed to resolve import" en una
+# dependencia que existe perfectamente, justo después de un npm install.</code></pre>
+
+<h3>HMR: por qué no perdés el estado</h3>
+
+<p>El <em>Hot Module Replacement</em> no recarga la página: reemplaza el módulo que cambiaste y propaga la invalidación hacia arriba en el grafo hasta encontrar un <strong>límite HMR</strong> — un módulo que sabe re-aplicarse a sí mismo. En React ese límite lo pone Fast Refresh en cada componente. Por eso editás un botón y el formulario a medio llenar sigue ahí.</p>
+
+<div class="mistake">
+  <strong>Por qué a veces "el HMR no anda" y recarga toda la página.</strong> Porque el módulo que tocaste no tiene límite: exportás un componente <em>y además</em> una constante desde el mismo archivo, o exportás algo con <code>export default</code> anónimo, o el archivo es un <code>store</code> global que nadie sabe cómo re-aplicar. La invalidación sube hasta la raíz y no queda otra que recargar. La solución es aburrida y funciona: <strong>un componente por archivo</strong>, y las constantes en un módulo aparte.
+</div>
+
+<div class="danger">
+  <strong>⚠️ Dev y prod ejecutan código distinto — este es el bug de "solo pasa en producción".</strong> En el dev server no hay tree shaking, no hay minificación, el orden de evaluación puede diferir y las variables de entorno se reemplazan de otra forma. Un componente que funciona diez horas en <code>dev</code> puede romper en el primer deploy. La disciplina que ahorra tardes enteras es correr <code>npm run build &amp;&amp; npm run preview</code> <strong>localmente</strong> antes de cada merge a main, y tener al menos un smoke test E2E que corra contra el build de producción, no contra el dev server.
+</div>
+
+<h2>FS7.8 Source maps: cómo depurar producción sin regalar el código</h2>
+
+<p>Un source map es un archivo JSON que traduce "línea 1, columna 48.312 de <code>index.a3f9.js</code>" a "línea 27 de <code>CarritoDeCompras.tsx</code>". Sin él, un stack trace de producción es ruido. Con él —mal servido— es tu código fuente completo, público.</p>
+
+<table>
+<thead><tr><th>Modo</th><th>Qué genera</th><th>Costo</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><code>false</code></td><td>Nada</td><td>0</td><td>Cuando no tenés servicio de errores. Renunciás a depurar</td></tr>
+<tr><td><code>true</code></td><td><code>.js.map</code> + comentario <code>sourceMappingURL</code></td><td>+10–30% de build; el <code>.map</code> pesa 3–5× el bundle</td><td>Desarrollo y staging</td></tr>
+<tr><td><code>'inline'</code></td><td>El mapa como data URI <em>dentro</em> del JS</td><td>Multiplica el tamaño del bundle servido</td><td><strong>Nunca</strong> en producción</td></tr>
+<tr><td><code>'hidden'</code></td><td>El <code>.map</code> <strong>sin</strong> el comentario que lo enlaza</td><td>Igual que <code>true</code>, sin exposición</td><td>✅ <strong>Producción.</strong> Se sube al servicio de errores</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-javascript">// vite.config.js
+export default {
+  build: {
+    // 'hidden' genera el mapa pero NO agrega //# sourceMappingURL=
+    // El navegador nunca lo pide. Tu servicio de errores sí lo tiene.
+    sourcemap: "hidden",
+  },
+};</code></pre>
+
+<pre><code class="lang-yaml"># .github/workflows/deploy.yml — el orden importa
+- name: Build
+  run: npm run build
+
+- name: Subir source maps al servicio de errores
+  run: npx sentry-cli sourcemaps inject ./dist &amp;&amp; npx sentry-cli sourcemaps upload ./dist
+  env:
+    SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+
+# ⬇️ CRÍTICO: borrarlos ANTES de publicar los archivos estáticos
+- name: Quitar los .map del artefacto público
+  run: find ./dist -name "*.map" -delete
+
+- name: Deploy
+  run: npx wrangler deploy ./dist</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Comprobalo, no lo asumas.</strong> El paso que más se olvida es el <code>find -delete</code>, y el síntoma es silencioso: todo funciona, nadie se entera, y tu código fuente comentado está disponible en <code>/assets/index.a3f9.js.map</code> para cualquiera que pruebe la URL. Verificación de 5 segundos, que además conviene dejar como test de humo post-deploy:
+  <pre><code class="lang-bash">curl -sI https://tu-sitio.com/assets/index.a3f9.js.map | head -1
+# Esperado: HTTP/2 404</code></pre>
+</div>
+
+<div class="info">
+  El <code>sourcemaps inject</code> del ejemplo no es decorativo: inserta un <strong>Debug ID</strong> único en el bundle y en el mapa, para que el servicio de errores los aparee por identificador y no por nombre de archivo. Sin eso, cualquier cambio de hash o de ruta de CDN te deja stack traces sin desminificar, que es exactamente el escenario en el que no querés estar a las 3 de la mañana.
+</div>
+
+<h2>FS7.9 Dependencias: el costo real de escribir <code>npm i</code></h2>
+
+<p>Una dependencia parece gratis porque la instalación tarda dos segundos. El precio se paga después, y en cinco monedas distintas:</p>
+
+<table>
+<thead><tr><th>Costo</th><th>Cómo se mide</th><th>Orden de magnitud</th></tr></thead>
+<tbody>
+<tr><td><strong>Peso en el bundle</strong></td><td>bundlejs.com, treemap, <code>--why</code> de size-limit</td><td>De 0,5 KB a 350 KB</td></tr>
+<tr><td><strong>Transitivas</strong></td><td><code>npm ls --all</code></td><td>1 paquete puede traer 40</td></tr>
+<tr><td><strong>Mantenimiento</strong></td><td>Último publish, issues abiertos, cantidad de maintainers</td><td>Un paquete abandonado es deuda con fecha</td></tr>
+<tr><td><strong>Riesgo de supply chain</strong></td><td>Superficie: cada transitiva es una cuenta npm que puede caer</td><td>Ver abajo — no es teórico</td></tr>
+<tr><td><strong>Acoplamiento</strong></td><td>¿Cuántos archivos la importan? ¿Se puede sacar?</td><td>Sacar algo que está en 200 archivos es un proyecto</td></tr>
+</tbody>
+</table>
+
+<h3>El riesgo de supply chain dejó de ser hipotético</h3>
+
+<div class="danger">
+  <strong>⚠️ Lo que pasó, con fechas.</strong> El <strong>8 de septiembre de 2025</strong>, un phishing contra un solo mantenedor comprometió 18 paquetes de npm —entre ellos <code>chalk</code>, <code>debug</code> y <code>ansi-styles</code>— que juntos suman unos <strong>2.600 millones de descargas semanales</strong>. Las versiones troyanizadas estuvieron arriba unas dos horas. El payload robaba credenciales y desviaba transacciones de criptomonedas. Poco después apareció el gusano <strong>Shai-Hulud</strong>, que además <em>se auto-propagaba</em>: robaba tokens de la máquina del desarrollador y, con acceso a GitHub, publicaba paquetes envenenados desde su cuenta. En su segunda oleada afectó decenas de miles de repositorios. En <strong>mayo de 2026</strong> volvió una variante que comprometió más de 170 paquetes de npm y, por primera vez, cruzó a PyPI en la misma operación. Ninguna de estas víctimas hizo nada mal: solo tenían la dependencia instalada.
+</div>
+
+<pre><code class="lang-json">// package.json — mitigaciones que cuestan poco y sirven mucho
+{
+  "scripts": {
+    "preinstall": "npx only-allow npm"
+  },
+  "overrides": {
+    "date-fns": "^4.1.0"
+  }
+}</code></pre>
+
+<pre><code class="lang-bash"># 1. Lockfile commiteado SIEMPRE, y en CI usar ci/frozen-lockfile
+npm ci                         # npm  — falla si el lock no coincide
+pnpm install --frozen-lockfile # pnpm
+
+# 2. No ejecutar scripts de instalación de terceros
+npm ci --ignore-scripts        # corta la vía de ejecución más usada
+
+# 3. Cuarentena por antigüedad: no instalar lo publicado hace 10 minutos
+#    .npmrc
+#    minimum-release-age=1440        # 24 horas — casi todo se detecta antes
+
+# 4. Auditar y mirar el árbol completo antes de aceptar algo
+npm audit --omit=dev
+npm ls --all | wc -l           # ¿de verdad necesitás 1.400 paquetes?</code></pre>
+
+<h3>Cómo evaluar una dependencia en 3 minutos</h3>
+
+<div class="step"><strong>1. Pesala primero.</strong> Pegá el import en <code>bundlejs.com</code> y mirá el tamaño <em>tree-shaken y comprimido con Brotli</em> — no el número de "unpacked size" de npm, que incluye tests y docs y no significa nada para tu bundle.</div>
+
+<div class="step"><strong>2. Miralas todas.</strong> <code>npm ls --all &lt;paquete&gt;</code> antes de instalar (o <code>npx howfat &lt;paquete&gt;</code>). Un helper de 3 KB que arrastra 40 transitivas es un helper de 40 transitivas.</div>
+
+<div class="step"><strong>3. ¿Es ESM con <code>exports</code> y <code>sideEffects</code>?</strong> Si no, asumí que entra entero al bundle y decidí con ese número, no con el optimista.</div>
+
+<div class="step"><strong>4. ¿Está viva?</strong> Fecha del último publish, issues abiertos sin respuesta, y —la métrica que más importa y menos se mira— <strong>cuántas personas pueden publicar</strong>. Un solo mantenedor es un solo phishing.</div>
+
+<div class="step"><strong>5. ¿Ya está en la plataforma?</strong> <code>Intl</code> para fechas y números, <code>structuredClone</code> para clonar hondo, <code>crypto.randomUUID()</code>, <code>URLSearchParams</code>, <code>Array.prototype.at</code>, <code>fetch</code>. Media docena de dependencias clásicas hoy pesan 0 KB porque el navegador ya las trae.</div>
+
+<h3>Cuándo escribir las 40 líneas vos mismo</h3>
+
+<pre><code class="lang-javascript">// Esto es una dependencia entera de muchos proyectos.
+// Son 9 líneas y no tiene casos borde ocultos.
+export function debounce(fn, ms = 300) {
+  let t;
+  return function (...args) {
+    clearTimeout(t);
+    t = setTimeout(() =&gt; fn.apply(this, args), ms);
+  };
+}
+
+// Y esto reemplaza a una librería de 12 KB:
+export const clases = (...xs) =&gt; xs.filter(Boolean).join(" ");</code></pre>
+
+<div class="rule">
+  <strong>📌 El criterio, en una línea.</strong> Escribilo vos si el problema es <strong>pequeño, cerrado y lo entendés completo</strong>: debounce, un formateador de clases, un slug simple. Usá la librería si el problema tiene <strong>casos borde que no ves desde acá</strong>: fechas con zonas horarias y DST, i18n y pluralización, criptografía, parsing de cualquier cosa, accesibilidad de widgets complejos (combobox, date picker, modal con foco atrapado). Reimplementar un date picker accesible no es ahorrar 30 KB: es firmar un contrato de mantenimiento de por vida con vos mismo.
+</div>
+
+<h2>FS7.10 Presupuestos y CI: fallar el build cuando el bundle crece</h2>
+
+<p>Ningún bundle pasa de 180 KB a 940 KB en un commit. Pasa en cuarenta commits de 19 KB cada uno, todos razonables, revisados y aprobados. Un presupuesto es simplemente <strong>hacer visible ese crecimiento en el momento en que ocurre</strong>, que es el único momento en que sale barato arreglarlo.</p>
+
+<pre><code class="lang-json">// .size-limit.json — presupuestos por RUTA, no un total global
+[
+  {
+    "name": "Entrada crítica (home)",
+    "path": "dist/assets/index-*.js",
+    "limit": "180 kB",
+    "gzip": true
+  },
+  {
+    "name": "Núcleo de dependencias",
+    "path": "dist/assets/core-*.js",
+    "limit": "60 kB",
+    "gzip": true
+  },
+  {
+    "name": "CSS inicial",
+    "path": "dist/assets/*.css",
+    "limit": "25 kB",
+    "gzip": true
+  }
+]</code></pre>
+
+<pre><code class="lang-yaml"># .github/workflows/budget.yml
+name: Presupuesto de bundle
+on: pull_request
+
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run build
+      # size-limit falla con exit code != 0 si se pasa del límite
+      - run: npx size-limit
+      # --why explica QUÉ ocupa el espacio, en el log del PR
+      - if: failure()
+        run: npx size-limit --why</code></pre>
+
+<h3>Por qué los presupuestos se vuelven ruido (y cómo evitarlo)</h3>
+
+<div class="mistake">
+  <strong>El ciclo de vida de un presupuesto mal puesto.</strong> Semana 1: alguien fija el límite en el número exacto de hoy. Semana 2: un PR legítimo lo supera por 4 KB y falla. Semana 3: alguien sube el límite "temporalmente". Semana 6: el límite se subió nueve veces y nadie lee el check. Semana 12: se agrega <code>continue-on-error: true</code>. El presupuesto sigue en verde y ya no significa nada.
+</div>
+
+<table>
+<thead><tr><th>Antipatrón</th><th>Por qué falla</th><th>Qué hacer</th></tr></thead>
+<tbody>
+<tr><td>Límite = tamaño actual exacto</td><td>Falla con cualquier cambio legítimo</td><td>Dejar 10–15% de margen y bajarlo cuando optimizás</td></tr>
+<tr><td>Un solo número para todo <code>dist/</code></td><td>Una imagen nueva rompe el check de JS</td><td>Un presupuesto por tipo de recurso y por ruta crítica</td></tr>
+<tr><td>Medir sin comprimir</td><td>No es lo que el usuario descarga</td><td>Medir en gzip o Brotli, que es lo que viaja por el cable</td></tr>
+<tr><td>Falla dura y nada más</td><td>La gente aprende a saltearlo</td><td>Comentar en el PR el <strong>delta contra <code>main</code></strong>: "+18 KB (+9%)"</td></tr>
+<tr><td>Sin dueño</td><td>Falla en el PR de alguien que no lo puso</td><td>Un responsable que revisa las subidas del límite</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>El presupuesto que la gente respeta</strong> no es el que dice "fallaste", es el que dice <em>"este PR agrega 18 KB (+9%) al bundle inicial; el 80% viene de <code>@empresa/charts</code>"</em>. Con esa información la conversación en el PR es técnica y de 2 minutos ("¿esto puede ser un <code>import()</code> dinámico?") en vez de burocrática. Presupuesto que informa se respeta; presupuesto que solo bloquea se saltea.
+</div>
+
+<h2>FS7.11 Cuándo NO tenés que optimizar el build</h2>
+
+<p>La mitad del contenido de este módulo no aplica a la mayoría de los proyectos, y decirlo es parte de saberlo.</p>
+
+<div class="step"><strong>1. El bundle ya es chico.</strong> Si el JS inicial pesa menos de 150 KB comprimido, code splitting agresivo te va a dar menos de lo que te va a costar en complejidad y en cadenas de requests. Un solo archivo bien cacheado le gana a seis chunks bien pensados.</div>
+
+<div class="step"><strong>2. El problema está en el servidor.</strong> Abrí la pestaña Network y mirá el waterfall. Si el HTML tarda 1,4 s en el TTFB y el JS descarga en 80 ms, tu bundle no es el problema: es una query N+1, un cold start, o un origen sin CDN. Optimizar el bundle ahí es pulir el volante de un auto sin motor.</div>
+
+<div class="step"><strong>3. El build tarda 20 segundos.</strong> Migrar de herramienta para bajarlo a 6 no cambia la vida de nadie. Vale la pena cuando el build tarda minutos, cuando bloquea el CI, o cuando el HMR se siente lento en el día a día — eso último sí se paga cincuenta veces por día.</div>
+
+<div class="step"><strong>4. La audiencia es interna y conocida.</strong> Un panel de administración que usan 30 personas por LAN, con máquinas de escritorio y conexión estable, no necesita el mismo presupuesto de bytes que un e-commerce en 4G. El costo del peso extra es real pero chico; el costo de la complejidad que agregás es el mismo que en cualquier lado.</div>
+
+<div class="rule">
+  <strong>📌 El orden correcto siempre.</strong> Medir → encontrar el cuello de botella → arreglar <em>ese</em> → volver a medir. Optimizar el build sin haber mirado un waterfall y un treemap no es ingeniería: es superstición con buena reputación.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "el bundle pasó de 180 KB a 940 KB en seis meses"</h2>
+
+<blockquote>Una SPA de gestión llevaba seis meses en producción. Al lanzar, el bundle inicial pesaba 180 KB minificado. Hoy pesa 940 KB (≈290 KB con Brotli) y el LCP en móvil pasó de 1,8 s a 4,3 s. Nadie sabe qué se agregó. Nadie hizo nada obviamente mal. Hay 214 commits desde el lanzamiento.</blockquote>
+
+<p><strong>Paso 1 — No leer 214 commits. Mirar el treemap.</strong></p>
+
+<pre><code class="lang-bash">npm run build
+npx vite-bundle-analyzer
+# Se abre el treemap del bundle real, no de lo que creés que hay adentro.</code></pre>
+
+<p><strong>Paso 2 — Leer los rectángulos grandes primero.</strong> Cuatro causas explican 738 de los 760 KB agregados:</p>
+
+<table>
+<thead><tr><th>#</th><th>Hallazgo</th><th>Qué pasó</th><th>Peso</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><code>recharts</code> + <code>d3-*</code> en el chunk de entrada</td><td>Un botón "Ver gráfico" en una pantalla secundaria hace un <code>import</code> estático de la librería entera</td><td><strong>410 KB</strong></td></tr>
+<tr><td>2</td><td><code>date-fns</code> aparece dos veces en el treemap</td><td><code>date-fns@4</code> tuyo + <code>date-fns@2</code> que arrastra el paquete de tablas</td><td><strong>78 KB</strong></td></tr>
+<tr><td>3</td><td>Un rectángulo uniforme con ~4.000 módulos diminutos</td><td><code>import { Icono } from "@paquete/icons"</code> — barrel completo, para 11 iconos</td><td><strong>190 KB</strong></td></tr>
+<tr><td>4</td><td><code>core-js</code> y regenerator en el bundle</td><td><code>browserslist</code> heredado del template todavía apunta a navegadores de 2018</td><td><strong>95 KB</strong></td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 3 — Confirmar cada hipótesis antes de tocar código.</strong> Este paso es el que separa un arreglo de una corazonada:</p>
+
+<pre><code class="lang-bash"># (1) ¿Quién importa recharts, y es estático o dinámico?
+grep -rn "from \"recharts\"" src/ | grep -v "await import"
+
+# (2) ¿Quién pidió cada versión de date-fns?
+npm ls date-fns
+
+# (3) ¿Cuántos iconos se usan realmente?
+grep -rhoE "&lt;Icono[A-Z][A-Za-z]+" src/ | sort -u | wc -l    # → 11
+
+# (4) ¿A qué navegadores estoy compilando de verdad?
+npx browserslist</code></pre>
+
+<p><strong>Paso 4 — Las cuatro correcciones, con lo que cuesta cada una.</strong></p>
+
+<pre><code class="lang-javascript">// (1) recharts: de import estático a chunk perezoso   −410 KB
+const PanelGrafico = lazy(() =&gt; import("./PanelGrafico"));
+
+function Reportes() {
+  return (
+    &lt;Suspense fallback={&lt;EsqueletoGrafico /&gt;}&gt;
+      &lt;PanelGrafico datos={datos} /&gt;
+    &lt;/Suspense&gt;
+  );
+}
+// Precarga cuando el usuario se acerca al botón, para que no se note:
+// boton.onmouseenter = () =&gt; import("./PanelGrafico");</code></pre>
+
+<pre><code class="lang-json">// (2) date-fns duplicada: una sola versión              −62 KB
+// package.json
+{
+  "overrides": { "date-fns": "^4.1.0" }
+}
+// Costo: hay que verificar que el paquete de tablas siga funcionando.
+// Se agregó un test de la vista que usa esa tabla, y pasó.</code></pre>
+
+<pre><code class="lang-javascript">// (3) iconos: del barrel a los subpaths                −178 KB
+// ❌ import { IconoUsuario, IconoCasa } from "@paquete/icons";
+import IconoUsuario from "@paquete/icons/usuario";
+import IconoCasa    from "@paquete/icons/casa";
+// Costo: 11 líneas de import más largas. Se automatizó con un codemod.</code></pre>
+
+<pre><code class="lang-json">// (4) polyfills: actualizar el target real              −88 KB
+// package.json
+{
+  "browserslist": ["&gt;0.5%", "not dead", "last 2 versions"]
+}
+// Costo: hay que decidirlo con datos, no por gusto. Se miró Analytics:
+// 0,3% de las sesiones venían de navegadores que se dejan de soportar.
+// Se acordó con producto ANTES de tocar nada.</code></pre>
+
+<p><strong>Paso 5 — El resultado, y lo que se dejó puesto para que no vuelva a pasar.</strong></p>
+
+<table>
+<thead><tr><th>Corrección</th><th>KB recuperados (min)</th><th>Bundle inicial resultante</th></tr></thead>
+<tbody>
+<tr><td>Punto de partida</td><td>—</td><td>940 KB</td></tr>
+<tr><td>1. <code>recharts</code> a chunk perezoso</td><td>−410</td><td>530 KB</td></tr>
+<tr><td>2. Deduplicar <code>date-fns</code></td><td>−62</td><td>468 KB</td></tr>
+<tr><td>3. Iconos por subpath</td><td>−178</td><td>290 KB</td></tr>
+<tr><td>4. <code>browserslist</code> actualizado</td><td>−88</td><td><strong>202 KB</strong></td></tr>
+<tr><td colspan="2"><strong>Total recuperado</strong></td><td><strong>738 KB (−78%)</strong></td></tr>
+</tbody>
+</table>
+
+<p>LCP en móvil: de 4,3 s a 2,0 s. Tiempo total de trabajo: una tarde. Pero el arreglo no es el entregable — el entregable es que no vuelva a degradarse:</p>
+
+<pre><code class="lang-json">// .size-limit.json — con 15% de margen sobre los 202 KB reales
+[
+  { "name": "Entrada crítica", "path": "dist/assets/index-*.js",
+    "limit": "115 kB", "gzip": true },
+  { "name": "Gráficos (perezoso, no cuenta al inicio)",
+    "path": "dist/assets/PanelGrafico-*.js", "limit": "160 kB", "gzip": true }
+]</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá <code>import()</code> dinámico".</strong> Es que la degradación de un bundle es <strong>invisible por commit y evidente por semestre</strong>: nadie agregó 760 KB, cuarenta personas agregaron 19 KB cada una y todas tenían razón. La corrección técnica llevó una tarde; lo que evita repetirla es el check en el PR que muestra el delta. Y notá que las cuatro causas se encontraron <em>mirando un treemap</em>, no leyendo código: en optimización de entrega, la herramienta de diagnóstico vale más que el conocimiento acumulado.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tenés una dependencia ESM, con <code>sideEffects: false</code>, y aun así entra entera en el bundle. ¿Qué revisás?</summary>
+<p>Primero, <strong>cómo la importás</strong>: si es un barrel (<code>from "lib"</code> en vez de <code>from "lib/boton"</code>), el bundler tiene que evaluar el índice completo para resolver un solo símbolo, y basta con que <em>un</em> módulo de ese índice tenga efectos para que la cadena entera se conserve. Segundo, <strong>si hay un intermediario CommonJS</strong>: un wrapper propio o un paquete de la empresa que sea CJS corta el análisis estático y todo lo que pase por él entra completo, sin importar lo prolija que sea la dependencia final. Tercero, <strong>si la declaración es honesta</strong>: <code>sideEffects: false</code> en un paquete que en realidad registra cosas en <code>window</code> o importa CSS es una promesa falsa, y algunos bundlers detectan efectos reales y conservan igual. Lo comprobás en el treemap, no razonando: si el rectángulo sigue ahí después de cambiar el import a subpath, el problema estaba una capa más arriba.</p></details>
+
+<details><summary>¿Por qué un vendor chunk único de 400 KB puede ser peor que tres chunks de 130 KB?</summary>
+<p>Por la <strong>invalidación de caché</strong>. El nombre del archivo lleva un hash del contenido, así que actualizar una sola dependencia cambia el hash y obliga a todos tus usuarios a redescargar los 400 KB completos. Con tres chunks segmentados por frecuencia de cambio —el núcleo React que se toca dos veces al año, las librerías pesadas de uso puntual, y el resto— una actualización menor invalida solo el chunk que cambió, y los otros dos siguen sirviéndose desde la caché del navegador. El costo de la segmentación son dos requests más, que con HTTP/2 son baratos, y una compresión levemente peor por tener menos contexto compartido. Con deploys frecuentes, ese intercambio conviene casi siempre. Donde no conviene es en granularidad extrema: pasando los ~30 chunks empiezan a pesar el overhead por archivo y, sobre todo, las cadenas de descubrimiento en serie.</p></details>
+
+<details><summary>El build de producción rompe y el dev server anda perfecto. ¿Cuáles son las tres causas más probables?</summary>
+<p><strong>(1) Tree shaking:</strong> algo se eliminó porque parecía código muerto — el caso clásico es el CSS borrado por un <code>sideEffects: false</code> mal declarado, o un módulo que solo se importaba por su efecto lateral. En dev no hay tree shaking, por eso no se ve. <strong>(2) Minificación:</strong> código que depende de <code>Function.prototype.name</code>, de nombres de clase en runtime, o de comparar <code>constructor.name</code> se rompe cuando el minificador renombra todo a una letra. <strong>(3) Variables de entorno y modo:</strong> <code>import.meta.env</code> se reemplaza literalmente en el build, y una variable que existía en tu <code>.env</code> local pero no en el CI queda como <code>undefined</code> incrustado en el bundle — el fallo aparece lejos de la causa. La disciplina que las previene a las tres es correr <code>npm run build &amp;&amp; npm run preview</code> localmente antes del merge, y tener un smoke test E2E que corra contra el build de producción y no contra el dev server.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Un bundler construye un <strong>grafo de módulos</strong> (entry → resolución → transformación → chunks) y después lo corta. Todo lo demás se deduce de esas dos operaciones.</li>
+  <li>El <strong>análisis estático de ESM</strong> es lo que habilita tree shaking, splitting automático e <code>import()</code> analizable. <strong>Un solo intermediario CommonJS</strong> en el camino desactiva todo eso para lo que pase por él.</li>
+  <li><strong>Tree shaking</strong> elimina lo que puede <em>demostrar</em> que no se usa y que no tiene efectos. Sus enemigos son los barrel files, CommonJS y los efectos de nivel superior. <code>sideEffects: false</code> en un paquete con CSS borra tus estilos <em>solo en producción</em>.</li>
+  <li><strong>Code splitting:</strong> por ruta, por interacción (con precarga en <code>mouseenter</code>) y vendor <strong>segmentado por frecuencia de cambio</strong>. Un vendor monolítico convierte cada patch en una invalidación total de caché.</li>
+  <li>El <strong>treemap</strong> responde "¿por qué pesa tanto?" en minutos. Las tres sorpresas de siempre: fechas con todos los locales, un icon pack entero por un barrel, y la misma librería en dos versiones.</li>
+  <li><strong>2026:</strong> Vite 8 (marzo) usa <strong>Rolldown</strong> como bundler único —esbuild y Rollup salieron del core— con Oxc de compilador; Rolldown 1.0 es estable desde mayo. Next.js 16 tiene Turbopack estable y por defecto en dev y build. El costo: el puente JS↔Rust se paga por hook, algunos plugins de AST rompen, y el minificador de Oxc todavía es alpha.</li>
+  <li>El <strong>dev server</strong> no bundlea: transforma bajo demanda. Por eso arranca instantáneo y por eso <strong>dev ≠ prod</strong>. Corré <code>build &amp;&amp; preview</code> antes de mergear.</li>
+  <li><strong>Source maps en producción: <code>hidden</code></strong>, subidos al servicio de errores con Debug ID y <strong>borrados del artefacto público</strong>. Verificá con un <code>curl</code> que el <code>.map</code> dé 404.</li>
+  <li>Una <strong>dependencia</strong> cuesta peso, transitivas, mantenimiento, acoplamiento y superficie de supply chain. Lockfile commiteado, <code>npm ci --ignore-scripts</code> y cuarentena por antigüedad son mitigaciones baratas frente a ataques que en 2025-2026 dejaron de ser hipotéticos.</li>
+  <li>Los <strong>presupuestos</strong> funcionan cuando informan el delta contra <code>main</code> y tienen dueño; se vuelven ruido cuando se fijan al número exacto de hoy.</li>
+  <li><strong>No optimices</strong> si el bundle ya es chico, si el cuello está en el servidor, o si el build tarda 20 segundos. Medí primero: waterfall y treemap antes que cualquier cambio.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Corré un treemap sobre un proyecto tuyo real. Anotá los <strong>tres</strong> rectángulos más grandes y, para cada uno, respondé con evidencia: ¿lo importé yo o vino de arrastre? ¿Se usa en la carga inicial? ¿Podría ser un <code>import()</code> dinámico?</li>
+  <li>Abrí la pestaña Coverage de DevTools en tu ruta principal y anotá el porcentaje de bytes de JS no usados. Elegí el archivo con peor porcentaje y proponé un punto de corte concreto. Implementalo y volvé a medir.</li>
+  <li>Buscá duplicados con <code>npm ls</code> en un proyecto con más de 30 dependencias. Si encontrás alguno, resolvelo con <code>overrides</code> y <strong>escribí el test</strong> que cubre el camino de la dependencia que forzaste.</li>
+  <li>Tomá una librería pesada detrás de una interacción y convertila a <code>import()</code> dinámico con precarga en <code>mouseenter</code>. Medí el bundle inicial antes y después, y comprobá en la pestaña Network que el chunk se descargue recién al pasar el mouse.</li>
+  <li>Configurá <code>size-limit</code> con tres presupuestos (entrada, núcleo de dependencias, CSS) y un workflow de CI que falle si se superan. Después subí a propósito el bundle con un import inútil y verificá que el check falla y que <code>--why</code> señala al culpable.</li>
+  <li>Poné <code>sourcemap: "hidden"</code>, hacé un build y verificá dos cosas: que el <code>.js</code> <strong>no</strong> tenga el comentario <code>sourceMappingURL</code>, y que el <code>.map</code> exista en <code>dist/</code>. Escribí el paso de CI que lo sube y lo borra antes de publicar.</li>
+  <li>Elegí una dependencia de tu proyecto de menos de 15 KB. Pesala en <code>bundlejs.com</code>, contá sus transitivas con <code>npm ls --all</code>, mirá cuántos mantenedores tiene y la fecha del último publish. Decidí, con esos cuatro datos escritos, si se queda o la reescribís.</li>
+  <li>Rompé el HMR a propósito: exportá un componente y una constante desde el mismo archivo, y observá en la consola de Vite cómo la invalidación sube hasta forzar un full reload. Después arreglalo separando los archivos y comprobá que el estado del formulario sobrevive.</li>
+  <li>Compará el mismo proyecto con Vite 7 (Rollup) y Vite 8 (Rolldown): cronometrá tres builds limpios de cada uno y compará también el <strong>tamaño</strong> de la salida, no solo el tiempo. Documentá si algún plugin tuvo que cambiar.</li>
+</ol>
+
+<section class="quiz" id="quizFS7">
+  <style>
+    #quizFS7{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizFS7 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizFS7 .q{margin-bottom:1.5rem}
+    #quizFS7 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizFS7 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizFS7 .opt:hover{border-color:var(--accent)}
+    #quizFS7 .opt:disabled{cursor:default}
+    #quizFS7 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizFS7 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizFS7 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizFS7 .exp.show{display:block}
+    #quizFS7 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Publicás una librería de componentes, ponés <code>"sideEffects": false</code> en el <code>package.json</code> y de golpe las apps que la consumen pierden todos los estilos <strong>solo en producción</strong>. ¿Qué pasó?</p>
+    <button class="opt">El campo <code>sideEffects</code> solo se puede usar en aplicaciones, no en librerías publicadas</button>
+    <button class="opt">Faltó minificar el CSS, y sin minificar el bundler lo descarta</button>
+    <button class="opt">Los <code>import "./x.css"</code> no exportan nada: el tree shaking los tomó por código muerto y los borró</button>
+    <div class="exp">Un <code>import</code> de CSS existe <em>solo</em> por su efecto lateral — no exporta ningún símbolo que alguien referencie. Al declarar <code>sideEffects: false</code> le prometiste al bundler que ningún módulo tiene efectos, así que eliminó esos imports con toda razón. Aparece solo en producción porque el dev server no hace tree shaking. La declaración correcta es la lista de excepciones: <code>"sideEffects": ["*.css"]</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu build de producción con Vite 8 tarda 4 segundos y el bundle inicial pesa 610 KB comprimido. El equipo propone migrar a otra herramienta "porque es más rápida". ¿Cuál es la objeción correcta?</p>
+    <button class="opt">Que el problema medido es el <strong>tamaño</strong> del bundle, no el tiempo de build: cambiar de bundler no baja un solo KB</button>
+    <button class="opt">Que ninguna herramienta actual puede mejorar los 4 segundos de Vite 8</button>
+    <button class="opt">Que migrar de bundler siempre aumenta el tamaño del bundle por el runtime que agrega</button>
+    <div class="exp">Son dos métricas distintas y se confunden todo el tiempo. Un bundler más rápido mejora tu ciclo de desarrollo y el tiempo de CI; no cambia cuántos bytes descarga el usuario, porque eso lo determinan tus imports y tus dependencias. Con 4 segundos de build no hay dolor que justifique una migración, y con 610 KB sí hay un problema real que se ataca con treemap, code splitting y deduplicación. Optimizar la métrica equivocada es el error más caro de este módulo.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Necesitás desminificar los stack traces de producción sin publicar tu código fuente. ¿Cuál es la configuración correcta?</p>
+    <button class="opt"><code>sourcemap: 'inline'</code>, así el mapa viaja dentro del bundle y nunca hay un <code>.map</code> suelto</button>
+    <button class="opt"><code>sourcemap: 'hidden'</code>: genera el <code>.map</code> sin el comentario que lo enlaza, se sube al servicio de errores y se borra del artefacto público</button>
+    <button class="opt"><code>sourcemap: false</code> y confiar en los nombres de función que sobreviven a la minificación</button>
+    <div class="exp"><code>'hidden'</code> es exactamente el modo que existe para este caso: produce el mapa pero omite el comentario <code>//# sourceMappingURL</code>, así que ningún navegador lo pide. Se sube al servicio de errores —idealmente con Debug ID inyectado, para que el apareo no dependa del nombre de archivo— y se borra de <code>dist/</code> antes de publicar. <code>'inline'</code> es lo opuesto de lo que se pide: incrusta el código fuente completo en el archivo que servís, y encima multiplica su tamaño. Y <code>false</code> te deja sin ninguna forma de leer un error en producción.</div>
+  </div>
+
+  <div class="score" id="scoreFS7"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizFS7');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreFS7').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con FS8.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../fs6-accesibilidad-experta/lecture.html">← FS6: Accesibilidad experta</a>
+  <a href="../fs8-plataforma-moderna/lecture.html">FS8: La plataforma moderna →</a>
+</nav>
+
+</div>
+</body>
+</html>

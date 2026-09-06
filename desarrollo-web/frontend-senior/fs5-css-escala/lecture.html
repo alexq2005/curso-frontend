@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FS5 — CSS a escala: arquitectura y la plataforma moderna · Frontend Senior</title>
+  <meta name="description" content="La cascada de verdad, @layer para migrar sin big bang, :has() y su costo de invalidación, container queries, @property y theming sin JS, BEM vs utilities vs Modules vs CSS-in-JS, dead code, subgrid, view transitions y el rendimiento real del CSS.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Frontend Senior</a>
+  <a href="../../modulo-00-sillabus/lecture.html">🎨 Curso Frontend</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">FS5</span>
+  <span class="badge">⏱ 50–115 min</span>
+  <span class="badge">🎯 Pre-req: Curso Frontend M03–M04 · FS4</span>
+  <span class="badge">🏗 Arquitectura CSS</span>
+</div>
+
+<article>
+
+<h1>FS5 — CSS a escala: arquitectura y la plataforma moderna</h1>
+
+<h2>FS5.0 Por qué este módulo</h2>
+
+<p>El CSS de un proyecto viejo casi nunca <em>se rompe</em>. Se <strong>pudre</strong>. Nadie borra una regla, porque nadie puede probar que no la usa nadie; entonces el archivo solo crece. Cada sprint agrega selectores y ninguno saca. A los dos años tenés 240 KB de hoja de estilos donde el 60% no se aplica a nada, hay tres escalas de espaciado conviviendo, y para cambiar el color de un botón hace falta un <code>!important</code> porque en algún lado alguien escribió <code>#app .sidebar ul li a.btn</code>.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El problema del CSS a escala <strong>no es la sintaxis</strong>: la sintaxis la aprendiste en M03. El problema es que el CSS, por diseño, es <strong>global y sin límites</strong>. Cualquier regla puede afectar a cualquier elemento del documento, y nada en el lenguaje te avisa cuándo cruzaste una frontera que no existía. Todo lo que vas a ver acá —capas, scoping, contenedores, convenciones de nombres, herramientas de build— es una respuesta a la misma pregunta: <strong>¿cómo le pongo límites a algo que nació sin ellos?</strong>
+</div>
+
+<p>La buena noticia es que la plataforma cambió mucho entre 2023 y 2026. Cosas que antes requerían una herramienta —ordenar la cascada, hacer que un componente responda a su contenedor y no a la ventana, tipar una variable para poder animarla— ahora son CSS nativo y con soporte real. La mala noticia es que cada una de esas herramientas tiene un costo, y la mayoría de los artículos que las presentan solo cuentan la mitad linda.</p>
+
+<div class="info">
+  <strong>Qué NO es este módulo.</strong> Los fundamentos de CSS (M03) y el layout con Flexbox y Grid (M04) se dan por sabidos. Acá no explicamos qué es <code>display: grid</code>: explicamos por qué tu grilla de tarjetas no se puede reutilizar en el sidebar, y qué mecanismo de 2023 resuelve exactamente eso.
+</div>
+
+<h2>FS5.1 La cascada de verdad</h2>
+
+<p>Casi todo el mundo cree que la cascada es "gana el más específico, y si empata gana el último". Eso es el final del algoritmo, no el algoritmo. El orden real de desempate que aplica el navegador, de mayor a menor prioridad, es este:</p>
+
+<table>
+<thead><tr><th>#</th><th>Criterio</th><th>Qué significa en la práctica</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>Origen e importancia</strong></td><td>Transiciones activas → <code>!important</code> del navegador → <code>!important</code> del usuario → <code>!important</code> del autor → animaciones activas → normal del autor → normal del usuario → normal del navegador</td></tr>
+<tr><td>2</td><td><strong>Contexto</strong></td><td>Los estilos del árbol de luz le ganan a los del Shadow DOM (y al revés con <code>!important</code>)</td></tr>
+<tr><td>3</td><td><strong>Atributo <code>style</code></strong></td><td>El estilo inline le gana a cualquier hoja del mismo origen</td></tr>
+<tr><td>4</td><td><strong>Capas en cascada</strong></td><td>La capa declarada <em>después</em> gana. Lo no encapado gana sobre todas las capas</td></tr>
+<tr><td>5</td><td><strong>Especificidad</strong></td><td>La terna (ids, clases, tipos)</td></tr>
+<tr><td>6</td><td><strong>Proximidad de scope</strong></td><td>Con <code>@scope</code>: gana la regla cuyo scope raíz está más cerca del elemento</td></tr>
+<tr><td>7</td><td><strong>Orden de aparición</strong></td><td>La última declaración que llegó</td></tr>
+</tbody>
+</table>
+
+<p>Fijate dónde está la especificidad: <strong>quinta</strong>. Cuatro criterios se resuelven antes. Eso es lo que hace que <code>@layer</code> sea tan potente y también tan peligroso si no lo entendés: mueve la pelea del criterio 5 al criterio 4, donde vos controlás el orden con una sola línea.</p>
+
+<h3>Especificidad: la aritmética que sí importa</h3>
+
+<p>La especificidad es una terna <code>(a, b, c)</code> que se compara de izquierda a derecha, <strong>sin acarreo</strong>: 11 clases nunca le ganan a un id.</p>
+
+<pre><code class="lang-css">/* (a=ids, b=clases/atributos/pseudo-clases, c=tipos/pseudo-elementos) */
+
+a                        /* (0,0,1) */
+.btn                     /* (0,1,0) */
+a.btn                    /* (0,1,1) */
+#app .btn                /* (1,1,0) */
+.card &gt; .title           /* (0,2,0) — el combinador no suma nada */
+li:nth-child(2)          /* (0,1,1) */
+::before                 /* (0,0,1) */
+
+/* Las tres pseudo-clases funcionales que cambian la aritmética */
+:where(.a, #b, .c)       /* (0,0,0) — SIEMPRE cero, pase lo que pase adentro */
+:is(.a, #b, .c)          /* (1,0,0) — el MÁXIMO de la lista */
+:not(.a, #b)             /* (1,0,0) — el MÁXIMO de la lista */
+h2:has(&gt; img)            /* (0,0,1) + el máximo de adentro → acá (0,0,2) */</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>:where()</code> es la herramienta más subvalorada del CSS moderno.</strong> Te deja escribir selectores complejos que <em>no pesan nada</em> en la cascada. Un reset o una librería de componentes escrita con <code>:where()</code> se puede sobreescribir con una sola clase, sin <code>!important</code> y sin importar el orden de los archivos. Si publicás CSS que otros van a consumir, envolvé tus selectores base en <code>:where()</code> y les regalás la vida.
+</div>
+
+<pre><code class="lang-css">/* Reset agresivo, especificidad CERO: cualquiera lo pisa con una clase */
+:where(h1, h2, h3, h4, p, ul, ol, figure, blockquote) {
+  margin-block: 0;
+}
+
+/* El consumidor hace esto y funciona, sin importar el orden de carga */
+.prosa p { margin-block: 1rem; }   /* (0,2,0) vs (0,0,0) → gana siempre */</code></pre>
+
+<h3>Por qué <code>!important</code> es un síntoma</h3>
+
+<p><code>!important</code> no es "prioridad alta". Es <strong>cambiar de banda de origen</strong>: la declaración se muda a la banda 4 de la tabla de arriba, donde compite con otros <code>!important</code> de autor. Por eso la escalada es inevitable: si el único mecanismo para ganar es mudarse de banda, y ya estás todos en la misma banda, la única salida que queda es la especificidad… dentro de la banda de los importantes. Y ahí volvés al punto de partida, pero con más ruido.</p>
+
+<div class="mistake">
+  <strong>El diagnóstico correcto.</strong> Cada <code>!important</code> en tu código responde a una de estas tres causas, y cada una tiene una cura distinta que <em>no</em> es <code>!important</code>:
+  <ul>
+    <li><strong>Estoy peleando contra una librería de terceros</strong> → cura: <code>@layer</code>, meterla en una capa baja.</li>
+    <li><strong>Estoy peleando contra código mío de otro archivo</strong> → cura: <code>@layer</code> o bajar la especificidad del origen con <code>:where()</code>.</li>
+    <li><strong>Estoy peleando contra un estilo inline que pone JavaScript</strong> → cura: que el JS toque una clase o una custom property, no <code>element.style</code>. Este es el único caso donde <code>!important</code> a veces es la respuesta honesta.</li>
+  </ul>
+</div>
+
+<div class="warn">
+  <strong>Métrica de salud, no de estilo.</strong> Contá los <code>!important</code> de tu proyecto y ponelo en el CI como un número que <strong>no puede subir</strong>. No hace falta que baje a cero: hace falta que agregar uno nuevo sea una decisión consciente y no un reflejo. Un <code>grep -c '!important'</code> en el bundle final es el chequeo de arquitectura CSS más barato que existe.
+</div>
+
+<h2>FS5.2 <code>@layer</code>: ordenar la cascada sin pelear especificidad</h2>
+
+<p>Las <strong>capas en cascada</strong> (<code>@layer</code>) son, de todo lo que llegó en los últimos años, lo que más cambia la arquitectura de un proyecto grande. Son <strong>Baseline widely available desde septiembre de 2024</strong> (Chrome/Edge 99, Firefox 97, Safari 15.4, todas de principios de 2022), con más del 96% de cobertura global.</p>
+
+<p>La idea es simple: vos declarás un orden de prioridad entre grupos de estilos, y ese orden gana <strong>antes</strong> que la especificidad. Un selector de un solo carácter en una capa alta le gana a un monstruo de cinco ids en una capa baja.</p>
+
+<pre><code class="lang-css">/* Una sola línea, arriba de todo del archivo de entrada.
+   Define el orden de prioridad: de MENOR a MAYOR. */
+@layer reset, vendor, base, layout, components, utilities;
+
+@layer vendor {
+  /* Bootstrap, un date picker, lo que sea */
+  #app .navbar .nav-link.active { color: #0d6efd; }   /* (1,3,0) */
+}
+
+@layer components {
+  .nav-link { color: var(--brand); }                   /* (0,1,0) */
+}
+
+/* La regla de `components` GANA, aunque su especificidad sea 30 veces menor,
+   porque `components` se declaró después de `vendor`. */</code></pre>
+
+<h3>Las cuatro reglas que tenés que saber de memoria</h3>
+
+<div class="step"><strong>1. El orden se define en la <em>primera</em> declaración de cada nombre.</strong> Por eso conviene declarar todas las capas vacías, en una línea, arriba de todo. Si no lo hacés, el orden lo determina el orden de aparición de los bloques, que depende del orden de tu bundler — es decir, el azar.</div>
+
+<div class="step"><strong>2. Lo no encapado le gana a TODAS las capas.</strong> Cualquier regla que esté fuera de un <code>@layer</code> se comporta como si estuviera en una capa implícita al final del stack. No es un bug: es la propiedad que hace posible migrar sin big bang.</div>
+
+<div class="step"><strong>3. <code>!important</code> invierte el orden de las capas.</strong> Entre declaraciones importantes, la capa declarada <em>primero</em> gana, y lo no encapado importante <strong>pierde</strong> contra todo lo encapado importante. Es coherente (el reset importante debería ser el más fuerte) y es profundamente contraintuitivo la primera vez.</div>
+
+<div class="step"><strong>4. Las capas anidan.</strong> <code>@layer components.card { }</code> crea la subcapa <code>card</code> dentro de <code>components</code>, y su orden solo compite con sus hermanas. Sirve para que cada equipo maneje su propio orden interno sin tocar el global.</div>
+
+<div class="danger">
+  <strong>⚠️ El error que te va a morder.</strong> Migrás medio proyecto a capas, todo funciona, y una semana después alguien agrega un archivo nuevo sin envolverlo en <code>@layer</code>. Ese archivo pisa <strong>todo</strong> tu sistema, incluidas las utilidades, y el bug se reporta como "el margen del botón está mal en una sola página". La defensa es un lint que exija que todo archivo de la carpeta <code>styles/</code> empiece con <code>@layer</code>, o —más simple— que el archivo de entrada importe todo con <code>layer()</code> y ningún módulo se importe suelto.
+</div>
+
+<h3>Cómo se migra un proyecto que ya existe (sin big bang)</h3>
+
+<p>Esta es la parte que casi nunca se cuenta, y es la razón principal para adoptar capas. La regla 2 —lo no encapado gana— convierte la migración en algo <strong>incremental y reversible</strong>:</p>
+
+<pre><code class="lang-css">/* PASO 1 — main.css. No cambia NADA visualmente.
+   Todo tu CSS actual sigue sin encapar, y por lo tanto sigue ganando. */
+@layer reset, vendor, base, components, utilities;
+
+@import url("./legacy/todo-lo-viejo.css");   /* sin layer(): sigue arriba de todo */</code></pre>
+
+<pre><code class="lang-css">/* PASO 2 — Meté los terceros en la capa más baja.
+   Acá empiezan a sobrar los !important que existían solo para ganarle a Bootstrap. */
+@import url("bootstrap/dist/css/bootstrap.css") layer(vendor);
+@import url("flatpickr/dist/flatpickr.css")     layer(vendor);</code></pre>
+
+<pre><code class="lang-css">/* PASO 3 — Migrá componente por componente, a medida que los tocás.
+   Cada componente que entra a una capa puede perder sus !important. */
+@layer components {
+  @import url("./components/card.css");
+  @import url("./components/button.css");
+}</code></pre>
+
+<div class="tip">
+  <strong>El truco de oro de la migración:</strong> mové primero lo que <em>no controlás</em> (vendor) y último lo que más se toca (utilities). Cada paso es un PR chico, con un solo criterio de aceptación —"ninguna captura visual cambió"— y con revert de una línea. Nunca vas a tener el proyecto "a medio migrar y roto", porque en cada estado intermedio lo no encapado sigue mandando.
+</div>
+
+<div class="warn">
+  <strong>El costo real de las capas.</strong> Tres, y ninguno es de rendimiento:
+  <ul>
+    <li><strong>Un <code>@import</code> crudo en el navegador cuesta un round-trip serializado</strong> (el navegador no descubre el archivo importado hasta que parseó el que lo importa). En build está perfecto porque el bundler lo aplana; en producción, jamás sirvas un CSS con <code>@import</code> sin aplanar.</li>
+    <li><strong>Un <code>&lt;link rel="stylesheet"&gt;</code> no se puede encapar.</strong> Si cargás la librería con un tag, no hay forma de meterla en una capa: hay que pasarla por <code>@import ... layer()</code> o por el bundler.</li>
+    <li><strong>Debuggear un orden mal declarado es horrible.</strong> El síntoma es "esta regla se ve tachada en DevTools y no entiendo por qué": DevTools ya muestra el nombre de la capa junto al origen, pero hay que saber mirarlo.</li>
+  </ul>
+</div>
+
+<h2>FS5.3 <code>:has()</code>: el selector padre y lo que cuesta</h2>
+
+<p><code>:has()</code> es la pseudo-clase que rompió una limitación de veinte años: <strong>seleccionar un elemento por lo que contiene</strong>. Llegó a Baseline <em>newly available</em> en diciembre de 2023 y pasó a <strong>Baseline <em>widely available</em> en junio de 2026</strong>, así que a esta altura no hay razón para tratarlo como experimental.</p>
+
+<p>Lo que cambia no es "escribir menos JavaScript": es que <strong>una clase entera de estado deja de necesitar JavaScript</strong>. Antes, para que una tarjeta se viera distinta si tenía imagen, alguien tenía que agregar <code>.card--con-imagen</code> desde el servidor o desde el cliente. Ahora el estado <em>ya está en el DOM</em> y el CSS lo puede leer.</p>
+
+<pre><code class="lang-css">/* 1 — Layout según el contenido: la tarjeta se acomoda sola */
+.card:has(&gt; img) { grid-template-columns: 120px 1fr; }
+.card:not(:has(&gt; img)) { grid-template-columns: 1fr; }
+
+/* 2 — Validación sin JS: el error se muestra solo si el campo es inválido
+       Y el usuario ya lo tocó (nadie quiere ver "error" en un campo vacío) */
+.field:has(input:user-invalid) { --borde: var(--danger); }
+.field:has(input:user-invalid) .mensaje-error { display: block; }
+
+/* 3 — Combinador de hermano ANTERIOR, que nunca existió */
+label:has(+ input:required)::after { content: " *"; color: var(--danger); }
+
+/* 4 — Estado de página desde un elemento cualquiera */
+body:has(dialog[open]) { overflow: hidden; }          /* bloquear scroll de fondo */
+.layout:has(.sidebar:empty) { grid-template-columns: 1fr; }
+
+/* 5 — Cantidad de hijos, que tampoco existía como selector */
+.grid:has(&gt; :nth-child(4)) { --columnas: 2; }         /* 4 hijos o más → 2 columnas */</code></pre>
+
+<div class="info">
+  <strong>Especificidad de <code>:has()</code>:</strong> aporta la del argumento <em>más específico</em> de su lista, igual que <code>:is()</code>. <code>.card:has(#hero)</code> pesa <code>(1,1,0)</code>, no <code>(0,1,0)</code>. Si querés el poder de <code>:has()</code> sin el peso, envolvé el argumento: <code>.card:has(:where(#hero))</code> → <code>(0,1,0)</code>.
+</div>
+
+<h3>El costo: no es hacer match, es invalidar</h3>
+
+<p>Acá está la parte que los tutoriales saltean. El costo de <code>:has()</code> <strong>no está en encontrar los elementos que matchean</strong> —eso el navegador lo hace rápido—; está en que <code>:has()</code> invierte la dirección de la invalidación. Normalmente, cuando cambia un elemento, el navegador sabe que solo puede haber afectado a ese elemento y a sus descendientes. Con <code>:has()</code>, cambiar un nodo hoja puede afectar el estilo de <strong>cualquier ancestro</strong>, así que el motor tiene que subir el árbol comprobando.</p>
+
+<pre><code class="lang-css">/* ⚠️ Caro: cualquier cambio en cualquier parte del documento obliga a
+   reevaluar si `body` sigue matcheando. Si esto se togglea en cada scroll,
+   se paga un recálculo de estilo sobre TODO el árbol. */
+body:has(.panel .item.activo) { --tema: oscuro; }
+
+/* ✅ Barato: el ámbito de invalidación es el propio .panel y sus hijos */
+.panel:has(&gt; .item.activo) { --tema: oscuro; }</code></pre>
+
+<div class="rule">
+  <strong>📌 Tres reglas prácticas para <code>:has()</code>.</strong>
+  <ol>
+    <li><strong>Acotá el ancestro.</strong> Preferí el ancestro más chico que sirva; <code>body:has()</code> y <code>html:has()</code> son la versión cara.</li>
+    <li><strong>Preferí el combinador hijo</strong> (<code>:has(&gt; .x)</code>) al descendiente (<code>:has(.x)</code>): limita el subárbol que hay que vigilar.</li>
+    <li><strong>Medilo antes de defenderlo.</strong> En DevTools → Performance, mirá <em>Recalculate Style</em> durante la interacción sospechosa, y activá <em>Selector Stats</em> en la solapa de experimentos: te da tiempo transcurrido e intentos de match por selector. Un <code>:has()</code> problemático aparece primero en esa lista, no hay que adivinarlo.</li>
+  </ol>
+</div>
+
+<div class="mistake">
+  <strong>El anti-patrón clásico.</strong> Alguien reemplaza una clase que ponía JavaScript (<code>document.body.classList.toggle('modal-abierto')</code>) por <code>body:has(dialog[open])</code> y se siente muy moderno. En este caso puntual está bien, porque <code>dialog[open]</code> cambia dos veces por sesión. Pero si el estado cambia <em>en cada frame</em> —un drag, un scroll, un input— la clase explícita puesta por JS es más barata y más predecible que hacer que el motor de estilos infiera el estado subiendo el árbol.
+</div>
+
+<h2>FS5.4 Container queries: el componente que se puede mover</h2>
+
+<p>Una media query pregunta por el <strong>viewport</strong>. Eso significa que un componente con media queries adentro tiene una dependencia oculta con la página completa. Podés ponerlo en el contenido principal y funciona; lo movés a un sidebar de 320 px y se rompe, aunque la ventana siga midiendo 1440 px. Un componente que responde al viewport <strong>no es un componente: es un fragmento de página</strong>.</p>
+
+<div class="concept">
+  <strong>💡 La idea.</strong> Las <em>container queries</em> invierten la pregunta: en lugar de "¿cuánto mide la ventana?", el componente pregunta <strong>"¿cuánto mido yo?"</strong>. Con eso, la misma tarjeta se ve en una columna cuando está en un sidebar angosto y en dos columnas cuando está en el contenido ancho, <em>sin que nadie le pase una prop, una clase ni un breakpoint</em>. Son Baseline <em>widely available</em> desde febrero de 2023 en su forma de tamaño (Chrome/Edge 105, Safari 16, Firefox 110).
+</div>
+
+<pre><code class="lang-css">/* 1 — El contenedor se declara. Sin esto, no hay a quién preguntarle. */
+.card-slot {
+  container-type: inline-size;   /* solo mide el ancho: lo normal */
+  container-name: tarjeta;       /* opcional pero muy recomendable */
+}
+
+/* Atajo equivalente */
+.card-slot { container: tarjeta / inline-size; }
+
+/* 2 — El componente pregunta por SU contenedor, no por la ventana */
+@container tarjeta (inline-size &gt;= 420px) {
+  .card { grid-template-columns: 160px 1fr; }
+  .card__resumen { display: block; }
+}
+
+@container tarjeta (inline-size &lt; 260px) {
+  .card__meta { display: none; }
+}</code></pre>
+
+<p>El markup obliga a una separación que no es opcional: <strong>el contenedor y el componente tienen que ser elementos distintos</strong>, porque un contenedor no puede consultarse a sí mismo. Ese wrapper es el costo estructural de las container queries, y conviene asumirlo desde el diseño del componente en vez de descubrirlo al tercer bug:</p>
+
+<pre><code class="lang-html">&lt;!-- El slot mide; la tarjeta reacciona. Son dos elementos, siempre. --&gt;
+&lt;div class="card-slot"&gt;
+  &lt;article class="card"&gt;
+    &lt;img class="card__img" src="/p/123.avif" width="320" height="240" alt=""&gt;
+    &lt;h3 class="card__titulo"&gt;Teclado mecánico 65%&lt;/h3&gt;
+    &lt;p class="card__resumen"&gt;Switches lineales, hot-swap, USB-C.&lt;/p&gt;
+    &lt;p class="card__meta"&gt;Envío en 24 h&lt;/p&gt;
+  &lt;/article&gt;
+&lt;/div&gt;
+
+&lt;!-- La MISMA tarjeta, sin una sola prop distinta, en un sidebar de 280px
+     y en una grilla de 900px. Eso es lo que compran las container queries. --&gt;</code></pre>
+
+<h3>Las unidades <code>cq*</code>: tipografía relativa al contenedor</h3>
+
+<p>Junto con <code>@container</code> llegaron unidades que se resuelven contra el contenedor de consulta más cercano, igual que <code>vw</code>/<code>vh</code> se resuelven contra el viewport:</p>
+
+<table>
+<thead><tr><th>Unidad</th><th>1 unidad =</th><th>Uso típico</th></tr></thead>
+<tbody>
+<tr><td><code>cqi</code></td><td>1% del <em>inline size</em> del contenedor</td><td>La que vas a usar el 90% de las veces</td></tr>
+<tr><td><code>cqb</code></td><td>1% del <em>block size</em> del contenedor</td><td>Requiere <code>container-type: size</code></td></tr>
+<tr><td><code>cqw</code> / <code>cqh</code></td><td>1% del ancho / alto físico</td><td>Cuando no te importa el modo de escritura</td></tr>
+<tr><td><code>cqmin</code> / <code>cqmax</code></td><td>La menor / mayor de <code>cqi</code> y <code>cqb</code></td><td>Tipografía que no explota en contenedores raros</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-css">/* Título que escala con el ancho del contenedor, con techo y piso.
+   Reemplaza tres breakpoints por una línea. */
+.card__titulo {
+  font-size: clamp(1rem, 4cqi, 2rem);
+}</code></pre>
+
+<h3>Qué reemplaza y qué NO</h3>
+
+<table>
+<thead><tr><th>Decisión</th><th>Herramienta correcta</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Tarjeta a 1 o 2 columnas según el espacio que le tocó</td><td><strong>Container query</strong></td><td>Es una propiedad del componente, no de la página</td></tr>
+<tr><td>Nav horizontal vs hamburguesa</td><td><strong>Media query</strong></td><td>Es una decisión del <em>shell</em> de la página: el nav ES la página</td></tr>
+<tr><td>Cantidad de columnas del layout general</td><td><strong>Media query</strong> (o <code>auto-fit</code>)</td><td>Nadie mueve el layout raíz a otro contenedor</td></tr>
+<tr><td>Tema claro/oscuro, movimiento reducido, alto contraste</td><td><strong>Media query</strong></td><td>No son tamaños: son preferencias del usuario, y no tienen equivalente en <code>@container</code></td></tr>
+<tr><td>Estilos de impresión</td><td><strong>Media query</strong></td><td><code>@media print</code> no tiene reemplazo</td></tr>
+<tr><td>Variante según un token del contenedor (ej: <code>--densidad: compacta</code>)</td><td><strong>Style query</strong> (<code>@container style()</code>)</td><td>Existe, pero su soporte es bastante más nuevo que el de las de tamaño: tratala como progresiva</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ La trampa número uno: <code>container-type: size</code> te colapsa la altura.</strong> Para que el navegador pueda responder una consulta de tamaño <em>antes</em> de haber dispuesto el contenido, el contenedor tiene que tener <strong>containment</strong> en esa dimensión: su tamaño no puede depender de lo que tiene adentro. Con <code>inline-size</code> eso solo aplica al ancho, que en flujo normal ya viene del padre — no se nota. Con <code>size</code> aplica <strong>también al alto</strong>, y como el alto normalmente <em>sí</em> depende del contenido, el contenedor colapsa a 0 px. Regla: usá <code>inline-size</code> salvo que tengas una altura explícita y sepas exactamente por qué necesitás <code>cqb</code>.
+</div>
+
+<div class="warn">
+  <strong>Los otros tres costos.</strong>
+  <ul>
+    <li><strong>Un contenedor no se puede consultar a sí mismo.</strong> El elemento que declara <code>container-type</code> queda fuera del alcance de su propia <code>@container</code>. Casi siempre hace falta un wrapper, y eso es un <code>div</code> extra en el markup por cada componente responsivo.</li>
+    <li><strong><code>container-type</code> aplica containment de layout y estilo</strong>, lo que puede cambiar comportamientos sutiles: <code>position: fixed</code> de un descendiente pasa a posicionarse contra el contenedor, y los márgenes dejan de colapsar hacia afuera.</li>
+    <li><strong>El nombre es un contrato global.</strong> Si no usás <code>container-name</code>, <code>@container</code> se resuelve contra el contenedor <em>más cercano</em>, y anidar dos componentes responsivos produce bugs que se ven como magia negra. Nombrá siempre.</li>
+  </ul>
+</div>
+
+<h2>FS5.5 Custom properties a fondo</h2>
+
+<p>Las custom properties no son "las variables de Sass pero en CSS". La diferencia es de naturaleza y es la que explica todo lo demás: <strong>una variable de Sass se resuelve en build; una custom property se resuelve en el navegador, en tiempo de valor computado, y <em>hereda</em></strong>. Eso las convierte en un canal de comunicación entre padres e hijos que atraviesa componentes, medios, temas y estados.</p>
+
+<pre><code class="lang-css">/* El patrón fundamental: el componente declara SU API pública en variables,
+   y el consumidor la configura desde afuera sin tocar los selectores internos. */
+.btn {
+  --btn-bg: var(--color-brand, #4f46e5);
+  --btn-fg: white;
+  --btn-pad: 0.6rem 1.1rem;
+
+  background: var(--btn-bg);
+  color: var(--btn-fg);
+  padding: var(--btn-pad);
+}
+
+/* El consumidor NO reescribe .btn: le pasa parámetros por herencia */
+.barra-peligro { --btn-bg: var(--color-danger); }
+.toolbar-compacta { --btn-pad: 0.3rem 0.6rem; }</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla de diseño.</strong> Un componente bien hecho expone <strong>pocas custom properties con nombres estables</strong> y mantiene todo lo demás privado. Esas variables son tu API: cambiarles el nombre es un breaking change, igual que renombrar una prop. Documentalas como documentarías una función.
+</div>
+
+<h3><code>@property</code>: variables tipadas y animables</h3>
+
+<p>Una custom property común es, para el motor, <strong>una cadena de texto</strong>. No sabe que <code>--angulo: 45deg</code> es un ángulo, así que no lo puede interpolar: animarla produce un salto, no una transición. <code>@property</code> registra la variable con un tipo, y con eso desbloquea tres cosas.</p>
+
+<pre><code class="lang-css">@property --angulo {
+  syntax: "&lt;angle&gt;";      /* 1. Tipo: ahora el motor sabe interpolarlo */
+  inherits: false;         /* 2. Control explícito de la herencia */
+  initial-value: 0deg;     /* 3. Valor inicial garantizado */
+}
+
+.tarjeta-borde {
+  --angulo: 0deg;
+  background: linear-gradient(var(--angulo), var(--c1), var(--c2));
+  transition: --angulo 400ms ease;   /* ⬅ esto NO funciona sin @property */
+}
+.tarjeta-borde:hover { --angulo: 180deg; }</code></pre>
+
+<table>
+<thead><tr><th>Lo que desbloquea</th><th>Detalle</th></tr></thead>
+<tbody>
+<tr><td><strong>Animación e interpolación</strong></td><td>Un <code>&lt;angle&gt;</code>, <code>&lt;color&gt;</code>, <code>&lt;length&gt;</code> o <code>&lt;number&gt;</code> registrado se puede poner en <code>transition</code> y <code>@keyframes</code></td></tr>
+<tr><td><strong>Validación</strong></td><td>Un valor que no cumple el <code>syntax</code> se descarta y se usa el <code>initial-value</code>, en vez de propagar basura hacia abajo</td></tr>
+<tr><td><strong>Control de herencia</strong></td><td><code>inherits: false</code> corta la herencia: ideal para variables internas de un componente que no deben filtrarse a los hijos</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Estado de <code>@property</code> en 2026 (esto suele contarse mal).</strong> Es Baseline <strong><em>newly</em> available</strong> desde el 9 de julio de 2024 —Chrome/Edge 85, Safari 16.4, Firefox 128—, y su paso a <em>widely available</em> está proyectado recién para <strong>enero de 2027</strong>. Traducción práctica: es seguro para mejoras progresivas (una animación más linda), y todavía no para algo de lo que dependa la legibilidad o el layout. Si un usuario con un navegador viejo no ve tu gradiente animado, no pasa nada; si no ve el texto, sí.
+</div>
+
+<h3>Theming sin una línea de JavaScript</h3>
+
+<p>El patrón completo son cuatro piezas: <code>color-scheme</code> para que el navegador pinte los controles nativos y la barra de scroll acordes, <code>light-dark()</code> para escribir los dos valores en una sola declaración, un <code>@media (prefers-color-scheme)</code> para respetar el sistema, y un atributo en la raíz para la elección explícita del usuario.</p>
+
+<pre><code class="lang-css">:root {
+  /* "El usuario elige, y si no eligió, seguimos al sistema" */
+  color-scheme: light dark;
+
+  --fondo:  light-dark(#ffffff, #0f172a);
+  --texto:  light-dark(#0f172a, #f1f5f9);
+  --borde:  light-dark(#e2e8f0, #334155);
+}
+
+/* Elección explícita: un atributo en &lt;html&gt; y listo */
+:root[data-tema="light"] { color-scheme: light; }
+:root[data-tema="dark"]  { color-scheme: dark; }
+
+body { background: var(--fondo); color: var(--texto); }</code></pre>
+
+<div class="tip">
+  Con esto, el único JavaScript que queda es el que lee la preferencia guardada y escribe <code>data-tema</code> en <code>&lt;html&gt;</code> — tres líneas, en un script bloqueante en el <code>&lt;head&gt;</code> para evitar el flash de tema equivocado. Todo el resto del sistema de temas es CSS y no crece cuando agregás componentes: si el componente usa las variables, ya está tematizado.
+</div>
+
+<div class="mistake">
+  <strong>El costo escondido: el radio de invalidación.</strong> Cambiar una custom property en <code>:root</code> invalida el estilo computado de <strong>todos</strong> los elementos que la heredan — es decir, del documento entero. Para un cambio de tema, eso es correcto y ocurre una vez. Para un valor que cambia en cada frame (la posición del mouse, el progreso de un scroll), es carísimo: declará esa variable <strong>en el elemento más bajo posible</strong>, o registrala con <code>inherits: false</code> para que el motor sepa que no tiene que bajar por el árbol.
+</div>
+
+<h2>FS5.6 Arquitectura: las cuatro familias y su costo real</h2>
+
+<p>Toda metodología de CSS resuelve el mismo problema —el alcance global— y las diferencias están en <em>a quién le pasa el costo</em>. Esta es la comparación honesta:</p>
+
+<table>
+<thead><tr><th>Enfoque</th><th>Qué problema resuelve REALMENTE</th><th>Runtime</th><th>Tamaño</th><th>Lo que te cobra</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>BEM</strong><br>(y convenciones)</td>
+  <td>El alcance global, <em>por acuerdo humano</em>. Cero herramientas: funciona en un HTML suelto</td>
+  <td>Ninguno</td>
+  <td>Crece con cada componente y no baja nunca</td>
+  <td><strong>Disciplina manual.</strong> Nada la verifica, así que se degrada con cada persona nueva. El código muerto es invisible: borrar un componente no borra su CSS</td>
+</tr>
+<tr>
+  <td><strong>Utility-first</strong><br>(Tailwind)</td>
+  <td>Que la hoja de estilos deje de crecer: el CSS pasa a crecer con el <em>sistema de diseño</em>, no con la cantidad de páginas. Y elimina el problema de nombrar</td>
+  <td>Ninguno (todo en build)</td>
+  <td>Tope acotado y estable; el peso se muda al HTML, que comprime muy bien por repetición</td>
+  <td><strong>Markup ruidoso y diffs ilegibles.</strong> Requiere build. La única fuente de verdad del diseño vive en la config, no en el CSS. Sin extraer componentes, la duplicación se hace en HTML</td>
+</tr>
+<tr>
+  <td><strong>CSS Modules</strong></td>
+  <td>El alcance global, <em>de verdad</em>: el bundler genera nombres únicos. Es CSS real, sin dialecto</td>
+  <td>Prácticamente cero (un mapa de nombres)</td>
+  <td>Proporcional a los componentes que realmente importás; el tree-shaking funciona</td>
+  <td><strong>Necesita bundler.</strong> Compartir valores entre archivos es incómodo (<code>composes</code>, o custom properties). Lo dinámico por props no se puede expresar: sale por variables o estilo inline</td>
+</tr>
+<tr>
+  <td><strong>CSS-in-JS con runtime</strong><br>(styled-components, Emotion)</td>
+  <td>Colocación total y estilos que dependen de props/estado en JS, sin inventar clases</td>
+  <td><strong>Real</strong>: serializar, hashear e inyectar en cada render</td>
+  <td>+12–20 KB de librería, más el CSS embebido en el bundle de JS</td>
+  <td><strong>Incompatible con React Server Components</strong>, SSR y streaming complicados, y un costo por render que aparece en el INP de listas grandes</td>
+</tr>
+<tr>
+  <td><strong>CSS-in-JS sin runtime</strong><br>(vanilla-extract, Panda, StyleX)</td>
+  <td>La misma DX de escribir estilos en TypeScript, con tipos, pero <strong>extrayendo a CSS estático en build</strong></td>
+  <td>Ninguno</td>
+  <td>CSS estático, atómico en varios de ellos</td>
+  <td><strong>Lo dinámico tiene que pasar por custom properties o variantes predefinidas.</strong> Build más complejo, ecosistema y comunidad más chicos, y el bloqueo a un compilador propio</td>
+</tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Cómo elegir sin discutir tres horas.</strong> Respondé dos preguntas: <strong>(1) ¿tenés un paso de build?</strong> Si no —un sitio estático, un widget embebible, un email—, BEM con <code>@layer</code> es la respuesta correcta y no hay más discusión. <strong>(2) ¿tus estilos dependen de valores que solo existen en runtime?</strong> Si la respuesta honesta es "de tres a cinco variantes y un color de marca", eso son custom properties, no CSS-in-JS. La necesidad genuina de generar CSS arbitrario en runtime es mucho más rara de lo que la gente cree.
+</div>
+
+<div class="analogy">
+  <strong>Una forma de verlo.</strong> BEM le pide al equipo que recuerde las fronteras. Tailwind las hace innecesarias, porque no hay nada que nombrar. CSS Modules se las pide al compilador. CSS-in-JS se las pide al runtime. Cuanto más tarde en el ciclo de vida le pedís la garantía, más te cuesta en el navegador del usuario — y el usuario no eligió tu metodología.
+</div>
+
+<h2>FS5.7 Por qué el CSS-in-JS con runtime cayó en desgracia</h2>
+
+<p>Entre 2018 y 2022, CSS-in-JS con runtime fue el default de facto del ecosistema React. En 2026 es una tecnología en retirada. Los números lo muestran sin ambigüedad:</p>
+
+<table>
+<thead><tr><th>Paquete</th><th>Descargas semanales 2023</th><th>2026</th><th>Variación</th></tr></thead>
+<tbody>
+<tr><td><code>styled-components</code></td><td>~8,5 M</td><td>~6,8 M</td><td>−20% · proyecto en <strong>modo mantenimiento</strong></td></tr>
+<tr><td><code>tailwindcss</code></td><td>~6 M</td><td>~12 M</td><td>×2</td></tr>
+<tr><td><code>@pandacss/dev</code></td><td>~80 K</td><td>~200 K</td><td>+150% (desde una base chica)</td></tr>
+</tbody>
+</table>
+
+<p>La causa no fue una moda: fue una <strong>incompatibilidad arquitectónica</strong>. El runtime de CSS-in-JS inyecta estilos <em>durante el render</em>, coordinándose a través del contexto de React. Los <strong>React Server Components</strong> no corren en un contexto de cliente que pueda recolectar e inyectar esos estilos, y el <strong>streaming SSR</strong> rompe la premisa de "junto todos los estilos y los emito en el <code>&lt;head&gt;</code>", porque el HTML se empieza a mandar antes de que existan. A eso se le sumó el costo por render, que en listas largas aparece directamente en el INP.</p>
+
+<div class="info">
+  <strong>Lo que lo reemplazó.</strong> No fue una cosa, fueron dos: <strong>utility-first</strong> (Tailwind, que duplicó su adopción) para equipos que quieren velocidad y un sistema cerrado, y <strong>zero-runtime CSS-in-JS</strong> (vanilla-extract, Panda CSS, StyleX) para equipos que quieren conservar la DX de tipos en TypeScript. Ambos comparten la misma idea: <strong>la extracción ocurre en build</strong>, y lo que llega al navegador es CSS estático, cacheable y sin librería.
+</div>
+
+<h3>Qué hacer si ya tenés uno (probablemente: casi nada)</h3>
+
+<div class="step"><strong>1. Medí antes de decidir.</strong> Abrí un perfil de Performance en la vista más pesada y buscá cuánto tiempo se va en la serialización de estilos. Si es el 2% del render, <strong>no tenés un problema de estilos</strong>, tenés una moda. Migrar por moda es cómo se pierden tres sprints sin un solo cambio visible para el usuario.</div>
+
+<div class="step"><strong>2. Congelá la frontera.</strong> Regla de equipo: ningún componente nuevo usa la librería vieja. Esto no cuesta nada y hace que el problema deje de crecer, que es el 80% del valor.</div>
+
+<div class="step"><strong>3. Sacá los tokens primero.</strong> Mové colores, espaciados y tipografía del objeto de tema de JS a <strong>custom properties en CSS</strong>. Con eso, la mayoría de los componentes dejan de necesitar el runtime: ya no necesitan JS para saber qué color usar, lo heredan. Este paso solo ya suele eliminar la mitad de las razones para tener la librería.</div>
+
+<div class="step"><strong>4. Migrá desde las hojas hacia la raíz.</strong> Los componentes hoja (un botón, un badge) no tienen hijos cuyos estilos dependan de ellos: se pueden convertir de a uno, con un cambio de import y una revisión visual. Los layouts van último.</div>
+
+<div class="step"><strong>5. Si el bloqueante son los RSC, la migración deja de ser opcional</strong> — pero incluso ahí el camino es el mismo, solo que con fecha. Marcá los componentes que tienen que ser de servidor y migrá esos primero; el resto puede convivir indefinidamente en el lado cliente.</div>
+
+<div class="warn">
+  <strong>La regla que evita el desastre.</strong> Una migración de la capa de estilos es el proyecto arquetípico que consume meses y produce <strong>cero cambio visible</strong>. Si no podés escribir el beneficio como un número —"−18 KB de JS", "−40 ms de INP en la lista de pedidos", "desbloquea RSC en el checkout"— entonces todavía no tenés una justificación: tenés una preferencia estética. Escribí el número primero.
+</div>
+
+<h2>FS5.8 Dead code: por qué el CSS sin usar no se detecta</h2>
+
+<p>En JavaScript, un bundler puede probar que una función no se importa desde ningún lado y borrarla. En CSS eso es <strong>indecidible en el caso general</strong>, y no por falta de herramientas: por la naturaleza del lenguaje. Un selector no se "llama": <em>espera</em>. Y la lista de razones por las que puede estar esperando algo legítimo es larga:</p>
+
+<table>
+<thead><tr><th>Por qué parece muerto</th><th>Ejemplo</th><th>Y sin embargo…</th></tr></thead>
+<tbody>
+<tr><td><strong>Estado no alcanzado</strong></td><td><code>.modal.is-open</code>, <code>.btn:hover</code>, <code>input:invalid</code></td><td>Se usa, pero solo cuando el usuario hace algo que el análisis no hizo</td></tr>
+<tr><td><strong>Clase construida dinámicamente</strong></td><td><code>clsx('badge--' + estado)</code>, <code>`col-${n}`</code></td><td>La cadena literal <code>badge--error</code> no existe en ningún archivo</td></tr>
+<tr><td><strong>Markup de terceros</strong></td><td>Un widget de chat, un date picker, un embed de pagos</td><td>Las clases aparecen en el DOM recién en runtime</td></tr>
+<tr><td><strong>Contenido de un CMS</strong></td><td>HTML que escriben editores, no programadores</td><td>Ninguna herramienta estática ve ese HTML</td></tr>
+<tr><td><strong>Otro medio</strong></td><td><code>@media print</code>, estilos de email, alto contraste</td><td>Nunca se ejercita en una carga normal</td></tr>
+<tr><td><strong>Otra ruta</strong></td><td>El panel de admin, el flujo de error, el onboarding</td><td>Está vivo, en una página que no visitaste</td></tr>
+</tbody>
+</table>
+
+<h3>Coverage de DevTools y su límite exacto</h3>
+
+<p>Chrome tiene un panel de <em>Coverage</em> que te dice qué bytes de cada hoja no se usaron. Es útil y es la primera parada, pero su límite hay que entenderlo con precisión: <strong>te dice qué no se usó en <em>esta</em> página, en <em>este</em> estado, durante <em>esta</em> grabación</strong>. No te dice que algo esté muerto. Un botón que nadie pasó por encima aparece como no usado.</p>
+
+<p>La versión seria es automatizar la recolección sobre un recorrido real y unir los resultados:</p>
+
+<pre><code class="lang-javascript">// Coverage sobre un JOURNEY, no sobre una carga. Playwright / Puppeteer.
+import { chromium } from "playwright";
+
+const RUTAS = ["/", "/productos", "/producto/123", "/carrito", "/checkout", "/cuenta"];
+
+const navegador = await chromium.launch();
+const pagina = await navegador.newPage();
+const usados = new Map();   // url de la hoja -&gt; Set de rangos usados
+
+for (const ruta of RUTAS) {
+  await pagina.coverage.startCSSCoverage();
+  await pagina.goto("http://localhost:3000" + ruta);
+
+  // Ejercitá LOS ESTADOS, que es lo que una carga simple nunca toca
+  for (const el of await pagina.$$("[data-abrir], .btn, summary")) {
+    await el.hover().catch(() =&gt; {});
+    await el.click({ trial: true }).catch(() =&gt; {});
+  }
+  await pagina.emulateMedia({ media: "print" });
+  await pagina.emulateMedia({ media: "screen" });
+
+  for (const entrada of await pagina.coverage.stopCSSCoverage()) {
+    const set = usados.get(entrada.url) ?? new Set();
+    entrada.ranges.forEach(r =&gt; set.add(`${r.start}-${r.end}`));
+    usados.set(entrada.url, set);
+  }
+}
+await navegador.close();
+// El resultado NO es una lista para borrar: es una lista de CANDIDATOS a revisar.</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Nunca borres CSS a partir de un reporte de coverage.</strong> Es la forma más rápida conocida de romper la página de error 500, el flujo de recuperación de contraseña o la vista de impresión de la factura — todo eso que nadie visita en el <em>happy path</em> y que alguien va a necesitar el peor día posible. El reporte genera <em>candidatos</em>; la decisión la toma una persona que sabe qué es cada bloque.
+</div>
+
+<div class="rule">
+  <strong>📌 La única cura estructural es una frontera, no una herramienta.</strong> El CSS muerto es difícil de detectar porque nada lo ata a nada. Si el estilo vive <strong>adentro del componente</strong> —CSS Modules, un archivo <code>.css</code> importado por el componente, utilidades en el markup—, entonces borrar el componente borra su estilo, automáticamente y sin análisis. Eso es lo que realmente comprás cuando elegís una arquitectura con alcance: no "clases más lindas", sino <strong>la capacidad de borrar</strong>.
+</div>
+
+<h2>FS5.9 Layout moderno: subgrid, aspect-ratio y view transitions</h2>
+
+<h3>Subgrid: alinear a través de componentes</h3>
+
+<p><code>subgrid</code> resuelve el problema clásico de una grilla de tarjetas: querés que los títulos, los cuerpos y los botones queden alineados <strong>entre tarjetas distintas</strong>, aunque el texto de cada una tenga largo diferente. Antes se hacía con alturas fijas y mentiras. Es <strong>Baseline <em>widely available</em> desde marzo de 2026</strong> (Firefox lo tiene desde 2019, Safari desde 16, Chrome/Edge desde 117 en septiembre de 2023).</p>
+
+<pre><code class="lang-css">.grilla {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1.5rem;
+}
+
+.tarjeta {
+  display: grid;
+  /* Las 3 filas propias de la tarjeta pasan a ser filas de la grilla PADRE */
+  grid-row: span 3;
+  grid-template-rows: subgrid;
+  gap: 0;
+}
+/* Resultado: todos los títulos alineados, todos los botones al mismo nivel,
+   sin alturas fijas y sin JavaScript midiendo nada. */</code></pre>
+
+<h3><code>aspect-ratio</code>: reservar espacio es una decisión de CLS</h3>
+
+<p>Esto conecta directo con FS4. <code>aspect-ratio</code> le permite al navegador reservar la caja antes de conocer el contenido, que es exactamente lo que evita el salto de layout:</p>
+
+<pre><code class="lang-css">.hero-media { aspect-ratio: 16 / 9; width: 100%; }
+.avatar     { aspect-ratio: 1; object-fit: cover; }
+
+/* Para &lt;img&gt;, seguí poniendo width y height en el HTML:
+   el navegador deriva el aspect-ratio de esos atributos y reserva
+   el espacio ANTES de que el CSS termine de cargar. */</code></pre>
+
+<h3>View transitions: animar entre estados y entre páginas</h3>
+
+<p>La API de <em>view transitions</em> toma una captura del estado anterior, aplica tu cambio de DOM, toma una captura del nuevo, y anima entre las dos. Hay dos variantes con <strong>estados de soporte muy distintos</strong>, y confundirlas es el error más común:</p>
+
+<pre><code class="lang-javascript">// A — MISMO documento (SPA). Soporte amplio: Chrome 111+, Safari 18+, Firefox 133+.
+// El navegador que no la tenga simplemente aplica el cambio sin animar.
+function actualizarVista(nuevoHTML) {
+  if (!document.startViewTransition) {   // degradación explícita
+    contenedor.innerHTML = nuevoHTML;
+    return;
+  }
+  document.startViewTransition(() =&gt; {
+    contenedor.innerHTML = nuevoHTML;
+  });
+}</code></pre>
+
+<pre><code class="lang-css">/* B — CROSS-document (MPA), sin una línea de JS. Va en AMBAS páginas. */
+@view-transition { navigation: auto; }
+
+/* Nombrar un elemento lo convierte en un actor de la transición:
+   el navegador lo interpola entre las dos páginas en vez de hacer cross-fade. */
+.producto__foto { view-transition-name: foto-destacada; }
+
+::view-transition-old(foto-destacada),
+::view-transition-new(foto-destacada) {
+  animation-duration: 260ms;
+}
+
+/* Obligatorio: respetar la preferencia del usuario */
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) { animation: none !important; }
+}</code></pre>
+
+<div class="warn">
+  <strong>Estado real en septiembre de 2026 — corregí esto si lo leíste en otro lado.</strong> Las transiciones de <strong>mismo documento</strong> están en todos los motores (Chrome 111+, Safari 18+, Firefox 133+), y <code>:active-view-transition</code> llegó a Baseline <em>newly available</em> en enero de 2026. Las <strong>cross-document</strong> (<code>@view-transition</code>) son otra historia: Chrome 126+ y Safari 18.2+ las tienen, pero <strong>Firefox sigue detrás de un flag</strong>, y MDN clasifica la at-rule como <em>limited availability</em>, explícitamente <strong>no Baseline</strong>. No es "ya está lista": es una mejora progresiva con un motor entero afuera.
+</div>
+
+<div class="mistake">
+  <strong>Tres trampas de view transitions.</strong>
+  <ul>
+    <li><strong>Los <code>view-transition-name</code> tienen que ser únicos en el documento</strong> en el momento de la transición. Dos elementos con el mismo nombre —típico al renderizar una lista— <strong>abortan la transición entera</strong>, sin error en consola. Generá el nombre a partir del id del ítem.</li>
+    <li><strong>Durante la transición, la página está congelada</strong>: lo que ves es una captura. Una animación de 600 ms son 600 ms en los que el usuario no puede interactuar. Quedate en 200–300 ms.</li>
+    <li><strong>No las uses para ocultar latencia.</strong> Una transición larga no hace que la navegación sea más rápida; hace que el usuario espere igual, pero mirando algo lindo. Si el destino tarda, el problema es el destino (FS4).</li>
+  </ul>
+</div>
+
+<h2>FS5.10 Rendimiento del CSS: el mito y la realidad</h2>
+
+<p>Durante años se enseñó que los selectores descendentes eran caros y que había que escribir de derecha a izquierda pensando en el motor. Eso viene de mediciones de los años 2000 y hoy es, para casi todo el mundo, <strong>ruido</strong>. Los motores modernos indexan las reglas por el compound más a la derecha, matchean de derecha a izquierda con filtros de Bloom para descartar ancestros imposibles, y el matcheo de selectores suele ser una fracción menor del recálculo de estilo.</p>
+
+<div class="concept">
+  <strong>💡 El orden real de los costos del CSS</strong>, de mayor a menor impacto en un proyecto típico:
+  <ol>
+    <li><strong>Bytes.</strong> El CSS bloquea el render: hasta que no se descargó y parseó, no hay primer pintado. Este es, casi siempre, el costo dominante.</li>
+    <li><strong>Radio de invalidación.</strong> Cambiar una clase en <code>&lt;html&gt;</code> o una variable en <code>:root</code> obliga a recalcular el documento entero.</li>
+    <li><strong>Cantidad de elementos × reglas a considerar.</strong> El recálculo escala con el producto, no con la longitud de tus selectores.</li>
+    <li><strong>Qué propiedad animás.</strong> <code>transform</code> y <code>opacity</code> se resuelven en el compositor; <code>width</code>, <code>top</code> o <code>box-shadow</code> disparan layout o paint en cada frame.</li>
+    <li><strong>Complejidad del selector.</strong> Último. Con dos excepciones reales: <code>:has()</code> mal acotado y selectores universales combinados, que son problemas de <em>invalidación</em>, no de matcheo.</li>
+  </ol>
+</div>
+
+<h3>Cómo se mide (y no es con la intuición)</h3>
+
+<table>
+<thead><tr><th>Qué querés saber</th><th>Herramienta</th><th>Qué mirás</th></tr></thead>
+<tbody>
+<tr><td>Cuánto pesa y cuánto bloquea</td><td>Network + Lighthouse</td><td>Transfer size y <em>Render blocking resources</em></td></tr>
+<tr><td>Cuánto no se usa</td><td>DevTools → Coverage</td><td>Bytes no usados (con las advertencias de FS5.8)</td></tr>
+<tr><td>Cuánto cuesta recalcular estilo</td><td>Performance → <em>Recalculate Style</em></td><td>Duración y cantidad de elementos afectados</td></tr>
+<tr><td>Qué selector concreto es caro</td><td>Performance → <em>Selector Stats</em></td><td>Tiempo transcurrido e intentos de match por selector</td></tr>
+<tr><td>Complejidad estructural</td><td>Un analizador de CSS en CI</td><td>Reglas totales, especificidad máxima, <code>!important</code>, duplicados</td></tr>
+</tbody>
+</table>
+
+<h3><code>content-visibility</code> y <code>contain</code>: pagar solo por lo que se ve</h3>
+
+<p>La optimización de rendering con más impacto por línea escrita es <code>content-visibility: auto</code>: le dice al navegador que puede <strong>saltear layout, paint y estilo</strong> del subárbol mientras está fuera de la pantalla. En páginas muy largas (un feed, una documentación, una tabla de miles de filas) el ahorro en el render inicial es grande, porque el trabajo se difiere hasta que el contenido se acerca al viewport.</p>
+
+<pre><code class="lang-css">.seccion-larga {
+  content-visibility: auto;
+  /* CRÍTICO: sin esto, cada sección oculta mide 0 y la barra de scroll salta */
+  contain-intrinsic-size: auto 800px;
+}
+
+/* `contain` es el mecanismo de bajo nivel: promete que lo de adentro
+   no afecta a lo de afuera, y el navegador aprovecha esa promesa. */
+.widget-aislado { contain: layout paint; }</code></pre>
+
+<div class="warn">
+  <strong>Lo que <code>content-visibility</code> te cobra.</strong>
+  <ul>
+    <li><strong>El scroll se vuelve una estimación.</strong> <code>contain-intrinsic-size</code> es una <em>promesa</em> sobre el alto; si le errás mucho, la barra de scroll salta cuando el contenido real se materializa. La forma <code>auto &lt;valor&gt;</code> hace que el navegador recuerde el tamaño real una vez medido, y mitiga bastante el problema.</li>
+    <li><strong>Anclaje y saltos a anclas</strong> pueden comportarse raro si el destino todavía no se renderizó.</li>
+    <li><strong>No lo pongas en todo.</strong> Aplicado a elementos chicos, el costo de administrar el saltado supera al ahorro. Es una herramienta para <em>secciones grandes y repetidas</em>.</li>
+  </ul>
+</div>
+
+<h2>FS5.11 Cuándo NO usar lo nuevo</h2>
+
+<p>Todo lo anterior es adoptable. Nada de lo anterior es obligatorio. Estos son los cuatro criterios para frenar:</p>
+
+<div class="step"><strong>1. Distinguí cosmético de funcional.</strong> Es la distinción más útil que existe. Si la ausencia de la feature produce una página <em>menos linda</em>, adoptala hoy sin fallback: las view transitions degradan a un cambio instantáneo, que es exactamente lo que había antes. Si su ausencia produce una página <strong>rota o ilegible</strong> —un layout que depende de container queries, un color que depende de <code>@property</code>—, necesitás fallback o un piso de soporte declarado. Nadie se queja de una animación que no vio; todos se quejan de un texto que no se lee.</div>
+
+<div class="step"><strong>2. Mirá TU analytics, no el porcentaje global.</strong> "97% de soporte global" no significa nada para tu producto. Si el 6% de tu tráfico es un navegador embebido de una app corporativa que quedó en una versión de 2021, ese 6% son personas concretas. El número que importa es el de tu panel, segmentado por el flujo donde vas a usar la feature.</div>
+
+<div class="step"><strong>3. Usá <code>@supports</code>, y sabé cómo se pregunta por un selector.</strong> La consulta de propiedades es la conocida; para pseudo-clases hace falta la forma <code>selector()</code>, que mucha gente no conoce.</div>
+
+<pre><code class="lang-css">/* Base: funciona en todos lados */
+.layout { display: block; }
+
+@supports (container-type: inline-size) {
+  .layout { display: grid; }
+}
+
+/* Para selectores, la forma correcta es selector() */
+@supports selector(:has(a)) {
+  .card:has(&gt; img) { grid-template-columns: 120px 1fr; }
+}
+
+/* Y se pueden combinar */
+@supports (view-transition-name: none) and (not (contain-intrinsic-size: 1px)) {
+  /* … */
+}</code></pre>
+
+<div class="step"><strong>4. Preguntate si el equipo lo va a poder mantener.</strong> Este es el criterio que más proyectos hunde y el que menos se menciona. Si sos la única persona que puede explicar por qué el orden de capas es <code>reset, vendor, base, components, utilities</code> y qué pasa si alguien agrega un archivo suelto, entonces ese orden va a estar mal en tres meses — y no por incompetencia ajena, sino porque el conocimiento vivía en una sola cabeza. <strong>La prueba concreta: ¿puede alguien que entró la semana pasada agregar un componente nuevo sin leer un wiki ni preguntarte?</strong> Si la respuesta es no, la arquitectura tiene un bug, aunque el CSS esté impecable.</div>
+
+<div class="danger">
+  <strong>⚠️ El costo que nunca se presupuesta.</strong> Cada capa de indirección que agregás —un sistema de tokens, un stack de capas, una convención de nombres de contenedores— es algo que hay que <strong>enseñar, documentar y hacer cumplir</strong>, para siempre. Ese costo es recurrente y lo paga el equipo entero; el beneficio suele ser puntual y lo cobra quien la introdujo. Antes de agregar una abstracción, escribí en una línea quién la va a mantener cuando vos estés en otro proyecto.
+</div>
+
+<h2>🧑‍🎓 Worked Example — 240 KB y tres sistemas de espaciado</h2>
+
+<blockquote>Heredás el front de un e-commerce con cuatro años. Un solo <code>bundle.css</code> de 241 KB. La tarea del sprint es "cambiar el espaciado de las tarjetas de producto"; la estimación original era de dos horas y ya van tres días. Tu jefa pregunta qué pasa.</blockquote>
+
+<p><strong>Paso 1 — Medir. Nada de opiniones todavía.</strong></p>
+
+<pre><code class="lang-bash"># Peso real, crudo y comprimido: lo único que ve el usuario
+wc -c dist/bundle.css                       # 241.088
+gzip -c dist/bundle.css | wc -c             #  38.402
+
+# Estructura: reglas, selectores, especificidad, !important, duplicados
+npx css-analyzer dist/bundle.css
+
+# Y el que más duele: cuánto de esto se usa en un recorrido REAL
+node scripts/coverage-journey.mjs           # el script de FS5.8</code></pre>
+
+<table>
+<thead><tr><th>Métrica</th><th>Valor medido</th><th>Lectura</th></tr></thead>
+<tbody>
+<tr><td>Tamaño crudo / gzip</td><td>241 KB / 38 KB</td><td>Render-blocking en la ruta crítica</td></tr>
+<tr><td>Reglas</td><td>6.842</td><td>—</td></tr>
+<tr><td>Archivos concatenados</td><td>11</td><td>Sin orden declarado: depende del bundler</td></tr>
+<tr><td><code>!important</code></td><td>214</td><td><strong>El síntoma principal</strong></td></tr>
+<tr><td>Especificidad máxima</td><td>(3, 7, 2)</td><td>Alguien perdió una guerra hace años</td></tr>
+<tr><td>Escalas de espaciado</td><td><strong>3</strong></td><td>Múltiplos de 5px (2022), escala de 8pt (rediseño 2024), y los <code>.mt-3</code> de Bootstrap</td></tr>
+<tr><td>Reglas no usadas en el journey</td><td>61%</td><td>Candidatas, no condenadas (FS5.8)</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 2 — El diagnóstico, que no es el que parece.</strong></p>
+
+<div class="rule">
+  <strong>📌 El problema no es que sean 241 KB. Es que nadie puede borrar nada.</strong> Los 214 <code>!important</code> y la especificidad de (3,7,2) no son descuido: son la <strong>evidencia fósil</strong> de que la única forma de ganar una discusión con la cascada, en este proyecto, era escalar. Y las tres escalas de espaciado conviven porque cada rediseño agregó la suya sin poder sacar la anterior — sacar la anterior habría requerido saber quién la usa, y eso nadie lo sabe. El tamaño es la <em>consecuencia</em>; la causa es la <strong>falta de límites</strong>.
+</div>
+
+<p><strong>Paso 3 — El plan incremental. Cinco PRs, cada uno mergeable y reversible.</strong></p>
+
+<div class="step"><strong>PR 1 — Declarar el orden. Cero cambios visuales.</strong> Una línea arriba del archivo de entrada: <code>@layer reset, vendor, base, layout, components, utilities;</code>. Como todo el CSS actual está sin encapar, sigue ganando sobre todas las capas y <strong>no cambia absolutamente nada</strong>. Es un PR de una línea que se puede mergear un viernes. Se agrega el chequeo de capturas visuales al CI acá, no después.</div>
+
+<div class="step"><strong>PR 2 — Meter los terceros en <code>layer(vendor)</code>.</strong> Bootstrap y el date picker pasan a <code>@import ... layer(vendor)</code>. En este momento, los <code>!important</code> que existían <em>solo</em> para ganarle a Bootstrap dejan de hacer falta. Se sacan con un grep guiado: de 214 bajan a 96 en un solo PR, y las capturas no cambian.</div>
+
+<div class="step"><strong>PR 3 — El reset a <code>layer(reset)</code>, reescrito con <code>:where()</code>.</strong> Baja la especificidad base a cero y saca otros 20 <code>!important</code>. Bajo riesgo, alto rédito.</div>
+
+<div class="step"><strong>PR 4..N — Componente por componente, a medida que se tocan.</strong> Regla de equipo: <em>todo ticket que toca un componente lo mueve a <code>@layer components</code> y le saca los <code>!important</code> que ya no necesita</em>. No hay un sprint de migración: la migración viaja de polizón en el trabajo normal. Se le pone un tablero con el porcentaje encapado para que se vea el avance.</div>
+
+<div class="step"><strong>PR final — Unificar el espaciado.</strong> Recién acá, con las capas puestas, se define <strong>una</strong> escala en custom properties y se aliasan las dos viejas a la nueva (<code>--space-15: var(--space-4)</code>) para que nada cambie visualmente. Después se van eliminando los alias a medida que el uso llega a cero. Este orden importa: intentar unificar tokens <em>antes</em> de tener capas es pelear en dos frentes.</div>
+
+<p><strong>Paso 4 — Qué se ganó, con números.</strong></p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Antes</th><th>Después (4 meses)</th><th>Delta</th></tr></thead>
+<tbody>
+<tr><td>Tamaño crudo</td><td>241 KB</td><td>96 KB</td><td><strong>−60%</strong></td></tr>
+<tr><td>Tamaño gzip</td><td>38 KB</td><td>17 KB</td><td>−55%</td></tr>
+<tr><td>Reglas</td><td>6.842</td><td>2.910</td><td>−57%</td></tr>
+<tr><td><code>!important</code></td><td>214</td><td>9</td><td><strong>−96%</strong></td></tr>
+<tr><td>Especificidad máxima</td><td>(3, 7, 2)</td><td>(0, 3, 1)</td><td>Sin ids en el CSS de producto</td></tr>
+<tr><td>Reglas no usadas en el journey</td><td>61%</td><td>12%</td><td>−49 pp</td></tr>
+<tr><td>FCP (4G simulada, p75)</td><td>1,9 s</td><td>1,4 s</td><td>−0,5 s</td></tr>
+<tr><td><strong>Tiempo de agregar un componente nuevo</strong></td><td><strong>~1 día de arqueología</strong></td><td><strong>~30 min</strong></td><td><strong>La fila que importa</strong></td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Sobre el FCP, seamos honestos.</strong> Los 0,5 s no salen de "mejor arquitectura": salen casi enteros de los 145 KB menos que hay que descargar y parsear antes del primer pintado. Atribuir la mejora a las capas sería vender humo. Las capas son lo que <em>hizo posible</em> borrar; el borrado es lo que movió la métrica. Contá la cadena causal completa cuando presentes esto, porque alguien va a preguntar.
+</div>
+
+<div class="rule">
+  <strong>📌 La última fila no está en ningún dashboard, y es la única que garantiza que esto no vuelva a pasar.</strong> Las otras siete métricas se degradan solas si el equipo vuelve a los viejos hábitos. La octava es la que cambia el comportamiento: cuando agregar un componente es barato, la gente agrega componentes en vez de parchear con <code>!important</code>. Medí el tiempo de la tarea, no solo los bytes.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué el CSS sin encapar le gana a todas las capas, y qué te permite hacer eso?</summary>
+<p>Porque la especificación define que las declaraciones no encapadas se comportan como si estuvieran en una capa implícita <strong>al final</strong> del orden — es decir, la de mayor prioridad. La consecuencia práctica es enorme: podés declarar tu orden de capas en un proyecto legacy y <strong>no cambia nada</strong>, porque todo el CSS existente sigue sin encapar y sigue ganando. Eso convierte la adopción de <code>@layer</code> en una migración <em>incremental y reversible</em> en vez de un big bang. El precio es el reverso: cualquier archivo nuevo que alguien olvide encapar pisa el sistema entero, así que hace falta un lint o un único punto de entrada que importe todo con <code>layer()</code>. Y ojo con la asimetría: entre declaraciones con <code>!important</code> el orden se invierte, y ahí lo no encapado pierde contra todo lo encapado.</p></details>
+
+<details><summary>Pusiste <code>container-type</code> en un wrapper y el componente colapsó a cero de alto. ¿Qué pasó?</summary>
+<p>Usaste <code>container-type: size</code> en vez de <code>inline-size</code>. Para poder responder una consulta de tamaño antes de disponer el contenido, el navegador necesita que el tamaño del contenedor <strong>no dependa de lo que tiene adentro</strong>: eso es containment de tamaño. Con <code>inline-size</code> solo aplica al ancho, que en flujo normal ya viene dado por el padre, así que no se nota. Con <code>size</code> aplica también al alto, y como el alto normalmente sí sale del contenido, el contenedor se computa como si estuviera vacío: 0 px. La regla es usar <code>inline-size</code> siempre, salvo que tengas una altura explícita y necesites específicamente consultar <code>block-size</code> o usar unidades <code>cqb</code>.</p></details>
+
+<details><summary>Un reporte dice que el 60% de tu CSS no se usa. ¿Lo borrás?</summary>
+<p>No, y esta es la trampa clásica. El coverage te dice qué no se ejercitó en <em>esa</em> grabación, no qué está muerto: los estados (<code>:hover</code>, <code>.is-open</code>, <code>input:invalid</code>), las clases construidas dinámicamente en JS, el markup que inyectan widgets de terceros, el HTML que escriben editores en un CMS, <code>@media print</code> y las rutas que no visitaste aparecen todos como "no usados". Lo correcto es correr el coverage sobre un <em>journey</em> automatizado que ejercite estados y rutas, unir los rangos, y tratar el resultado como una <strong>lista de candidatos</strong> que revisa una persona. Y sobre todo entender que la herramienta no arregla la causa: mientras el CSS no tenga una frontera que lo ate a un componente, va a seguir siendo indeciblemente difícil de borrar.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El CSS a escala no falla por sintaxis: falla porque es <strong>global y sin límites</strong>. Toda la arquitectura consiste en fabricar fronteras que el lenguaje no trae.</li>
+  <li>La especificidad es el <strong>quinto</strong> criterio de la cascada, no el primero. <code>@layer</code> mueve la pelea a un criterio anterior que vos controlás en una línea, y <code>:where()</code> te deja escribir selectores complejos que pesan cero.</li>
+  <li><strong><code>!important</code> es un síntoma</strong>, y cada uno delata una de tres causas con curas distintas. Contalos en el CI y no dejes que el número suba.</li>
+  <li><strong><code>@layer</code></strong> es <em>widely available</em> desde 2024 y su superpoder es la migración incremental: lo no encapado gana, así que declarar el orden no rompe nada. Cuidado con la inversión bajo <code>!important</code>.</li>
+  <li><strong><code>:has()</code></strong> pasó a <em>widely available</em> en junio de 2026. Su costo no es el matcheo sino la <strong>invalidación hacia arriba</strong>: acotá el ancestro y preferí el combinador hijo.</li>
+  <li><strong>Container queries</strong> (widely available desde 2023) son lo que hace que un componente se pueda mover. No reemplazan las media queries del <em>shell</em> ni las de preferencias. Usá <code>inline-size</code>, no <code>size</code>.</li>
+  <li><strong><code>@property</code></strong> es Baseline <em>newly</em> available (widely proyectado para enero de 2027): úsalo para mejoras progresivas, todavía no para lo funcional.</li>
+  <li>El <strong>CSS-in-JS con runtime</strong> retrocede por una razón técnica —incompatibilidad con RSC y streaming SSR—, no por moda. Lo reemplazaron utility-first y la <strong>extracción en build</strong>. Si ya tenés uno: congelá la frontera, sacá los tokens a custom properties, migrá desde las hojas, y justificá con un número.</li>
+  <li>El <strong>dead code CSS</strong> es indecidible en general; el coverage da candidatos, no sentencias. La única cura estructural es que el estilo viva adentro del componente, para que borrar el componente borre el estilo.</li>
+  <li>En rendimiento, el orden es <strong>bytes → invalidación → elementos×reglas → propiedad animada → complejidad del selector</strong>. La complejidad del selector va última, con la excepción de un <code>:has()</code> mal acotado.</li>
+  <li><strong>Cross-document view transitions siguen sin ser Baseline</strong> en septiembre de 2026: Firefox detrás de un flag. Tratalas como cosmético progresivo, nunca como funcional.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá el CSS de un proyecto tuyo y sacá tres números: bytes crudos y gzip, cantidad de <code>!important</code> y especificidad máxima. Para cada <code>!important</code>, clasificá cuál de las tres causas de FS5.1 lo explica.</li>
+  <li>Agregá <code>@layer reset, vendor, base, components, utilities;</code> arriba de ese mismo proyecto y comprobá empíricamente que <strong>no cambió nada</strong>. Después mové solo los terceros a <code>layer(vendor)</code> y contá cuántos <code>!important</code> podés eliminar sin que cambie una sola captura.</li>
+  <li>Reescribí tu reset envolviendo los selectores en <code>:where()</code>. Verificá con DevTools que la especificidad pasó a (0,0,0) y que ahora una sola clase lo pisa sin importar el orden de carga.</li>
+  <li>Implementá un mismo componente de tarjeta dos veces: una con media queries y otra con container queries. Metelas en tres contenedores de 260 px, 420 px y 900 px dentro de la misma página y documentá qué se rompe en cuál.</li>
+  <li>Provocá el bug de <code>container-type: size</code> a propósito, comprobá que el contenedor mide 0 px, y arreglalo. Escribí en dos líneas por qué pasa.</li>
+  <li>Escribí un <code>:has()</code> deliberadamente caro (<code>body:has(...)</code> sobre un DOM de miles de nodos, togglado en scroll), medí <em>Recalculate Style</em> en el panel Performance, acotalo al ancestro mínimo y anotá los dos números.</li>
+  <li>Registrá una variable con <code>@property</code> y animala en una <code>transition</code>. Después quitá el <code>@property</code> y comprobá que la animación se convierte en un salto. Explicá por qué.</li>
+  <li>Adaptá el script de coverage de FS5.8 a tu proyecto, corrélo sobre al menos cinco rutas ejercitando estados, y armá la lista de candidatos. Elegí tres, verificá manualmente si están vivos, y contá cuántos de los tres te habrías equivocado en borrar.</li>
+  <li>Aplicá <code>content-visibility: auto</code> con <code>contain-intrinsic-size</code> a una página larga tuya. Medí el tiempo de rendering antes y después, y anotá también si la barra de scroll se comporta raro.</li>
+</ol>
+
+<section class="quiz" id="quizFS5">
+  <style>
+    #quizFS5{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizFS5 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizFS5 .q{margin-bottom:1.5rem}
+    #quizFS5 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizFS5 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizFS5 .opt:hover{border-color:var(--accent)}
+    #quizFS5 .opt:disabled{cursor:default}
+    #quizFS5 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizFS5 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizFS5 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizFS5 .exp.show{display:block}
+    #quizFS5 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Declarás <code>@layer reset, vendor, components;</code> en un proyecto legacy de 200 KB donde ningún archivo está encapado. ¿Qué pasa con los estilos al desplegar?</p>
+    <button class="opt">Se rompe todo: al existir capas, el CSS sin encapar pasa a tener la prioridad más baja</button>
+    <button class="opt">Los estilos sin encapar quedan en la capa <code>reset</code> por ser la primera declarada</button>
+    <button class="opt">No cambia nada: lo no encapado se comporta como una capa implícita al final, así que sigue ganando</button>
+    <div class="exp">Esta es exactamente la propiedad que hace viable la migración incremental. Las declaraciones fuera de todo <code>@layer</code> compiten como si estuvieran en una capa implícita al final del orden, es decir con la máxima prioridad. Podés declarar el stack completo en un PR de una línea y desplegarlo sin riesgo, y recién después ir moviendo archivos hacia adentro de a uno. La contracara: un archivo nuevo que alguien olvide encapar pisa todo el sistema, así que hace falta un lint o un único punto de entrada. Y bajo <code>!important</code> el orden se invierte, con lo no encapado perdiendo contra todo lo encapado.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Estás por usar <code>@view-transition { navigation: auto; }</code> para animar la navegación entre páginas de un sitio MPA. ¿Cuál es la lectura correcta de su soporte en septiembre de 2026?</p>
+    <button class="opt">Chrome 126+ y Safari 18.2+ la tienen, pero Firefox sigue detrás de un flag: es una mejora cosmética, no algo de lo que se pueda depender</button>
+    <button class="opt">Es Baseline widely available desde 2025: se puede usar como base del sistema de navegación</button>
+    <button class="opt">No la soporta ningún navegador todavía; solo existen las transiciones de mismo documento</button>
+    <div class="exp">Hay que separar las dos variantes. Las transiciones de <strong>mismo documento</strong> (<code>document.startViewTransition()</code>) están en los tres motores: Chrome 111+, Safari 18+, Firefox 133+. Las <strong>cross-document</strong> con la at-rule <code>@view-transition</code> están en Chromium 126+ y Safari 18.2+, pero Firefox las mantiene detrás de un flag, y MDN clasifica la at-rule como <em>limited availability</em>, explícitamente no Baseline. La consecuencia práctica es buena: donde no está soportada, la navegación simplemente ocurre sin animar, que es lo que pasaba antes. Por eso califica como cosmético progresivo — y por eso nunca hay que colgar de ella nada funcional.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tu hoja pesa 241 KB, tiene selectores descendentes largos y 6.800 reglas. ¿Dónde está, casi con certeza, la mayor parte del costo para el usuario?</p>
+    <button class="opt">En el matcheo de los selectores descendentes: hay que reescribirlos de derecha a izquierda</button>
+    <button class="opt">En los bytes: el CSS bloquea el render, y hay que descargarlo y parsearlo entero antes del primer pintado</button>
+    <button class="opt">En la cantidad de reglas: el navegador evalúa las 6.800 contra cada elemento del documento</button>
+    <div class="exp">El costo dominante en un proyecto típico es el tamaño, porque el CSS es render-blocking: no hay primer pintado hasta que se descargó y parseó. Lo de los selectores descendentes es un mito heredado de mediciones de los 2000: los motores modernos indexan por el compound más a la derecha y usan filtros de Bloom para descartar ancestros imposibles, así que el matcheo suele ser una fracción menor del recálculo de estilo. Y no, el navegador no evalúa las 6.800 reglas contra cada elemento — están agrupadas en buckets. El orden real de los costos es: bytes, radio de invalidación, elementos × reglas consideradas, qué propiedad animás, y último la complejidad del selector, con la excepción de un <code>:has()</code> mal acotado, que es un problema de invalidación disfrazado de selector.</div>
+  </div>
+
+  <div class="score" id="scoreFS5"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizFS5');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreFS5').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con FS6.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../fs4-web-vitals/lecture.html">← FS4: Web Vitals</a>
+  <a href="../fs6-accesibilidad-experta/lecture.html">FS6: Accesibilidad experta →</a>
+</nav>
+
+</div>
+</body>
+</html>

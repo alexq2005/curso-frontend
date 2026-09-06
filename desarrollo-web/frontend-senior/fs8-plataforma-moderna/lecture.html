@@ -1,0 +1,1032 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FS8 — La plataforma web moderna: qué podés hacer hoy sin framework · Frontend Senior</title>
+  <meta name="description" content="Web Components y shadow DOM con sus límites reales, WebAssembly y el costo del cruce de frontera, localStorage vs IndexedDB vs Cache API vs OPFS, offline-first como decisión de arquitectura de datos, streaming y SSR, View Transitions, popover y dialog, progressive enhancement en 2026, Baseline como criterio de soporte, y cuándo NO necesitás un framework.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Frontend Senior</a>
+  <a href="../../modulo-00-sillabus/lecture.html">🌐 Curso de Frontend</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">FS8</span>
+  <span class="badge">⏱ 45–110 min</span>
+  <span class="badge">🎯 Pre-req: FS1–FS7</span>
+  <span class="badge">🧩 Plataforma</span>
+</div>
+
+<article>
+
+<h1>FS8 — La plataforma web moderna: qué podés hacer hoy sin framework</h1>
+
+<h2>FS8.0 Por qué este módulo</h2>
+
+<p>Durante los siete módulos anteriores desarmaste el navegador, el motor de JavaScript, la red, las métricas, el CSS a escala, la accesibilidad y la cadena de build. En todos ellos apareció, sin decirlo, la misma pregunta de fondo: <strong>¿esto lo resuelve la plataforma o lo tengo que traer de afuera?</strong> Este módulo la responde de frente.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Buena parte del trabajo que en 2015 justificaba meter un framework —componentes con estilos encapsulados, transiciones entre vistas, modales accesibles, observar el scroll, guardar datos localmente, funcionar sin red— hoy lo hace el navegador. Eso <em>no</em> significa que los frameworks sobren. Significa que <strong>cambió qué dependencias podés justificar</strong>, y que la respuesta "usamos React porque necesitamos componentes" ya no es un argumento: es una costumbre.
+</div>
+
+<p>Nada de lo que sigue es militancia. Cada tema viene con su costo, su punto de quiebre y con qué se mide. Un senior no es el que sabe más APIs: es el que puede defender por qué eligió una y descartó las otras dos.</p>
+
+<table>
+<thead><tr><th>Lo que en 2015 pedía una librería</th><th>Qué lo resuelve hoy en la plataforma</th><th>Lo que la plataforma <em>no</em> te da</th></tr></thead>
+<tbody>
+<tr><td>Componentes con estilos aislados</td><td>Custom Elements + Shadow DOM</td><td>JSX, tipos, HMR, convención de equipo</td></tr>
+<tr><td>Modales y tooltips accesibles</td><td><code>&lt;dialog&gt;</code>, <code>popover</code>, invoker commands, anchor positioning</td><td>Los detalles finos siguen siendo tuyos</td></tr>
+<tr><td>Transiciones entre vistas</td><td>View Transitions API</td><td>Coreografías complejas y orquestación</td></tr>
+<tr><td>Lazy loading e infinite scroll</td><td><code>loading="lazy"</code>, <code>IntersectionObserver</code></td><td>Virtualización de listas enormes</td></tr>
+<tr><td>Validación de formularios</td><td>Constraint Validation + <code>ElementInternals</code></td><td>Validación asíncrona y estados derivados</td></tr>
+<tr><td>Guardar datos y trabajar sin red</td><td>IndexedDB, Cache API, OPFS, Service Worker</td><td>Sincronización y resolución de conflictos</td></tr>
+<tr><td>Cómputo pesado en el cliente</td><td>WebAssembly + Workers</td><td>Un modelo de UI; Wasm no toca el DOM</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Leé bien la tercera columna.</strong> Es donde vive el argumento honesto a favor de los frameworks, y es la que casi nunca aparece en los posts que dicen "ya no necesitás React". La plataforma te da <em>capacidades</em>. Un framework te da capacidades <strong>más un modelo mental compartido</strong>, y eso último es lo que hace que ocho personas escriban código parecido.
+</div>
+
+<h2>FS8.1 Web Components: las tres piezas</h2>
+
+<p>"Web Components" no es una API: son tres especificaciones que se usan juntas y que se pueden usar por separado.</p>
+
+<div class="step"><strong>1. Custom Elements.</strong> Registrás una etiqueta HTML propia asociada a una clase que extiende <code>HTMLElement</code>. El navegador te avisa cuando se conecta al documento, cuando se desconecta y cuando cambia un atributo que declaraste observado.</div>
+
+<div class="step"><strong>2. Shadow DOM.</strong> Un árbol de DOM separado, colgado del elemento, con <strong>encapsulación real de estilos en las dos direcciones</strong>: tus reglas no salen y las del host no entran (con excepciones importantes que vemos en un minuto).</div>
+
+<div class="step"><strong>3. Templates y slots.</strong> <code>&lt;template&gt;</code> es markup inerte que no se parsea como contenido activo hasta que lo clonás. <code>&lt;slot&gt;</code> es el agujero por donde entra el contenido que el usuario del componente puso entre las etiquetas.</div>
+
+<pre><code class="lang-javascript">// Un componente completo, sin dependencias.
+const hoja = new CSSStyleSheet();
+hoja.replaceSync(`
+  :host {
+    /* Reset defensivo: las propiedades heredables SÍ cruzan el shadow boundary */
+    all: initial;
+    display: block;
+    font: var(--card-font, 500 14px/1.5 system-ui, sans-serif);
+    color: var(--card-color, #111);
+    background: var(--card-bg, #fff);
+    border: 1px solid var(--card-border, #d4d4d8);
+    border-radius: 10px;
+    padding: 1rem;
+  }
+  :host([estado="error"]) { border-color: #dc2626; }
+  :host([hidden]) { display: none; }   /* [hidden] NO funciona solo si definís display */
+  .titulo { font-weight: 700; margin: 0 0 .35rem; }
+  ::slotted(p) { margin: 0; }          /* estilar contenido del light DOM */
+`);
+
+class TarjetaEstado extends HTMLElement {
+  // Solo estos atributos disparan attributeChangedCallback
+  static observedAttributes = ["estado", "titulo"];
+
+  #root;
+
+  constructor() {
+    super();
+    // delegatesFocus se explica en el Worked Example: cambia dónde cae el foco
+    this.#root = this.attachShadow({ mode: "open" });
+    this.#root.adoptedStyleSheets = [hoja];   // una sola hoja compartida por N instancias
+    this.#root.innerHTML = `
+      &lt;p class="titulo"&gt;&lt;/p&gt;
+      &lt;slot&gt;Sin contenido&lt;/slot&gt;
+    `;
+  }
+
+  connectedCallback() {
+    // Ojo: puede correr MÁS DE UNA VEZ si el elemento se mueve de lugar en el DOM
+    this.#render();
+  }
+
+  attributeChangedCallback(nombre, viejo, nuevo) {
+    if (viejo !== nuevo) this.#render();
+  }
+
+  #render() {
+    this.#root.querySelector(".titulo").textContent = this.getAttribute("titulo") ?? "";
+  }
+
+  // API de propiedades: los atributos son SIEMPRE strings, las propiedades no
+  get estado() { return this.getAttribute("estado"); }
+  set estado(v) { this.setAttribute("estado", v); }
+}
+
+customElements.define("tarjeta-estado", TarjetaEstado);</code></pre>
+
+<pre><code class="lang-html">&lt;tarjeta-estado titulo="Envío #4412" estado="ok"&gt;
+  &lt;p&gt;Salió del depósito hace 2 horas.&lt;/p&gt;
+&lt;/tarjeta-estado&gt;</code></pre>
+
+<div class="info">
+  <strong>El contrato de estilos de un web component tiene cuatro puertas.</strong> <code>:host</code> para el elemento en sí; <strong>custom properties</strong> (<code>--card-bg</code>) que <em>sí</em> atraviesan el shadow boundary y son tu API de theming; <code>::part()</code> para exponer partes internas a propósito; y <code>::slotted()</code> para estilar lo que puso el consumidor. Todo lo demás queda adentro. Diseñar esas cuatro puertas <em>es</em> diseñar el componente.
+</div>
+
+<h3>Declarative Shadow DOM: shadow root sin JavaScript</h3>
+
+<p>El pecado original de los web components era que sin JavaScript no había nada. Eso se resolvió: el shadow root se puede escribir en el HTML que manda el servidor.</p>
+
+<pre><code class="lang-html">&lt;tarjeta-estado titulo="Envío #4412"&gt;
+  &lt;template shadowrootmode="open"&gt;
+    &lt;style&gt;:host { display:block; border:1px solid #d4d4d8; border-radius:10px; padding:1rem }&lt;/style&gt;
+    &lt;p class="titulo"&gt;Envío #4412&lt;/p&gt;
+    &lt;slot&gt;&lt;/slot&gt;
+  &lt;/template&gt;
+  &lt;p&gt;Salió del depósito hace 2 horas.&lt;/p&gt;
+&lt;/tarjeta-estado&gt;</code></pre>
+
+<div class="tip">
+  El parser crea el shadow root <strong>durante el parseo del HTML</strong>, antes de que corra una línea de tu JS. El primer render sale gratis y el contenido es indexable. La hidratación —conectar el markup ya existente con tu clase en vez de volver a pintar todo— sigue siendo trabajo tuyo: en <code>connectedCallback</code> tenés que detectar <code>this.shadowRoot</code> ya presente y <strong>no</strong> pisarlo con <code>innerHTML</code>.
+</div>
+
+<h2>FS8.2 Dónde brillan los Web Components y dónde no</h2>
+
+<p>La pregunta útil no es "¿son buenos?". Es "¿cuál es la propiedad que necesito y que solo ellos me dan?". Esa propiedad es una sola: <strong>ser una etiqueta HTML</strong>. Todo lo que sabe poner HTML —cualquier framework, cualquier CMS, cualquier email builder, cualquier editor WYSIWYG— sabe usarlos.</p>
+
+<table>
+<thead><tr><th>Escenario</th><th>¿Web Components?</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Design system que tiene que sobrevivir a 2 o 3 frameworks</td><td>✅ Sí, caso estrella</td><td>Los frameworks rotan cada 4-6 años; el HTML no. Adobe, Salesforce, GitHub y SAP hacen exactamente esto</td></tr>
+<tr><td>Widget embebible en sitios de terceros</td><td>✅ Sí</td><td>Encapsulación real de estilos sin el peso ni el aislamiento incómodo de un iframe</td></tr>
+<tr><td>Islas de interactividad en un sitio de contenido</td><td>✅ Sí</td><td>El HTML llega del CMS; el elemento se activa solo donde hace falta</td></tr>
+<tr><td>Formularios complejos con validación derivada</td><td>⚠️ Con cuidado</td><td>Se puede con <code>ElementInternals</code>, pero es más código que en cualquier framework</td></tr>
+<tr><td>Una SPA entera con routing y estado global</td><td>❌ No</td><td>Estarías reimplementando un framework, con peor DX y sin ecosistema</td></tr>
+<tr><td>Listas virtualizadas de 50.000 filas</td><td>❌ No</td><td>Un custom element por fila es caro: cada uno tiene su ciclo de vida</td></tr>
+</tbody>
+</table>
+
+<h3>Los cuatro límites honestos</h3>
+
+<div class="warn">
+  <strong>1. Formularios.</strong> Un custom element <em>no</em> participa de un <code>&lt;form&gt;</code> por defecto: no se envía, no valida, no responde a <code>reset</code>. Se arregla con <code>ElementInternals</code>, y el soporte hoy está en los tres motores, pero es código que escribís vos.
+</div>
+
+<pre><code class="lang-javascript">class InputMoneda extends HTMLElement {
+  static formAssociated = true;          // ← sin esto, nada de lo de abajo existe
+  #internals;
+
+  constructor() {
+    super();
+    this.#internals = this.attachInternals();
+    this.attachShadow({ mode: "open" }).innerHTML = `&lt;input type="text" inputmode="decimal"&gt;`;
+    this.shadowRoot.querySelector("input")
+      .addEventListener("input", (e) =&gt; this.#actualizar(e.target.value));
+  }
+
+  #actualizar(texto) {
+    const valor = Number(texto.replace(/[^\d.-]/g, ""));
+    this.#internals.setFormValue(String(valor));   // así viaja en el submit
+    if (Number.isNaN(valor) || valor &lt;= 0) {
+      // El tercer argumento (el ancla) es obligatorio: sin él el browser
+      // no sabe a qué enfocar cuando el usuario aprieta "Enviar"
+      this.#internals.setValidity(
+        { customError: true }, "Ingresá un monto mayor a cero",
+        this.shadowRoot.querySelector("input"),
+      );
+    } else {
+      this.#internals.setValidity({});
+    }
+  }
+
+  formResetCallback()   { this.#actualizar(""); }
+  formDisabledCallback(deshabilitado) { this.shadowRoot.querySelector("input").disabled = deshabilitado; }
+}
+customElements.define("input-moneda", InputMoneda);</code></pre>
+
+<div class="warn">
+  <strong>2. Accesibilidad.</strong> Los <code>id</code> <strong>no cruzan el shadow boundary</strong>. Un <code>aria-labelledby="titulo"</code> adentro del shadow root no puede apuntar a un <code>id</code> del documento, ni al revés. Se mitiga con <code>ElementInternals</code> (que expone <code>role</code>, <code>ariaLabel</code> y compañía sin ensuciar el markup del host), pero las referencias ARIA entre raíces siguen siendo un problema abierto —por eso el tema aparece año tras año en los focus areas de Interop.
+</div>
+
+<div class="warn">
+  <strong>3. Nombres globales.</strong> <code>customElements.define("mi-boton", …)</code> registra en un <strong>registro global del documento</strong>. Dos versiones del mismo componente en la misma página se pisan y la segunda tira <code>NotSupportedError</code>. Los <em>scoped custom element registries</em> son justamente un focus area de <strong>Interop 2026</strong>: o sea, todavía no son interoperables. Mientras tanto: prefijo de proyecto en cada nombre y un <code>if (!customElements.get(nombre))</code> defensivo.
+</div>
+
+<div class="warn">
+  <strong>4. DX.</strong> No hay JSX, no hay HMR, los atributos son strings, el tipado es manual y las devtools no te muestran un árbol de componentes con su estado. Librerías como Lit tapan casi todo eso por ~5 KB, y ahí ya volviste a tener una dependencia — que puede ser una decisión perfectamente razonable, pero conviene tomarla con los ojos abiertos.
+</div>
+
+<div class="mistake">
+  <strong>El error de encuadre más común:</strong> comparar "Web Components vs React" como si compitieran por el mismo puesto. React resuelve <em>cómo describo una UI que cambia</em>. Los Web Components resuelven <em>cómo distribuyo un pedazo de UI a consumidores que no controlo</em>. Se pueden usar juntos —y en un design system corporativo grande, casi siempre se usan juntos.
+</div>
+
+<h2>FS8.3 WebAssembly: qué es de verdad</h2>
+
+<p>WebAssembly no es "JavaScript rápido". Es un <strong>formato binario para una máquina virtual de pila</strong>, con tipado estático, que sirve de destino de compilación para C, C++, Rust, Go, Zig, C#, Kotlin y varios más. El navegador lo valida, lo compila a código máquina y lo ejecuta en el mismo hilo y en el mismo sandbox que tu JS.</p>
+
+<div class="concept">
+  <strong>💡 Los dos hechos que explican todo lo demás.</strong> <strong>(1)</strong> Wasm <strong>no tiene acceso al DOM ni a las Web APIs</strong>: todo lo que quiera tocar la página pasa por una llamada a JavaScript. <strong>(2)</strong> Su memoria es un <code>ArrayBuffer</code> plano —memoria lineal— separado del heap de JS: pasar un string o un objeto significa <strong>copiarlo</strong>. Casi todos los casos donde Wasm decepciona se explican con uno de esos dos.
+</div>
+
+<h3>Dónde está el estándar en 2026</h3>
+
+<table>
+<thead><tr><th>Pieza</th><th>Estado</th><th>Qué habilita</th></tr></thead>
+<tbody>
+<tr><td><strong>WebAssembly 3.0</strong></td><td>Estándar W3C desde septiembre de 2025</td><td>Consolida nueve features: GC, excepciones, tail calls, memoria de 64 bits, SIMD de 128 bits</td></tr>
+<tr><td><strong>WasmGC</strong></td><td>Chrome 119+, Firefox 120+, Safari 18.2+ (desde diciembre de 2024)</td><td>Lenguajes con recolector —Kotlin, Dart, Java— usan el GC del motor en vez de traer el suyo. Recorta megabytes</td></tr>
+<tr><td><strong>SIMD 128 bits + threads</strong></td><td>Interoperable</td><td>Vectorización real; threads vía <code>SharedArrayBuffer</code> (exige headers COOP/COEP)</td></tr>
+<tr><td><strong>JSPI</strong> (JS Promise Integration)</td><td>Chrome 137+, Firefox 139+; Safari pendiente. <strong>Focus area de Interop 2026</strong></td><td>Código Wasm síncrono puede esperar una promesa de JS sin bloquear el hilo</td></tr>
+<tr><td><strong>Component Model / WASI 0.2</strong></td><td>Estable desde 2025</td><td>Interoperabilidad entre módulos y ejecución fuera del navegador (edge, plugins)</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Para dimensionar: Wasm aparece en torno al <strong>5,5% de las cargas de página de Chrome</strong> a principios de 2026, contra ~4,5% el año anterior. Crece de manera sostenida y sigue siendo una tecnología de <em>nicho profundo</em>, no de uso general. Que sea nicho no la hace irrelevante: ese 5% incluye Figma, Photoshop Web, AutoCAD Web y prácticamente todo el video en el navegador.
+</div>
+
+<h3>Cuándo gana</h3>
+
+<div class="step"><strong>Cómputo denso sobre datos contiguos.</strong> Códecs de audio y video, criptografía, compresión, físicas, procesamiento de imágenes, inferencia de modelos, parsers binarios. Mucho trabajo por byte, poca interacción con el DOM.</div>
+
+<div class="step"><strong>Código portado que sería una locura reescribir.</strong> <code>ffmpeg.wasm</code>, <code>sqlite-wasm</code>, motores de PDF, motores de juego. El valor acá no es la velocidad: es <strong>no reescribir 300.000 líneas de C probadas durante veinte años</strong>.</div>
+
+<div class="step"><strong>Cuando querés el mismo algoritmo en cliente y servidor, bit a bit idéntico.</strong> Un motor de reglas o un validador compilado una vez y ejecutado en los dos lados elimina toda una clase de bugs de divergencia.</div>
+
+<h3>Cuándo pierde</h3>
+
+<div class="danger">
+  <strong>⚠️ El cruce de frontera se come la ganancia.</strong> Cada llamada JS↔Wasm tiene overhead, y los strings y objetos hay que serializarlos hacia y desde la memoria lineal. Si tu función hace poco trabajo por llamada, vas a estar <strong>más lento</strong> que en JS puro. La regla práctica: <em>pocas llamadas que hacen mucho</em>, no muchas llamadas que hacen poco.
+</div>
+
+<pre><code class="lang-javascript">// Antipatrón: 100.000 cruces de frontera para hacer sumas
+for (const px of pixeles) resultado.push(wasm.procesarPixel(px));   // ← más lento que JS
+
+// Patrón correcto: UN cruce, el buffer entero, el loop adentro de Wasm
+const ptr = wasm.exports.reservar(pixeles.length);
+new Uint8Array(wasm.exports.memory.buffer, ptr, pixeles.length).set(pixeles);
+wasm.exports.procesarBuffer(ptr, pixeles.length);
+const salida = new Uint8Array(wasm.exports.memory.buffer, ptr, pixeles.length).slice();
+wasm.exports.liberar(ptr);</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El costo de arranque es real y se paga siempre.</strong> Hay que descargar el <code>.wasm</code>, validarlo y compilarlo antes de la primera llamada. Un runtime con GC puede pesar cientos de kilobytes. Si el usuario típico nunca usa la función que Wasm acelera, le cobraste el arranque a todos para beneficiar a pocos.
+</div>
+
+<pre><code class="lang-javascript">// Compilación en streaming: compila MIENTRAS descarga, no después.
+// Exige que el servidor mande Content-Type: application/wasm (si no, cae al camino lento).
+const { instance } = await WebAssembly.instantiateStreaming(fetch("/motor.wasm"), imports);
+
+// Y medí las tres fases por separado, porque se optimizan distinto:
+performance.mark("wasm:inicio");
+const mod = await WebAssembly.instantiateStreaming(fetch("/motor.wasm"), imports);
+performance.mark("wasm:listo");
+const t = performance.measure("wasm:arranque", "wasm:inicio", "wasm:listo");
+console.log(`arranque ${t.duration.toFixed(1)} ms`);   // descarga + compilación
+// Después, aparte: tiempo de marshalling vs tiempo de cómputo dentro del módulo.</code></pre>
+
+<div class="rule">
+  <strong>📌 Wasm es una optimización de cómputo, no una arquitectura de UI.</strong> Un "framework en Wasm" que pinta DOM termina haciendo una llamada a JS por cada nodo que toca — y ahí perdiste. Cargá Wasm <strong>bajo demanda</strong>, adentro de un Worker cuando el trabajo sea largo, y solo después de haber medido que el cuello de botella es cómputo y no red ni layout (FS4).
+</div>
+
+<h2>FS8.4 Almacenamiento del lado del cliente</h2>
+
+<p>Hay cinco lugares donde guardar datos en el navegador y se eligen mal casi siempre, porque el más fácil de usar es el peor para casi todo.</p>
+
+<table>
+<thead><tr><th>Mecanismo</th><th>Modelo</th><th>Límite típico</th><th>Sincrónico</th><th>Para qué sirve de verdad</th></tr></thead>
+<tbody>
+<tr><td><code>localStorage</code></td><td>Clave→string</td><td>~5 MiB</td><td>❌ <strong>Sí, bloqueante</strong></td><td>Preferencias diminutas: tema, idioma, un flag</td></tr>
+<tr><td><code>sessionStorage</code></td><td>Clave→string, por pestaña</td><td>~5 MiB</td><td>❌ Sí, bloqueante</td><td>Estado efímero de un flujo (un wizard)</td></tr>
+<tr><td><strong>IndexedDB</strong></td><td>Objetos, índices, transacciones</td><td>Cuota compartida (GB)</td><td>✅ Asíncrono</td><td>Datos de la app: la opción por defecto real</td></tr>
+<tr><td><strong>Cache API</strong></td><td>Pares Request→Response</td><td>Cuota compartida</td><td>✅ Asíncrono</td><td>Respuestas HTTP y assets, desde el Service Worker</td></tr>
+<tr><td><strong>OPFS</strong></td><td>Sistema de archivos privado del origen</td><td>Cuota compartida</td><td>✅ Async, y <strong>sync dentro de un Worker</strong></td><td>Archivos grandes, bases embebidas (SQLite), escrituras de alta frecuencia</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Por qué <code>localStorage</code> es una trampa de rendimiento.</strong> Es la única API de almacenamiento <strong>sincrónica</strong> que queda. Cada <code>getItem</code> y cada <code>setItem</code> <em>bloquea el hilo principal</em>: durante esa operación no hay layout, ni paint, ni respuesta a un click. Serializar un objeto de 500 KB a JSON y escribirlo es una <em>long task</em> perfectamente medible, y en un móvil de gama baja se convierte en INP malo (FS4). Peor todavía: se lee también en el arranque, justo cuando el hilo principal es más escaso.
+</div>
+
+<pre><code class="lang-javascript">// Detectá el problema en vez de suponerlo: Long Animation Frames muestra
+// qué script bloqueó el frame y por cuánto tiempo.
+new PerformanceObserver((lista) =&gt; {
+  for (const entrada of lista.getEntries()) {
+    if (entrada.duration &lt; 100) continue;
+    for (const s of entrada.scripts) {
+      console.warn(`bloqueo ${entrada.duration.toFixed(0)} ms`, s.sourceURL, s.sourceFunctionName);
+    }
+  }
+}).observe({ type: "long-animation-frame", buffered: true });</code></pre>
+
+<h3>OPFS: el sistema de archivos que casi nadie usa</h3>
+
+<p>El <strong>Origin Private File System</strong> es un sistema de archivos real, invisible para el usuario, privado por origen. Está en <strong>Baseline Widely available desde marzo de 2023</strong> (Chrome/Edge 86+, Firefox 111+, Safari 15.2+). Su superpoder está en los Workers:</p>
+
+<pre><code class="lang-javascript">// ── worker.js ── createSyncAccessHandle SOLO existe dentro de un dedicated worker
+const raiz    = await navigator.storage.getDirectory();
+const archivo = await raiz.getFileHandle("datos.bin", { create: true });
+const acceso  = await archivo.createSyncAccessHandle();
+
+// Lecturas y escrituras SINCRÓNICAS, sin await, sin copias intermedias.
+// Esto es exactamente lo que permite correr SQLite compilado a Wasm en el navegador.
+const buffer = new Uint8Array(1024);
+acceso.read(buffer, { at: 0 });
+acceso.write(buffer, { at: 0 });
+acceso.flush();
+acceso.close();          // si no cerrás, el archivo queda bloqueado para el resto</code></pre>
+
+<div class="mistake">
+  <strong>No confundas OPFS con la File System Access API.</strong> Son parientes pero distintas: <code>showOpenFilePicker()</code> / <code>showSaveFilePicker()</code> tocan archivos <em>del usuario</em>, y siguen siendo <strong>solo Chromium</strong> — no son Baseline. OPFS, en cambio, es interoperable hace años. Si tu feature depende de escribir en la carpeta del usuario, necesitás un fallback con <code>&lt;input type="file"&gt;</code> más una descarga.
+</div>
+
+<h3>Cuotas y expulsión: lo que nadie lee hasta que pierde datos</h3>
+
+<table>
+<thead><tr><th>Navegador</th><th>Cuota aproximada</th><th>Política de expulsión</th></tr></thead>
+<tbody>
+<tr><td>Chromium</td><td>Hasta ~60% del disco disponible, por origen</td><td>Bajo presión de disco, empieza por el origen menos usado</td></tr>
+<tr><td>Firefox</td><td>~10% del disco por eTLD+1</td><td>LRU bajo presión; <code>persist()</code> muestra un prompt al usuario</td></tr>
+<tr><td>Safari</td><td>~1 GB inicial, y pide permiso en tramos de ~200 MB</td><td><strong>ITP: 7 días sin interacción del usuario y borra todo lo creado por script</strong></td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Las dos cosas que te van a arruinar el día.</strong> Primero: la expulsión es <strong>por origen y todo junto</strong> — si el navegador decide limpiar, se van IndexedDB, Cache API y OPFS <em>al mismo tiempo</em>, no el pedacito que menos usás. Segundo: en Safari, un usuario que no visita tu sitio durante siete días vuelve con todo vacío. La excepción es una <strong>PWA instalada</strong> en la pantalla de inicio, que queda exenta de ese plazo.
+</div>
+
+<pre><code class="lang-javascript">async function prepararAlmacenamiento() {
+  const { usage, quota } = await navigator.storage.estimate();
+  const usadoMB = (usage / 1_048_576).toFixed(1);
+  const cuotaMB = (quota / 1_048_576).toFixed(0);
+
+  // persist() NO es una garantía: Firefox le pregunta al usuario, Chromium y Safari
+  // deciden solos según cuánto interactuó con el sitio. Puede devolver false.
+  const persistido = await navigator.storage.persist();
+
+  return { usadoMB, cuotaMB, persistido };
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Tu almacenamiento local es una caché, no una base de datos.</strong> El criterio es simple y no admite excepciones: <em>si el usuario perdería trabajo cuando el navegador expulse los datos, esos datos tienen que estar sincronizados con el servidor</em>. Todo lo demás es reconstruible, y tu código tiene que poder reconstruirlo sin drama.
+</div>
+
+<h2>FS8.5 Offline de verdad</h2>
+
+<p>Hay una distancia enorme entre "mi app pasa el audit de PWA" y "mi app funciona sin red". La primera se logra en una tarde. La segunda es un proyecto.</p>
+
+<div class="concept">
+  <strong>💡 Offline-first no es un plugin: es una decisión de arquitectura de datos.</strong> Es la decisión de que la <strong>fuente de verdad de la UI es la base local</strong> y el servidor es un peer con el que sincronizás, en vez de que la red sea la fuente de verdad y el caché un consuelo. Todo lo demás —el service worker, el manifest, los íconos— es plomería alrededor de esa decisión.
+</div>
+
+<table>
+<thead><tr><th>PWA de checklist</th><th>Offline-first en serio</th></tr></thead>
+<tbody>
+<tr><td>Manifest + íconos + service worker</td><td>Todo eso, y además:</td></tr>
+<tr><td>Cachea el app shell</td><td>La UI <strong>lee de IndexedDB</strong>, no de <code>fetch</code>. La red rellena la base</td></tr>
+<tr><td>Muestra "estás sin conexión"</td><td>Las mutaciones entran en una <strong>outbox</strong> con reintentos e idempotencia</td></tr>
+<tr><td>—</td><td>Estrategia de <strong>conflictos elegida a propósito</strong> y documentada</td></tr>
+<tr><td>—</td><td>Estados visibles: pendiente / sincronizado / en conflicto / falló</td></tr>
+<tr><td>—</td><td><strong>Migraciones</strong> del esquema local versionadas</td></tr>
+</tbody>
+</table>
+
+<h3>La cola de salida y la idempotencia</h3>
+
+<pre><code class="lang-javascript">// Toda mutación se escribe local PRIMERO y se encola después.
+// La clave de idempotencia es lo que hace que reintentar sea seguro:
+// si el POST llegó pero la respuesta se perdió, el servidor reconoce el id y no duplica.
+async function guardarNota(db, texto) {
+  const op = {
+    id: crypto.randomUUID(),            // ← clave de idempotencia
+    tipo: "crear_nota",
+    payload: { texto },
+    creadoEn: Date.now(),
+    intentos: 0,
+  };
+  const tx = db.transaction(["notas", "outbox"], "readwrite");
+  tx.objectStore("notas").put({ id: op.id, texto, estado: "pendiente" });
+  tx.objectStore("outbox").put(op);
+  await tx.done;
+  drenarOutbox(db);                     // intenta ya; si falla, queda para después
+  return op.id;                          // la UI ya puede mostrar la nota
+}
+
+async function drenarOutbox(db) {
+  if (!navigator.onLine) return;        // onLine miente: dice "hay red", no "hay internet"
+  for (const op of await db.getAll("outbox")) {
+    try {
+      const r = await fetch("/api/notas", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": op.id },
+        body: JSON.stringify(op.payload),
+      });
+      if (r.status &gt;= 500) throw new Error("reintentable");
+      if (r.status &gt;= 400) { await marcarFallida(db, op, await r.text()); continue; }
+      await confirmar(db, op, await r.json());
+    } catch {
+      // Backoff exponencial con tope. Sin tope, un servidor caído se convierte
+      // en un ataque de denegación de servicio hecho por tus propios usuarios.
+      op.intentos++;
+      setTimeout(() =&gt; drenarOutbox(db), Math.min(2 ** op.intentos * 1000, 60_000));
+      return;
+    }
+  }
+}
+
+// Reintentá también cuando la pestaña vuelve al frente: es el disparador
+// más confiable que existe, y funciona en todos los navegadores.
+document.addEventListener("visibilitychange", () =&gt; {
+  if (document.visibilityState === "visible") drenarOutbox(db);
+});
+addEventListener("online", () =&gt; drenarOutbox(db));</code></pre>
+
+<div class="danger">
+  <strong>⚠️ No apoyes tu sincronización en Background Sync.</strong> La <strong>Background Sync API</strong> es solo Chromium (Chrome, Edge, Opera, Samsung): ni Firefox ni Safari la implementan. La <strong>Periodic Background Sync</strong> es todavía más restringida —Chromium, solo en PWA instaladas y sujeta al puntaje de engagement del sitio. Usalas como <em>mejora</em>, nunca como mecanismo principal. Tu red de seguridad son <code>visibilitychange</code> y el evento <code>online</code>.
+</div>
+
+<h3>Conflictos: elegí uno, escribilo, no improvises</h3>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Cuándo sirve</th><th>Qué te cuesta</th></tr></thead>
+<tbody>
+<tr><td><strong>Last write wins</strong></td><td>Datos de un solo usuario en varios dispositivos</td><td>Pérdida silenciosa de ediciones. Necesitás relojes confiables (o versiones)</td></tr>
+<tr><td><strong>Versión / ETag</strong> y rechazo</td><td>Cuando el usuario puede resolver a mano</td><td>Hay que diseñar una UI de conflicto, que nadie quiere diseñar</td></tr>
+<tr><td><strong>Merge por campo</strong></td><td>Formularios donde cada campo es independiente</td><td>Falla cuando hay invariantes entre campos</td></tr>
+<tr><td><strong>CRDT</strong></td><td>Colaboración en tiempo real sobre texto o listas</td><td>Metadatos que crecen, curva de aprendizaje, difícil de auditar</td></tr>
+<tr><td><strong>Append-only + proyección</strong></td><td>Bitácoras, mediciones, eventos</td><td>Almacenamiento que solo crece; hay que compactar</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error clásico:</strong> no elegir. Un equipo implementa "offline" sin decidir la estrategia y termina con last-write-wins <em>de hecho</em>, porque el último <code>PUT</code> pisa. Nadie lo documentó, así que cuando un usuario reporta que perdió una edición, no hay a qué comparar el comportamiento. La estrategia de conflictos va escrita en un ADR <strong>antes</strong> de la primera línea de código de sincronización.
+</div>
+
+<h2>FS8.6 Streaming y renderizado en el servidor</h2>
+
+<p>HTTP transporta un <em>stream</em> de bytes y el parser del navegador es incremental: empieza a construir el DOM con el primer chunk, sin esperar el cierre de <code>&lt;/html&gt;</code>. Eso, que es de 1993, es la base de todo el SSR moderno.</p>
+
+<pre><code class="lang-javascript">// SSR con streaming, sin framework. El shell sale en el primer chunk;
+// los datos lentos salen cuando llegan, sin bloquear nada de lo anterior.
+export default {
+  async fetch(req) {
+    const stream = new ReadableStream({
+      async start(c) {
+        const enc = new TextEncoder();
+        // 1) Head + shell: el navegador ya puede pedir CSS y pintar
+        c.enqueue(enc.encode(`&lt;!DOCTYPE html&gt;&lt;html lang="es"&gt;&lt;head&gt;
+          &lt;link rel="stylesheet" href="/app.css"&gt;&lt;/head&gt;&lt;body&gt;
+          &lt;header&gt;Mi tienda&lt;/header&gt;
+          &lt;main id="lista"&gt;&lt;p class="cargando"&gt;Cargando productos…&lt;/p&gt;&lt;/main&gt;`));
+
+        // 2) La consulta lenta corre mientras el usuario YA ve algo
+        const productos = await consultarProductos();
+
+        // 3) Out-of-order: mandamos el contenido real al final y lo movemos
+        //    a su lugar con un script inline. Así el orden de LLEGADA
+        //    no tiene por qué ser el orden VISUAL de la página.
+        c.enqueue(enc.encode(`&lt;template id="datos-lista"&gt;${render(productos)}&lt;/template&gt;
+          &lt;script&gt;{
+            const t = document.getElementById("datos-lista");
+            document.getElementById("lista").replaceChildren(t.content);
+            t.remove();
+          }&lt;/script&gt;&lt;/body&gt;&lt;/html&gt;`));
+        c.close();
+      },
+    });
+    return new Response(stream, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  },
+};</code></pre>
+
+<div class="info">
+  Eso es, en esencia, lo que hacen <code>&lt;Suspense&gt;</code> de React, <code>&lt;Await&gt;</code> de Remix y <code>{#await}</code> de Svelte. Saber que abajo hay un <code>&lt;template&gt;</code> y un script inline te cambia la relación con esas abstracciones: dejan de ser magia y pasan a ser una comodidad que también podés escribir vos.
+</div>
+
+<h3>Qué resuelve el SSR de verdad — y qué no</h3>
+
+<table>
+<thead><tr><th>SSR sí resuelve</th><th>SSR NO resuelve</th></tr></thead>
+<tbody>
+<tr><td>Tiempo hasta el primer contenido significativo (LCP)</td><td>La velocidad de la app <em>después</em> del arranque</td></tr>
+<tr><td>HTML indexable y previsualizable al compartir un link</td><td>Un waterfall de datos: lo <strong>mueve</strong> al servidor, no lo elimina</td></tr>
+<tr><td>Menos trabajo de JS en el arranque, sobre todo en móviles baratos</td><td>El costo de la hidratación, que se sigue pagando</td></tr>
+<tr><td>Contenido visible aunque el JS falle (si hiciste PE)</td><td>El TTFB: ahora esperás a tu servidor y a tu base</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El SSR agrega un servidor a tu vida.</strong> Con render estático o SPA pura, tu frontend es un montón de archivos en una CDN: no se cae, no escala mal, no tiene incidentes a las 3 de la mañana. Con SSR tenés un servicio con latencia, con estado de conexiones, con despliegues, con memoria que se puede fugar y con una base de datos que se puede saturar. Eso no lo hace una mala decisión — lo hace <strong>una decisión</strong>, que se justifica con LCP y TTFB de campo (FS4), no con la sensación de que "se siente más rápido".
+</div>
+
+<h2>FS8.7 APIs modernas que valen la pena</h2>
+
+<p>La lista completa de APIs nuevas es interminable y la mayoría no te va a servir. Estas siete sí, con el criterio de cuándo usar cada una.</p>
+
+<table>
+<thead><tr><th>API</th><th>Para qué</th><th>Estado 2026</th><th>Criterio</th></tr></thead>
+<tbody>
+<tr><td><strong>View Transitions</strong> (mismo documento)</td><td>Animar un cambio de estado del DOM sin coreografiar nada</td><td>Chrome 111+, Safari 18+, Firefox 144+. <code>:active-view-transition</code> es Baseline Newly available desde el 13/01/2026</td><td>Usala: el fallback es que el cambio ocurre sin animación</td></tr>
+<tr><td><strong>Cross-document</strong> (<code>@view-transition</code>)</td><td>Transiciones entre páginas en un sitio multipágina</td><td>Chromium y Safari 18.2+; <strong>Firefox pendiente</strong>. MDN: "disponibilidad limitada", <strong>no es Baseline</strong>. Focus area de Interop 2026</td><td>Enhancement puro: donde no hay soporte, la navegación es un corte seco. Aceptable</td></tr>
+<tr><td><code>&lt;dialog&gt;</code> + <code>popover</code></td><td>Modales, menús, tooltips, toasts</td><td>Popover es Baseline <strong>Widely available desde abril de 2025</strong>; los <em>invoker commands</em> (<code>command</code>/<code>commandfor</code>) ya están en los tres motores</td><td>Reemplazá tu librería de modales. Pero testeá: "dialogs and popovers" sigue en Interop 2026, o sea que hay diferencias finas</td></tr>
+<tr><td><strong>IntersectionObserver</strong></td><td>Saber si algo entró en pantalla: lazy load, scroll infinito, analytics de visibilidad</td><td>Widely available hace años</td><td>Primera opción siempre. Nunca hagas esto con el evento <code>scroll</code></td></tr>
+<tr><td><strong>ResizeObserver</strong></td><td>Reaccionar al tamaño de un <em>elemento</em>, no de la ventana</td><td>Widely available</td><td>Si podés resolverlo con container queries en CSS, hacelo en CSS</td></tr>
+<tr><td><strong>MutationObserver</strong></td><td>Detectar cambios en un DOM que no controlás</td><td>Widely available</td><td>Último recurso. Si observás tu propio DOM, tenés un problema de arquitectura</td></tr>
+<tr><td><strong>Broadcast Channel</strong></td><td>Coordinar pestañas del mismo origen</td><td>Widely available</td><td>Logout en todas las pestañas, invalidar caché, evitar dos sincronizaciones simultáneas</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-javascript">// View Transitions: el patrón de tres líneas, con la salida de emergencia incluida.
+function navegar(actualizarDOM) {
+  // Detección de feature + respeto por prefers-reduced-motion, en la misma condición
+  const puede = document.startViewTransition
+    &amp;&amp; !matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  if (!puede) return actualizarDOM();       // sin animación, pero funciona igual
+  return document.startViewTransition(actualizarDOM).finished;
+}</code></pre>
+
+<pre><code class="lang-html">&lt;!-- Popover + invoker commands: un menú accesible sin una línea de JS.
+     El navegador se ocupa del light-dismiss, del foco y de la capa superior. --&gt;
+&lt;button commandfor="menu-usuario" command="toggle-popover"&gt;Cuenta&lt;/button&gt;
+&lt;div id="menu-usuario" popover&gt;
+  &lt;a href="/perfil"&gt;Perfil&lt;/a&gt;
+  &lt;a href="/salir"&gt;Cerrar sesión&lt;/a&gt;
+&lt;/div&gt;
+
+&lt;!-- Y un diálogo modal, también declarativo --&gt;
+&lt;button commandfor="confirmar" command="show-modal"&gt;Borrar&lt;/button&gt;
+&lt;dialog id="confirmar"&gt;
+  &lt;p&gt;¿Seguro que querés borrar esto?&lt;/p&gt;
+  &lt;button commandfor="confirmar" command="close"&gt;Cancelar&lt;/button&gt;
+&lt;/dialog&gt;</code></pre>
+
+<pre><code class="lang-javascript">// Broadcast Channel: el caso de uso que justifica aprenderla en cinco minutos.
+const canal = new BroadcastChannel("sesion");
+
+canal.addEventListener("message", (e) =&gt; {
+  if (e.data.tipo === "logout") location.assign("/login");   // todas las pestañas, a la vez
+});
+
+export function cerrarSesion() {
+  canal.postMessage({ tipo: "logout" });   // no le llega a la pestaña que lo emite
+  location.assign("/login");
+}</code></pre>
+
+<div class="tip">
+  <strong>Web Share</strong> merece una mención aparte porque es la que peor se implementa. <code>navigator.share()</code> <strong>exige un gesto del usuario</strong> —no la llames desde un <code>setTimeout</code>—, devuelve un rechazo cuando el usuario cancela (no es un error tuyo: no lo reportes), y en escritorio el soporte es irregular. El patrón correcto es: <code>if (navigator.canShare?.(datos))</code> mostrás el botón nativo; si no, mostrás "copiar link". Nunca mostrar un botón que no hace nada.
+</div>
+
+<h2>FS8.8 Progressive enhancement en 2026</h2>
+
+<p>El argumento contra el progressive enhancement siempre fue el mismo: "casi nadie navega sin JavaScript". Es cierto y es irrelevante, porque nunca se trató de eso.</p>
+
+<div class="concept">
+  <strong>💡 El punto no son los usuarios sin JS: es que el JS falla.</strong> Y falla por razones que no controlás. La red corta a mitad del bundle. El CDN está bloqueado por una red corporativa o por un país. Un navegador viejo no parsea una sintaxis nueva y todo el archivo muere en el parseo. Una extensión rompe un global. Un móvil con 2 GB de RAM mata la pestaña. El HTML y el CSS <strong>degradan</strong> —lo que no se entiende se ignora—, mientras que el <strong>JavaScript es binario: anda o no anda</strong>.
+</div>
+
+<table>
+<thead><tr><th>Falla</th><th>SPA sin PE</th><th>Con progressive enhancement</th></tr></thead>
+<tbody>
+<tr><td>El bundle no descarga (red, CDN, bloqueo)</td><td>Página en blanco</td><td>Contenido legible, links que funcionan</td></tr>
+<tr><td>Error de JS en el arranque</td><td>Página en blanco</td><td>Contenido legible, formularios que envían</td></tr>
+<tr><td>Navegador viejo o exótico</td><td>Página en blanco</td><td>Versión sin adornos, usable</td></tr>
+<tr><td>Bot / crawler / preview de link</td><td>Depende del renderizado del bot</td><td>HTML real, siempre</td></tr>
+<tr><td>Red lentísima</td><td>Spinner durante 8 segundos</td><td>Contenido a los 800 ms, interactivo después</td></tr>
+</tbody>
+</table>
+
+<h3>Qué significa cuando tu app es una SPA</h3>
+
+<p>No significa "hacé que todo funcione sin JS". Eso es imposible en un editor de video y absurdo en un IDE. Significa <strong>definir tu superficie mínima</strong> y garantizarla en capas:</p>
+
+<div class="step"><strong>Capa 1 — Estructura.</strong> La navegación principal son <code>&lt;a href&gt;</code> con URLs reales, no <code>&lt;div onclick&gt;</code>. Los formularios tienen <code>action</code> y <code>method</code>. El contenido crítico está en el HTML inicial.</div>
+
+<div class="step"><strong>Capa 2 — Presentación.</strong> El CSS hace la página usable aunque el JS nunca llegue. Nada crítico depende de una clase que agrega JavaScript.</div>
+
+<div class="step"><strong>Capa 3 — Comportamiento.</strong> El JS <em>intercepta</em> y mejora: en vez de un submit completo, un fetch y una actualización parcial. Si el JS no llegó, el submit normal funciona.</div>
+
+<pre><code class="lang-html">&lt;!-- Sin JS: POST normal, el servidor responde con la página actualizada.
+     Con JS: se intercepta, se manda en segundo plano y no parpadea nada. --&gt;
+&lt;form id="suscribir" action="/api/suscribir" method="post"&gt;
+  &lt;label for="email"&gt;Tu email&lt;/label&gt;
+  &lt;input id="email" name="email" type="email" required&gt;
+  &lt;button&gt;Suscribirme&lt;/button&gt;
+  &lt;p class="resultado" aria-live="polite"&gt;&lt;/p&gt;
+&lt;/form&gt;</code></pre>
+
+<pre><code class="lang-javascript">document.getElementById("suscribir").addEventListener("submit", async (e) =&gt; {
+  e.preventDefault();
+  const form = e.currentTarget;
+  const salida = form.querySelector(".resultado");
+  const boton  = form.querySelector("button");
+
+  boton.disabled = true;
+  try {
+    // action y method salen del HTML: una sola fuente de verdad para la URL
+    const r = await fetch(form.action, { method: form.method, body: new FormData(form) });
+    salida.textContent = r.ok ? "¡Listo! Revisá tu correo." : "No pudimos suscribirte.";
+  } catch {
+    // Si falla la red, dejamos que el navegador haga el envío clásico:
+    // degradar hacia la capa de abajo también es progressive enhancement
+    form.submit();
+  } finally {
+    boton.disabled = false;
+  }
+});</code></pre>
+
+<div class="rule">
+  <strong>📌 La pregunta correcta no es "¿PE sí o no?".</strong> Es: <em>¿cuál es la parte de mi producto que tiene que funcionar aunque el JavaScript no llegue?</em> En un e-commerce, esa parte es ver un producto y su precio. En un banco, ver el saldo. En un diario, leer la nota. Definila, escribila en la documentación del proyecto y ponele un test. Lo demás puede exigir JS con toda tranquilidad.
+</div>
+
+<h2>FS8.9 Detección de features y estrategia de soporte</h2>
+
+<p>La decisión de "qué navegadores soportamos" se toma casi siempre por opinión —"los últimos dos", "los que usa el equipo"— y casi nunca con datos. Desde 2023 hay una herramienta que convierte esa discusión en una consulta.</p>
+
+<h3>Baseline: el vocabulario común</h3>
+
+<table>
+<thead><tr><th>Nivel</th><th>Qué significa</th><th>Cómo se usa en una decisión</th></tr></thead>
+<tbody>
+<tr><td><strong>Limited availability</strong></td><td>Falta al menos un motor core</td><td>Solo como enhancement con fallback, o detrás de un flag</td></tr>
+<tr><td><strong>Newly available</strong></td><td>Ya está en Chrome, Edge, Firefox y Safari (escritorio y móvil)</td><td>Usable, pero el parque de dispositivos viejos todavía no rotó</td></tr>
+<tr><td><strong>Widely available</strong></td><td><strong>30 meses</strong> después de ser Newly</td><td>Usar sin ceremonia. Es el default sensato para producción</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Los 30 meses no son arbitrarios: son el tiempo empírico que tarda el parque de dispositivos reales en rotar lo suficiente como para que la cola de versiones viejas deje de importar. Y hay una segunda señal, gratis: <strong>Interop</strong>. Los focus areas los eligen entre Apple, Google, Igalia, Microsoft y Mozilla, y en <strong>Interop 2026</strong> son 20 áreas surgidas de más de 150 propuestas. Que algo esté en la lista significa que <em>todavía no es interoperable</em> — es una advertencia disfrazada de buena noticia.
+</div>
+
+<pre><code class="lang-bash"># Browserslist ya trae las consultas de Baseline: la política se vuelve una línea
+npx browserslist "baseline widely available"
+
+# Congelada a una fecha, para que el build sea reproducible y no cambie solo
+npx browserslist "baseline widely available on 2025-01-01"
+
+# Y se compara contra tus datos reales antes de decidir
+npx browserslist "&gt; 0.5% in AR, last 2 versions, not dead"</code></pre>
+
+<pre><code class="lang-css">/* Detección en CSS: @supports pregunta por la propiedad, no por el navegador */
+@supports (anchor-name: --x) {
+  .tooltip { position: absolute; position-anchor: --disparador; }
+}
+@supports not (anchor-name: --x) {
+  .tooltip { position: absolute; top: 100%; left: 0; }   /* el camino de siempre */
+}
+
+/* También se puede preguntar por selectores */
+@supports selector(:has(+ .hermano)) {
+  .fila:has(+ .fila--error) { border-bottom-color: transparent; }
+}</code></pre>
+
+<pre><code class="lang-javascript">// Detección en JS: preguntá por la capacidad, NUNCA por el user agent.
+const soporta = {
+  vistas:   typeof document.startViewTransition === "function",
+  popover:  HTMLElement.prototype.hasOwnProperty("popover"),
+  compartir: typeof navigator.canShare === "function",
+  opfs:     typeof navigator.storage?.getDirectory === "function",
+  css:      CSS.supports("color", "contrast-color(black)"),
+};
+
+// El polyfill se carga SOLO si hace falta, y con fecha de vencimiento escrita:
+if (!soporta.popover) {
+  // REVISAR 2027-06: popover es Widely available desde 2025-04.
+  // Cuando el corte de soporte pase esa fecha, borrar este import y el paquete.
+  await import("./polyfills/popover.js");
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El costo real de un polyfill no son sus kilobytes.</strong> Son cuatro: <strong>(1)</strong> bytes y tiempo de parseo, muchas veces para el 100% de los usuarios cuando solo el 3% lo necesita; <strong>(2)</strong> sus propios bugs, que se comportan distinto de la implementación nativa; <strong>(3)</strong> el conflicto cuando la feature nativa llega y el polyfill la pisa; y <strong>(4)</strong> que <strong>nadie los borra</strong>. Todo polyfill que agregues lleva un comentario con fecha de revisión, o dentro de tres años sigue ahí.
+</div>
+
+<h3>Elegir la línea de corte con datos</h3>
+
+<table>
+<thead><tr><th>Fuente</th><th>Qué te dice</th><th>Trampa</th></tr></thead>
+<tbody>
+<tr><td>Tus propias analytics</td><td>Qué usan <strong>tus</strong> usuarios reales</td><td>Sesgo de supervivencia: los que ya no pueden entrar no aparecen</td></tr>
+<tr><td>CrUX para tu dominio</td><td>Datos de campo de usuarios reales de Chrome</td><td>Solo Chrome; no ves Safari ni Firefox</td></tr>
+<tr><td>Estadísticas globales (caniuse)</td><td>El mundo</td><td>El mundo no es tu público: un SaaS B2B no se parece al promedio</td></tr>
+<tr><td>Logs del servidor</td><td>Quién <em>intenta</em> entrar, incluidos los que fallan</td><td>User agents cada vez menos informativos</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Una política se puede verificar; una opinión no.</strong> "Soportamos los navegadores que cubren el 98% de nuestras sesiones de los últimos 90 días, más Baseline Widely available, revisado cada trimestre" es una política: cualquiera puede consultarla y saber si una feature entra o no. "Soportamos los últimos dos navegadores" es una opinión, y una que cambia de significado sola cada seis semanas.
+</div>
+
+<h2>FS8.10 Cuándo NO necesitás un framework — y cuándo sí</h2>
+
+<p>Sin militancia y sin la trampa de comparar solamente el tamaño del bundle. El costo de un framework casi nunca son sus kilobytes: es el <strong>acoplamiento a su modelo mental y a su ciclo de versiones</strong>. Y el costo de <em>no</em> usarlo es que el sistema de componentes, el routing, el manejo de estado y las convenciones los escribís y los mantenés vos.</p>
+
+<table>
+<thead><tr><th>Dimensión</th><th>Apunta a plataforma pura</th><th>Apunta a framework</th></tr></thead>
+<tbody>
+<tr><td><strong>Estado compartido</strong></td><td>Poco, local, sin derivaciones cruzadas</td><td>Mucho estado derivado que tiene que mantenerse consistente</td></tr>
+<tr><td><strong>Cantidad de vistas</strong></td><td>Pocas, o navegación entre documentos</td><td>Decenas, con rutas anidadas y estado que sobrevive a la navegación</td></tr>
+<tr><td><strong>Tamaño del equipo</strong></td><td>1 a 3 personas</td><td>5 o más, o alta rotación: la convención vale más que la elegancia</td></tr>
+<tr><td><strong>Vida esperada</strong></td><td>Más de 8 años, o nadie va a mantenerlo</td><td>3 a 6 años con equipo activo</td></tr>
+<tr><td><strong>Ecosistema necesario</strong></td><td>Nada raro</td><td>Tablas complejas, drag &amp; drop, gráficos, editores de texto enriquecido</td></tr>
+<tr><td><strong>Contratación</strong></td><td>No es un factor</td><td>Sí: hay más gente que sabe React que gente que sabe tu framework casero</td></tr>
+<tr><td><strong>SSR / streaming</strong></td><td>Estático o streaming simple</td><td>Streaming con Suspense, RSC, revalidación fina</td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>Una tercera opción que casi nadie menciona.</strong> Entre "todo React" y "todo a mano" existe una franja ancha y muy razonable: <strong>HTML servido más islas de interactividad</strong> (Astro), <strong>HTML sobre el cable</strong> (htmx), <strong>una capa fina de reactividad</strong> (Alpine, Lit), o <strong>tu propio código</strong> — porque 200 líneas tuyas que entendés completas suelen ser mejores que una dependencia de 40 KB que entendés a medias. Elegir una de esas no es cobardía: es dimensionar.
+</div>
+
+<div class="mistake">
+  <strong>Los dos errores simétricos.</strong> El primero: meter un framework en un sitio de contenido de doce páginas, y terminar con hidratación, un servidor de render y un pipeline de build para mostrar texto. El segundo: construir una aplicación con cuarenta vistas y estado compartido sin framework, y a los dos años tener un framework propio —peor documentado, sin comunidad y con un solo mantenedor que se va a ir. <strong>El segundo error es más caro que el primero</strong>, aunque el primero se critique más en redes.
+</div>
+
+<h2>FS8.11 El futuro cercano y cómo no correr atrás de cada novedad</h2>
+
+<p>La plataforma se mueve más rápido que nunca y eso genera una ansiedad que no ayuda a nadie. La respuesta no es leer más: es tener un sistema.</p>
+
+<div class="step"><strong>1. Una sola fuente de verdad de soporte.</strong> Baseline y el dashboard de web status. Se consulta cuando hay una decisión que tomar, no todos los días.</div>
+
+<div class="step"><strong>2. Un pulso trimestral, no diario.</strong> Los digests mensuales de Baseline y las notas de versión de los cuatro motores. Una hora cada tres meses te deja mejor informado que scrollear todos los días.</div>
+
+<div class="step"><strong>3. Usá Interop como agenda.</strong> Los focus areas del año te dicen <em>qué va a dejar de ser un problema</em>. Los de 2026 —View Transitions, scoped custom element registries, Navigation API, JSPI, dialogs y popovers, container style queries, scroll-driven animations— son literalmente el índice de lo que vas a poder usar sin fallback en 2027.</div>
+
+<div class="step"><strong>4. Dos preguntas antes de adoptar cualquier cosa.</strong> ¿Qué problema <strong>medido</strong> resuelve? ¿Cuál es el plan si lo tengo que sacar? Si no podés responder las dos, no es una decisión técnica: es entusiasmo.</div>
+
+<div class="step"><strong>5. Un ADR de diez líneas por dependencia nueva.</strong> Fecha, problema, alternativas descartadas, criterio de salida. Es el único antídoto contra el "esto está acá porque siempre estuvo".</div>
+
+<div class="tip">
+  <strong>El antipatrón tiene nombre y es caro:</strong> adoptar por FOMO y descubrir el costo recién en la migración. Toda tecnología se ve barata mientras la estás agregando; el precio real se cobra el día que la querés sacar. Por eso el criterio de salida se escribe <em>el día que entra</em>, cuando todavía sos honesto.
+</div>
+
+<h2>FS8.12 Cierre del track</h2>
+
+<p>Ocho módulos, ocho preguntas que un frontend senior tiene que poder responder con evidencia y no con opinión.</p>
+
+<table>
+<thead><tr><th>Módulo</th><th>La pregunta que responde</th><th>Lo que te llevás</th></tr></thead>
+<tbody>
+<tr><td><strong>FS1</strong> El navegador por dentro</td><td>¿Por qué la página tarda en aparecer?</td><td>Parseo, árboles, layout, paint, compositing: dónde se va el tiempo antes del primer píxel</td></tr>
+<tr><td><strong>FS2</strong> El motor de JavaScript</td><td>¿Por qué este código es lento?</td><td>JIT, formas de objetos, deoptimizaciones, GC y presión de memoria</td></tr>
+<tr><td><strong>FS3</strong> Red y protocolos</td><td>¿Por qué los bytes llegan tarde?</td><td>HTTP/2 y /3, TLS, caché, CDN, prioridades y precarga</td></tr>
+<tr><td><strong>FS4</strong> Web Vitals</td><td>¿Cómo se demuestra que es rápido?</td><td>LCP, INP, CLS, campo vs laboratorio, y cómo no engañarse solo</td></tr>
+<tr><td><strong>FS5</strong> CSS a escala</td><td>¿Por qué el CSS se pudre con el tiempo?</td><td>Cascada, capas, contención, tokens y arquitectura que sobrevive al equipo</td></tr>
+<tr><td><strong>FS6</strong> Accesibilidad experta</td><td>¿Cómo sé que funciona para todos?</td><td>Árbol de accesibilidad, foco, ARIA, y prueba real con tecnología asistiva</td></tr>
+<tr><td><strong>FS7</strong> Build y entrega</td><td>¿Cómo llega esto a producción sin sorpresas?</td><td>Bundling, presupuestos, versionado, despliegues progresivos y rollback</td></tr>
+<tr><td><strong>FS8</strong> La plataforma</td><td>¿Qué necesito instalar de verdad?</td><td>Qué es nativo, qué cuesta cada capacidad y cómo se justifica una dependencia</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El hilo que une los ocho.</strong> Ninguno te enseñó una receta. Todos te enseñaron a <strong>medir antes de decidir y a nombrar el costo de cada opción</strong>. Esa es la diferencia entre alguien que sabe muchas herramientas y alguien en quien un equipo confía para elegir cuáles.
+</div>
+
+<p>Hacia dónde seguir, según qué quieras profundizar:</p>
+
+<ul>
+  <li><strong><a href="../../Curso-React/senior/index.html">React Senior</a></strong> — si tu trabajo vive en el ecosistema: el reconciliador por dentro, Concurrent React, el compilador, Server Components, caché de datos y migración incremental. Este módulo te dio la plataforma; ese track te da el framework que la usa.</li>
+  <li><strong><a href="../../../track-senior/modulo-01-patterns-arquitectura/lecture.html">Track Senior transversal</a></strong> — si lo que sigue es alcance y no profundidad técnica: patrones de arquitectura, decisiones de diseño, revisión de código, liderazgo técnico y comunicación con negocio.</li>
+</ul>
+
+<h2>🧑‍🎓 Worked Example — un widget para tres clientes con tres frameworks</h2>
+
+<blockquote>Tenés que entregar un widget de "estado del envío" para tres clientes. El primero corre WordPress con jQuery. El segundo, un Angular de hace tres años. El tercero, un Next.js reciente. Requisitos: no romper los estilos del host y que el host no rompa los tuyos; que el cliente pueda escuchar eventos del widget; que se actualice sin que ellos redeployeen; que sea accesible; y que pese poco. ¿Qué construís?</blockquote>
+
+<p><strong>Paso 1 — Las tres opciones reales, con sus costos.</strong></p>
+
+<table>
+<thead><tr><th></th><th>iframe</th><th>Bundle de React</th><th>Custom element + shadow DOM</th></tr></thead>
+<tbody>
+<tr><td>Aislamiento de estilos</td><td>✅ Total</td><td>❌ Los globales del host se filtran</td><td>✅ Real (con una excepción, ver trampa 1)</td></tr>
+<tr><td>Aislamiento de JS</td><td>✅ Total</td><td>⚠️ Conflicto si el host ya tiene React</td><td>⚠️ Comparte el global, pero no el DOM</td></tr>
+<tr><td>Peso agregado al host</td><td>Un documento entero + su request</td><td>~45 KB de runtime, por cada host</td><td>~4 KB, sin dependencias</td></tr>
+<tr><td>Se adapta a su contenido</td><td>❌ Necesita <code>postMessage</code> y coordinación</td><td>✅</td><td>✅</td></tr>
+<tr><td>Hereda tipografía y tema del host</td><td>❌ Nunca</td><td>✅ (a veces demasiado)</td><td>✅ Controlado, vía custom properties</td></tr>
+<tr><td>Foco y teclado</td><td>⚠️ El tab entra y sale raro; lector de pantalla lo anuncia como otro documento</td><td>✅</td><td>⚠️ Retargeting, ver trampa 3</td></tr>
+<tr><td>Integración con el host</td><td>Solo <code>postMessage</code></td><td>Depende de su versión de React</td><td>✅ Una etiqueta HTML y eventos DOM</td></tr>
+<tr><td>Cookies de terceros</td><td>❌ Problema creciente</td><td>✅ Mismo origen que el host</td><td>✅</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 2 — La decisión.</strong> <strong>Custom element + shadow DOM.</strong> El iframe da el mejor aislamiento pero rompe la accesibilidad, el foco y el auto-alto, y en 2026 arrastra el lío de las cookies de terceros. El bundle de React resuelve el caso de un cliente y crea un problema en los otros dos. El custom element es la única opción donde <em>la integración es literalmente una etiqueta HTML</em>, que es exactamente lo que los tres hosts saben poner sin discutir.</p>
+
+<pre><code class="lang-javascript">const estilos = new CSSStyleSheet();
+estilos.replaceSync(`
+  /* TRAMPA 1: 'all: initial' corta la herencia del host.
+     Sin esto, font-family, color, line-height, letter-spacing, text-transform
+     y varias más CRUZAN el shadow boundary y te deforman el widget. */
+  :host {
+    all: initial;
+    display: block;
+    contain: content;                          /* aísla layout y paint (FS1) */
+    font: 400 14px/1.5 system-ui, sans-serif;
+    color: var(--envio-color, #18181b);        /* API de theming explícita */
+    background: var(--envio-bg, #fff);
+    border: 1px solid var(--envio-borde, #e4e4e7);
+    border-radius: var(--envio-radio, 10px);
+    padding: 1rem;
+  }
+  :host([hidden]) { display: none; }
+  button {
+    font: inherit; cursor: pointer; padding: .4rem .8rem;
+    border: 1px solid currentColor; border-radius: 6px; background: transparent; color: inherit;
+  }
+  button:focus-visible { outline: 2px solid var(--envio-foco, #2563eb); outline-offset: 2px; }
+  .estado { font-weight: 700; }
+`);
+
+class EstadoEnvio extends HTMLElement {
+  static observedAttributes = ["codigo"];
+  #root; #controlador;
+
+  constructor() {
+    super();
+    // TRAMPA 3 (parte 1): delegatesFocus hace que enfocar el host lleve el foco
+    // al primer elemento focuseable de adentro. Mejora el tabbing, pero cambia
+    // dónde se dibuja el anillo de foco: hay que estilar :host(:focus-within).
+    this.#root = this.attachShadow({ mode: "open", delegatesFocus: true });
+    this.#root.adoptedStyleSheets = [estilos];
+    this.#root.innerHTML = `
+      &lt;div role="status" aria-live="polite"&gt;
+        &lt;p class="estado"&gt;Consultando…&lt;/p&gt;
+        &lt;button type="button" part="boton-detalle"&gt;Ver detalle&lt;/button&gt;
+      &lt;/div&gt;`;
+
+    this.#root.querySelector("button")
+      .addEventListener("click", () =&gt; this.#emitir("detalle-solicitado", { codigo: this.codigo }));
+  }
+
+  connectedCallback() {
+    // AbortController: un solo abort limpia TODOS los listeners al desconectar.
+    // connectedCallback puede correr más de una vez si el host mueve el elemento.
+    this.#controlador?.abort();
+    this.#controlador = new AbortController();
+    this.#consultar();
+  }
+
+  disconnectedCallback() { this.#controlador?.abort(); }
+
+  attributeChangedCallback(n, viejo, nuevo) { if (viejo !== nuevo) this.#consultar(); }
+
+  get codigo() { return this.getAttribute("codigo"); }
+
+  #emitir(nombre, detail) {
+    // TRAMPA 2: sin composed:true el evento MUERE en el shadow boundary
+    // y el host nunca se entera. bubbles:true solo no alcanza.
+    this.dispatchEvent(new CustomEvent(nombre, { detail, bubbles: true, composed: true }));
+  }
+
+  async #consultar() {
+    if (!this.codigo) return;
+    try {
+      const r = await fetch(`https://api.ejemplo.com/envios/${this.codigo}`,
+                            { signal: this.#controlador.signal });
+      const { estado } = await r.json();
+      this.#root.querySelector(".estado").textContent = estado;
+      this.#emitir("estado-cambiado", { codigo: this.codigo, estado });
+    } catch (e) {
+      if (e.name === "AbortError") return;                  // desconexión, no es un error
+      this.#root.querySelector(".estado").textContent = "No pudimos consultar el envío.";
+    }
+  }
+}
+
+// Registro defensivo: dos versiones del widget en la misma página no deben tirar
+// NotSupportedError. Hasta que los scoped registries sean interoperables, esto.
+if (!customElements.get("envio-estado")) customElements.define("envio-estado", EstadoEnvio);</code></pre>
+
+<p><strong>Paso 3 — Las tres trampas que aparecieron en la integración real.</strong></p>
+
+<div class="danger">
+  <strong>Trampa 1 — Los estilos que sí se heredan.</strong> El shadow DOM bloquea los <em>selectores</em> del host, pero las <strong>propiedades heredables</strong> pasan igual: <code>font-family</code>, <code>font-size</code>, <code>color</code>, <code>line-height</code>, <code>letter-spacing</code>, <code>text-transform</code>, <code>visibility</code>. En el cliente de WordPress, un <code>body { letter-spacing: .05em }</code> hacía que el widget se viera distinto de los otros dos. Solución: <code>all: initial</code> en <code>:host</code> y volver a declarar lo que sí querés. Y aprovechar que las <strong>custom properties también cruzan</strong> —eso no es un bug, es tu API de theming: <code>--envio-bg</code>, <code>--envio-color</code>, <code>--envio-radio</code>.
+</div>
+
+<div class="danger">
+  <strong>Trampa 2 — Eventos que no salen, y un <code>target</code> que miente.</strong> Un <code>CustomEvent</code> con solo <code>bubbles: true</code> sube hasta el shadow root <strong>y ahí se detiene</strong>: el host nunca lo escucha. Hace falta <code>composed: true</code>. Y hay una segunda mitad: cuando el evento cruza, el navegador hace <em>retargeting</em> y <code>event.target</code> pasa a ser el <code>&lt;envio-estado&gt;</code>, no el botón interno. Si necesitás el elemento real, es <code>event.composedPath()[0]</code>. En Angular esto se manifestó como un handler que "no recibía nada"; en realidad recibía el host y el código buscaba un <code>dataset</code> que ahí no existía.
+</div>
+
+<div class="danger">
+  <strong>Trampa 3 — El foco.</strong> <code>document.activeElement</code> devuelve <strong>el host</strong>, no el elemento enfocado adentro: para llegar al real hay que bajar por <code>host.shadowRoot.activeElement</code>. Eso rompió la trampa de foco del modal del cliente de Next.js, que recorría <code>document.querySelectorAll</code> y no veía nada adentro del widget. Además, <code>delegatesFocus: true</code> mejora el tabbing pero mueve el anillo de foco al host, así que hay que estilar <code>:host(:focus-within)</code>. Y recordá que <code>aria-labelledby</code> <strong>no cruza el boundary</strong>: la etiqueta accesible se resuelve adentro, o con <code>ElementInternals</code>.
+</div>
+
+<div class="warn">
+  <strong>Y la cuarta, que apareció después del deploy.</strong> Sin JavaScript, <code>&lt;envio-estado&gt;</code> es una caja vacía: el navegador la renderiza como un elemento desconocido y no muestra absolutamente nada. El fallback es progressive enhancement puro: poner contenido en el <strong>light DOM</strong> —un link al seguimiento en la web del correo— dentro de un <code>&lt;slot&gt;</code>, para que si el script nunca llega, el usuario igual tenga a dónde ir.
+</div>
+
+<div class="rule">
+  <strong>📌 Lo que hay que llevarse del ejercicio no es "usá custom elements".</strong> Es que la decisión se tomó por <strong>una propiedad concreta</strong> —"la integración tiene que ser una etiqueta HTML porque no controlo los tres hosts"— y no por preferencia de tecnología. Y que las tres trampas no eran obvias desde la documentación: aparecieron probando en los tres entornos reales. <strong>Ningún componente distribuible está listo hasta que se probó en un host que no controlás.</strong>
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué un componente en WebAssembly que pinta DOM suele ser más lento que el mismo en JavaScript?</summary>
+<p>Porque Wasm no tiene acceso al DOM: cada operación sobre la página es una llamada que cruza la frontera hacia JavaScript, y ese cruce tiene overhead. Encima, los strings y objetos no viven en el heap de JS sino en la memoria lineal de Wasm, así que hay que copiarlos en cada dirección. Un componente de UI hace muchísimas operaciones chicas sobre el DOM: es el peor perfil posible: mucho marshalling y poco cómputo por llamada. Wasm gana en lo contrario —pocas llamadas que hacen mucho trabajo sobre datos contiguos: códecs, criptografía, físicas, imágenes, inferencia. Es una optimización de cómputo, no una arquitectura de UI.</p></details>
+
+<details><summary>Tu app guarda el borrador del usuario en IndexedDB y funciona perfecto. Un usuario de Safari vuelve a los diez días y perdió todo. ¿Qué pasó y qué se hace?</summary>
+<p>La política de Intelligent Tracking Prevention de Safari borra los datos creados por script cuando un origen pasa siete días sin interacción del usuario. No es un bug tuyo ni de IndexedDB, y no se arregla desde el código: la expulsión es por origen y se lleva IndexedDB, Cache API y OPFS al mismo tiempo. Las mitigaciones reales son tres, en orden: (1) sincronizar el borrador con el servidor —si perder el dato le cuesta trabajo al usuario, el dato no puede vivir solo en el cliente; (2) pedir <code>navigator.storage.persist()</code>, sabiendo que puede devolver <code>false</code> y que no es una garantía; y (3) para el caso de una PWA, ofrecer la instalación en la pantalla de inicio, que queda exenta del plazo de siete días. Y en cualquier caso, la UI tiene que sobrevivir a encontrar la base vacía.</p></details>
+
+<details><summary>¿Por qué "cross-document view transitions" y "view transitions" no son la misma decisión de adopción?</summary>
+<p>Porque tienen estados de soporte distintos. Las transiciones dentro de un mismo documento (<code>document.startViewTransition()</code>) están en los tres motores —Chrome 111+, Safari 18+, Firefox 144+— y su pseudo-clase <code>:active-view-transition</code> es Baseline Newly available desde enero de 2026. Las cross-document (<code>@view-transition</code>, para sitios multipágina) funcionan en Chromium y en Safari 18.2+, pero Firefox todavía no las envía: MDN las marca como disponibilidad limitada y no son Baseline; de hecho View Transitions es un focus area de Interop 2026, que es precisamente la señal de que falta interoperabilidad. La consecuencia práctica es buena: donde no hay soporte, la navegación simplemente ocurre sin animación. Es un enhancement con degradación perfecta, así que se puede usar hoy — pero como adorno, nunca como algo de lo que dependa el funcionamiento.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Web Components</strong> valen cuando la propiedad que necesitás es "ser una etiqueta HTML": design systems que cruzan frameworks y widgets embebibles. Sus límites reales son formularios (<code>ElementInternals</code>), accesibilidad entre raíces, el registro global de nombres y la DX.</li>
+  <li><strong>WebAssembly</strong> gana en cómputo denso y en código portado; pierde por el cruce de frontera, por no tocar el DOM y por el costo de arranque. Wasm 3.0 es estándar W3C desde 2025 y WasmGC está en los tres motores desde fines de 2024; JSPI todavía le falta a Safari.</li>
+  <li><strong>Almacenamiento:</strong> IndexedDB por defecto, Cache API para respuestas HTTP, OPFS para archivos y bases embebidas, <code>localStorage</code> solo para banderas diminutas porque es sincrónico y bloquea el hilo principal. La expulsión es por origen y todo junto; Safari borra a los 7 días sin interacción.</li>
+  <li><strong>Offline-first</strong> es una decisión de arquitectura de datos: la base local como fuente de verdad, una outbox idempotente y una estrategia de conflictos elegida a propósito. Background Sync es Chromium-only: no apoyes la sincronización ahí.</li>
+  <li><strong>SSR</strong> mejora el primer contenido y la indexabilidad; no mejora la app después del arranque, no elimina el waterfall de datos y te agrega un servidor a mantener.</li>
+  <li><strong>Progressive enhancement</strong> no es por los usuarios sin JS: es porque el JS falla, y el HTML degrada mientras el JS es binario. Definí tu superficie mínima y ponele un test.</li>
+  <li><strong>Baseline</strong> convierte "qué soportamos" en una consulta reproducible: Newly available (los cuatro motores) y Widely available (30 meses después). Browserslist ya trae esas queries. Interop marca lo que <em>todavía</em> no es interoperable.</li>
+  <li><strong>La pregunta framework sí/no</strong> se responde con estado compartido, cantidad de vistas, tamaño y rotación del equipo, vida esperada y ecosistema. Construir una app grande sin framework sale más caro que meter un framework en un sitio chico.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un componente que ya tengas (una tarjeta, un badge, un acordeón) y reescribilo como custom element con shadow DOM. Exponé al menos tres custom properties de theming y una <code>::part()</code>. Después incrustalo en una página con estilos globales agresivos y anotá qué se filtró igual.</li>
+  <li>Medí el bloqueo de <code>localStorage</code>: escribí y leé un objeto de 1 MB serializado a JSON, cronometrando con <code>performance.now()</code>, y compará contra la misma operación en IndexedDB. Corré ambas con el throttling de CPU de las devtools en 4× y armá una tabla con tus números.</li>
+  <li>Implementá una outbox mínima con IndexedDB: encolar, drenar con backoff exponencial y clave de idempotencia. Probala apagando la red desde las devtools y volviéndola a prender. Documentá qué estrategia de conflictos elegiste y por qué.</li>
+  <li>Escribí un endpoint que devuelva HTML con <code>ReadableStream</code>: shell primero, contenido lento después con la técnica del <code>&lt;template&gt;</code>. Compará el LCP contra la versión que espera todos los datos antes de responder.</li>
+  <li>Agarrá un formulario tuyo que hoy dependa de JavaScript y hacelo funcionar sin JS. Después agregale la capa de mejora con <code>fetch</code>. Verificá el resultado deshabilitando JavaScript en el navegador.</li>
+  <li>Corré <code>npx browserslist "baseline widely available"</code> y compará la lista contra los navegadores reales de tu proyecto (tus analytics o los logs del servidor). Escribí en dos frases la política de soporte que se desprende de esos datos.</li>
+  <li>Elegí tres APIs de la tabla de FS8.7 que no hayas usado nunca y verificá su estado actual en el dashboard de Baseline. ¿Alguna cambió de nivel desde que se escribió este módulo? Si sí, ese es exactamente el hábito que hay que tener.</li>
+  <li>Escribí un ADR de diez líneas para la dependencia más grande de tu proyecto actual: qué problema resuelve, qué alternativas se descartaron y cuál sería el criterio para sacarla.</li>
+</ol>
+
+<section class="quiz" id="quizFS8">
+  <style>
+    #quizFS8{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizFS8 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizFS8 .q{margin-bottom:1.5rem}
+    #quizFS8 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizFS8 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizFS8 .opt:hover{border-color:var(--accent)}
+    #quizFS8 .opt:disabled{cursor:default}
+    #quizFS8 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizFS8 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizFS8 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizFS8 .exp.show{display:block}
+    #quizFS8 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu custom element emite un <code>CustomEvent</code> con <code>bubbles: true</code>, pero el host nunca lo recibe. ¿Cuál es la causa?</p>
+    <button class="opt">Los eventos personalizados no se pueden escuchar desde afuera de un componente</button>
+    <button class="opt">Falta llamar a <code>event.preventDefault()</code> antes de despacharlo</button>
+    <button class="opt">Falta <code>composed: true</code>: sin eso el evento se detiene en el shadow boundary</button>
+    <div class="exp">Un evento con solo <code>bubbles: true</code> sube por el árbol interno y muere en el shadow root. Para cruzar hacia el documento hace falta <code>composed: true</code>. Y hay una segunda mitad que suele confundir después: cuando el evento cruza, el navegador hace <em>retargeting</em> y <code>event.target</code> pasa a ser el host, no el elemento interno que lo originó — si necesitás ese elemento real, usá <code>event.composedPath()[0]</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Estás decidiendo si usar <code>@view-transition</code> (cross-document) en un sitio multipágina. ¿Cuál es el razonamiento correcto en 2026?</p>
+    <button class="opt">Se puede usar como enhancement: funciona en Chromium y Safari 18.2+, en Firefox todavía no, y donde falta la navegación simplemente ocurre sin animación</button>
+    <button class="opt">No se puede usar: al no ser Baseline, romperá la navegación en los navegadores sin soporte</button>
+    <button class="opt">Se puede usar sin más: es Baseline Widely available desde 2025</button>
+    <div class="exp">Es el caso de manual de una degradación perfecta. MDN marca <code>@view-transition</code> como disponibilidad limitada —no es Baseline— porque Firefox todavía no la envía, y View Transitions es justamente un focus area de Interop 2026, que es la señal de que falta interoperabilidad. Pero el fallback no es una página rota: es un corte seco entre páginas, o sea el comportamiento normal de la web. Ojo con no confundirla con las transiciones dentro del mismo documento (<code>document.startViewTransition()</code>), que sí están en los tres motores.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Una app de notas guarda todo en IndexedDB y funciona sin red. ¿Qué le falta para llamarse offline-first en serio?</p>
+    <button class="opt">Nada: guardar en IndexedDB y tener un service worker ya es offline-first</button>
+    <button class="opt">Una cola de mutaciones idempotente y una estrategia de resolución de conflictos elegida y documentada</button>
+    <button class="opt">Registrar Background Sync, que es lo que garantiza que los datos se envíen</button>
+    <div class="exp">Guardar local resuelve la lectura; lo difícil es la escritura. Sin una outbox con clave de idempotencia, un reintento después de una respuesta perdida duplica el dato; y sin una estrategia de conflictos elegida a propósito, terminás con last-write-wins de hecho y ediciones que se pierden sin que nadie lo pueda explicar. Background Sync tampoco es la respuesta: es solo Chromium —ni Firefox ni Safari la implementan—, así que sirve como mejora pero nunca como mecanismo principal; los disparadores confiables son <code>visibilitychange</code> y el evento <code>online</code>.</div>
+  </div>
+
+  <div class="score" id="scoreFS8"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizFS8');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreFS8').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Terminaste el track Frontend Senior.' : '  — repasá las que fallaste y cerrá el track.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../fs7-build-entrega/lecture.html">← FS7: Build y entrega</a>
+  <a href="../index.html">Volver al track →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,1107 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FS6 — Accesibilidad experta: más allá del alt y el contraste · Frontend Senior</title>
+  <meta name="description" content="El árbol de accesibilidad, el cálculo del nombre accesible, la primera regla de ARIA, gestión de foco, patrones APG para widgets, live regions en SPAs, testing real más allá de axe y el marco legal 2026: WCAG 2.2, borrador de WCAG 3.0, European Accessibility Act y ADA Título II.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Frontend Senior</a>
+  <a href="../../modulo-00-sillabus/lecture.html">🌐 Curso Frontend</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">FS6</span>
+  <span class="badge">⏱ 55–135 min</span>
+  <span class="badge">🎯 Pre-req: Curso Frontend M00–M13</span>
+  <span class="badge">♿ Accesibilidad</span>
+</div>
+
+<article>
+
+<h1>FS6 — Accesibilidad experta: más allá del alt y el contraste</h1>
+
+<h2>FS6.0 Por qué este módulo</h2>
+
+<p>En el M12 viste lo que todo el mundo ve: poné <code>alt</code>, cuidá el contraste, usá HTML semántico. Está bien, y con eso ya estás arriba del promedio. El problema es que ese promedio es catastrófico, y que la parte que falta no es "un poco más de lo mismo": es otra disciplina.</p>
+
+<p>El <strong>WebAIM Million de 2026</strong> —el escaneo anual del millón de home pages más visitadas— encontró fallas de WCAG <em>detectables automáticamente</em> en el <strong>95,9%</strong> de las páginas, contra 94,8% el año anterior. El promedio es de <strong>56,1 errores por página</strong>, y la cantidad de errores detectados subió un 10,1% interanual. La accesibilidad de la web no está mejorando: está empeorando, y lo hace mientras las herramientas automáticas se vuelven cada vez mejores.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> La accesibilidad no es una lista de chequeo que se aplica al final: es una <strong>propiedad de la arquitectura</strong>. Un componente mal elegido —un <code>div</code> donde iba un <code>button</code>, un router que no anuncia nada, un modal sin gestión de foco— no se arregla con un atributo: se arregla reescribiéndolo. Y ese costo crece con el tiempo, exactamente como la deuda técnica, porque cada componente nuevo se construye sobre el anterior.
+</div>
+
+<p>El segundo hecho incómodo: <strong>las herramientas automáticas detectan solo entre el 30% y el 40% de los criterios de WCAG</strong>. Ese número se repite en la literatura hace una década y no cambió, porque no es una limitación de implementación sino del problema. Una máquina puede verificar que una imagen tiene <code>alt</code>; no puede verificar que el <code>alt</code> <em>describe la imagen</em>. Puede medir el contraste; no puede decidir si el orden de foco tiene sentido. Puede detectar un <code>aria-label</code> ausente; no puede detectar uno que miente.</p>
+
+<div class="rule">
+  <strong>📌 La consecuencia práctica.</strong> Si tu definición de "accesible" es "axe da cero violaciones", estás midiendo un tercio del problema y llamándolo el total. Este módulo es sobre los otros dos tercios: el árbol de accesibilidad, el foco, los widgets, el testing con personas y herramientas reales, y el marco legal que en 2025–2026 dejó de ser teórico.
+</div>
+
+<h2>FS6.1 El árbol de accesibilidad: el modelo mental que ordena todo</h2>
+
+<p>Casi todos los errores de accesibilidad que vas a ver en tu carrera se explican con una sola idea: <strong>la tecnología asistiva no lee tu HTML ni tu DOM</strong>. Lee otra estructura, derivada del DOM, que el navegador construye y expone al sistema operativo.</p>
+
+<p>Un navegador mantiene varios árboles del mismo documento, con propósitos distintos:</p>
+
+<table>
+<thead><tr><th>Árbol</th><th>Para qué</th><th>Qué se poda</th></tr></thead>
+<tbody>
+<tr><td><strong>DOM</strong></td><td>La estructura del documento tal como la escribiste (más lo que scriptaste)</td><td>Nada</td></tr>
+<tr><td><strong>Árbol de render / layout</strong></td><td>Qué se pinta y dónde</td><td><code>display:none</code>, <code>&lt;head&gt;</code>, comentarios</td></tr>
+<tr><td><strong>Árbol de accesibilidad</strong></td><td>Qué se le expone al sistema operativo y de ahí a la tecnología asistiva</td><td><code>display:none</code>, <code>visibility:hidden</code>, <code>hidden</code>, <code>aria-hidden="true"</code>, subárboles <code>inert</code>, y nodos "genéricos" sin semántica</td></tr>
+</tbody>
+</table>
+
+<p>El árbol de accesibilidad se expone a través de las APIs de accesibilidad de cada plataforma: <strong>UI Automation</strong> e <strong>IAccessible2</strong> en Windows, la <strong>AX API</strong> en macOS, <strong>AccessibilityNodeInfo</strong> en Android. NVDA, JAWS, VoiceOver o TalkBack hablan con esas APIs, no con tu código.</p>
+
+<div class="analogy">
+  <strong>🔎 La analogía.</strong> El DOM es el manuscrito; el árbol de accesibilidad es la <em>ficha catalográfica</em> que la biblioteca genera a partir de él. El lector ciego no recibe el manuscrito: recibe la ficha. Si la ficha dice "objeto sin título, categoría: genérico", da lo mismo lo hermoso que sea el manuscrito.
+</div>
+
+<h3>Los cuatro datos de cada nodo</h3>
+
+<p>Cada nodo del árbol lleva, como mínimo, cuatro cosas. Todo lo que vas a hacer en este módulo consiste en controlarlas:</p>
+
+<div class="step"><strong>1. Rol (<em>role</em>).</strong> Qué <em>es</em>: botón, enlace, encabezado nivel 2, casilla, región, tabla. Determina cómo se anuncia y qué teclas espera el usuario.</div>
+
+<div class="step"><strong>2. Nombre accesible (<em>accessible name</em>).</strong> Cómo se <em>llama</em>: "Guardar borrador", "Buscar productos". Es lo que se lee en voz alta y lo que un usuario de control por voz pronuncia para activarlo.</div>
+
+<div class="step"><strong>3. Estado y propiedades.</strong> Cómo <em>está</em>: expandido, seleccionado, deshabilitado, inválido, de solo lectura, requerido, y las relaciones con otros nodos.</div>
+
+<div class="step"><strong>4. Descripción y valor.</strong> Información secundaria (<code>aria-describedby</code>) y el contenido actual de un control (el texto de un input, la posición de un slider).</div>
+
+<h3>Cómo inspeccionarlo (y por qué tenés que hacerlo)</h3>
+
+<p>En Chrome: <em>DevTools → Elements → panel Accessibility</em>, que muestra el nodo seleccionado con su rol, nombre calculado y <strong>de dónde salió ese nombre</strong> — que es el dato más valioso. Arriba de ese panel hay una casilla <em>Enable full-page accessibility tree</em> que reemplaza el árbol DOM por el de accesibilidad completo. En Firefox hay un panel <em>Accessibility</em> dedicado, con un chequeo automático de contraste y de nombres faltantes. En Safari, el <em>Audit</em> del inspector.</p>
+
+<pre><code class="lang-html">&lt;!-- Lo que escribiste --&gt;
+&lt;div class="btn" onclick="guardar()"&gt;Guardar&lt;/div&gt;
+
+&lt;!-- Lo que llega al árbol de accesibilidad --&gt;
+generic
+  StaticText "Guardar"
+
+&lt;!-- Sin rol de control. Sin nombre accesible. No es focusable.
+     Para la tecnología asistiva esto NO es un botón: es texto suelto. --&gt;</code></pre>
+
+<pre><code class="lang-html">&lt;!-- El mismo comportamiento visual, con el elemento correcto --&gt;
+&lt;button onclick="guardar()"&gt;Guardar&lt;/button&gt;
+
+&lt;!-- En el árbol: --&gt;
+button "Guardar"
+  focusable: true
+  invalid: false
+  disabled: false</code></pre>
+
+<div class="warn">
+  <strong>Costo de esta técnica:</strong> abrir el panel de accesibilidad en cada componente es lento y no escala como práctica diaria. Lo que sí escala es usarlo <strong>cuando algo no se comporta como esperabas</strong> y cuando diseñás un componente nuevo del design system. Ahí una inspección de dos minutos te ahorra semanas de parches. Debuguear accesibilidad mirando el DOM es como debuguear layout mirando el HTML: estás en el árbol equivocado.
+</div>
+
+<h2>FS6.2 El nombre accesible: el algoritmo que casi nadie leyó</h2>
+
+<p>El nombre accesible se calcula con un algoritmo especificado —la <em>Accessible Name and Description Computation</em>, "accname"— y el orden de precedencia importa muchísimo, porque explica una familia entera de bugs.</p>
+
+<table>
+<thead><tr><th>#</th><th>Fuente</th><th>Gana sobre</th><th>Cuándo usarla</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><code>aria-labelledby</code></td><td>Todo lo demás</td><td>Cuando el nombre ya existe como texto visible en otro lado de la página</td></tr>
+<tr><td>2</td><td><code>aria-label</code></td><td>Contenido nativo y <code>title</code></td><td>Solo cuando <strong>no hay</strong> texto visible (un botón que es puro ícono)</td></tr>
+<tr><td>3</td><td>Marcado nativo: <code>&lt;label for&gt;</code>, <code>alt</code>, <code>&lt;legend&gt;</code>, <code>&lt;caption&gt;</code>, <code>&lt;figcaption&gt;</code>, contenido del elemento</td><td><code>title</code></td><td><strong>Siempre que se pueda.</strong> Es la opción por defecto</td></tr>
+<tr><td>4</td><td><code>title</code></td><td>Nada</td><td>Casi nunca: no aparece en touch ni con foco de teclado</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-html">&lt;!-- 1. aria-labelledby gana sobre TODO, y concatena en el orden de los ids --&gt;
+&lt;button aria-labelledby="t1 t2" aria-label="Esto se ignora"&gt;Esto también&lt;/button&gt;
+&lt;span id="t1"&gt;Borrar&lt;/span&gt; &lt;span id="t2"&gt;factura 0042&lt;/span&gt;
+&lt;!-- nombre = "Borrar factura 0042" --&gt;
+
+&lt;!-- 2. aria-label gana sobre el contenido: correcto acá, no hay texto visible --&gt;
+&lt;button aria-label="Cerrar diálogo"&gt;&lt;svg aria-hidden="true"&gt;...&lt;/svg&gt;&lt;/button&gt;
+
+&lt;!-- 3. El contenido, que es lo normal y lo mejor --&gt;
+&lt;button&gt;Guardar borrador&lt;/button&gt;
+
+&lt;!-- 4. El caso ROTO que vas a encontrar en producción --&gt;
+&lt;button aria-label="Cerrar"&gt;Cancelar suscripción&lt;/button&gt;
+&lt;!-- nombre = "Cerrar". El texto visible desapareció del árbol.
+     Un usuario de control por voz dice "hacé clic en Cancelar suscripción"
+     y no pasa absolutamente nada. --&gt;</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El daño colateral de <code>aria-label</code>.</strong> Cuando lo ponés sobre un elemento cuyo rol "toma el nombre del contenido" (botón, enlace, encabezado, celda), <strong>todo el contenido de ese elemento y sus descendientes desaparece del árbol de accesibilidad</strong> — salvo que un <code>aria-labelledby</code> lo referencie. No estás agregando información: la estás reemplazando. Un <code>&lt;a aria-label="Ver más"&gt;</code> que envuelve una tarjeta entera con título, precio y foto convierte todo eso en tres palabras.
+</div>
+
+<h3>La regla de oro: si hay texto visible, el nombre lo contiene</h3>
+
+<p>Esto no es una preferencia: es el criterio <strong>WCAG 2.5.3 Label in Name (nivel A)</strong>. Existe por los usuarios de control por voz —Dragon, Voice Control de Apple, Voice Access de Android— que pronuncian lo que <em>ven</em>. Si el nombre accesible no incluye el texto visible, el control es literalmente inalcanzable para ellos.</p>
+
+<pre><code class="lang-html">&lt;!-- ❌ Rompe 2.5.3: el nombre no contiene el texto visible --&gt;
+&lt;button aria-label="Enviar formulario de contacto"&gt;Enviar&lt;/button&gt;
+
+&lt;!-- ✅ El nombre empieza con el texto visible --&gt;
+&lt;button aria-label="Enviar formulario de contacto"&gt;
+  Enviar
+&lt;/button&gt;
+&lt;!-- ...pero incluso así: si el texto visible ya alcanza, NO pongas nada. --&gt;
+&lt;button&gt;Enviar&lt;/button&gt;
+
+&lt;!-- ✅ El patrón correcto para desambiguar en una lista --&gt;
+&lt;button&gt;Borrar &lt;span class="visually-hidden"&gt;la factura 0042&lt;/span&gt;&lt;/button&gt;
+&lt;!-- Nombre = "Borrar la factura 0042". El texto visible sigue siendo "Borrar",
+     y está CONTENIDO en el nombre. Los dos usuarios quedan servidos. --&gt;</code></pre>
+
+<div class="tip">
+  <strong>El costo escondido de <code>aria-label</code>:</strong> no es visible, así que ningún diseñador, redactor ni tester manual lo revisa nunca. Envejece mal: el botón cambia de función, el texto visible se actualiza, el <code>aria-label</code> queda con la etiqueta de hace dos años. Además, <strong>muchos traductores automáticos del navegador no traducen atributos</strong>, así que tu sitio en español termina anunciándose en inglés. El texto oculto con una clase <code>.visually-hidden</code> no tiene ninguno de esos tres problemas: se traduce, se busca con Ctrl+F en el código como texto normal y es contenido, no metadata.
+</div>
+
+<h2>FS6.3 La primera regla de ARIA: no usar ARIA</h2>
+
+<p>La especificación de prácticas de ARIA arranca con su propia primera regla, y no es una broma: <em>si existe un elemento o atributo HTML nativo con la semántica y el comportamiento que necesitás, usá ese en lugar de reconvertir un elemento genérico agregándole roles y propiedades ARIA.</em></p>
+
+<p>La razón es que <strong>ARIA no agrega comportamiento: solo cambia lo que se anuncia</strong>. <code>role="button"</code> no hace que un <code>div</code> responda a Enter. <code>aria-expanded="true"</code> no abre nada. <code>aria-disabled="true"</code> no impide el clic ni saca del orden de tabulación. ARIA es una capa de <em>declaración</em>; el comportamiento lo escribís vos, entero.</p>
+
+<h3>Lo que te da gratis un <code>&lt;button&gt;</code></h3>
+
+<table>
+<thead><tr><th>Comportamiento</th><th><code>&lt;button&gt;</code></th><th><code>&lt;div role="button" tabindex="0"&gt;</code></th></tr></thead>
+<tbody>
+<tr><td>Rol anunciado como "botón"</td><td>✅ Gratis</td><td>✅ Con el atributo</td></tr>
+<tr><td>Entra en el orden de tabulación</td><td>✅ Gratis</td><td>⚠️ Solo con <code>tabindex="0"</code>, en cada instancia</td></tr>
+<tr><td>Se activa con <kbd>Enter</kbd></td><td>✅ Gratis</td><td>❌ Lo escribís vos</td></tr>
+<tr><td>Se activa con <kbd>Espacio</kbd></td><td>✅ Gratis</td><td>❌ Lo escribís vos, y además tenés que frenar el scroll de la página</td></tr>
+<tr><td><code>disabled</code> real (no clickeable, fuera del tab order)</td><td>✅ Gratis</td><td>❌ <code>aria-disabled</code> solo lo <em>anuncia</em></td></tr>
+<tr><td>Envía o resetea un formulario</td><td>✅ Con <code>type</code></td><td>❌ No participa del formulario</td></tr>
+<tr><td>Se ve en el modo de alto contraste forzado de Windows</td><td>✅ Gratis</td><td>❌ Un <code>div</code> con fondo CSS desaparece</td></tr>
+<tr><td>Indicador de foco por defecto</td><td>✅ Gratis</td><td>⚠️ Depende de tu CSS</td></tr>
+<tr><td>Menú contextual del navegador, arrastre de enlace, "abrir en pestaña nueva"</td><td>✅ En <code>&lt;a href&gt;</code></td><td>❌ Nunca</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-javascript">// Lo que hay que escribir para que un div se comporte como un botón.
+// Todo esto es código que el navegador ya tiene, gratis y sin bugs.
+el.addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') { e.preventDefault(); activar(); }
+  // El espacio se dispara en keyup, pero hay que frenar el scroll en keydown
+  if (e.key === ' ') { e.preventDefault(); }
+});
+el.addEventListener('keyup', function (e) {
+  if (e.key === ' ') { e.preventDefault(); activar(); }
+});
+el.addEventListener('click', function (e) {
+  if (el.getAttribute('aria-disabled') === 'true') {
+    e.preventDefault();
+    e.stopImmediatePropagation();   // aria-disabled NO frena nada por su cuenta
+  }
+});</code></pre>
+
+<div class="mistake">
+  <strong>El error que hace daño real:</strong> <code>aria-disabled="true"</code> en un botón de "Comprar" mientras se procesa el pago. Se anuncia como deshabilitado, se ve gris, y sigue siendo clickeable y enviando el formulario. Doble cobro. Si querés bloquear de verdad, usá <code>disabled</code>; si querés que el control siga siendo enfocable para que el usuario pueda leer <em>por qué</em> está bloqueado —que es la razón legítima para preferir <code>aria-disabled</code>— entonces tenés que frenar el evento vos, como en el ejemplo.
+</div>
+
+<h3>La segunda regla: no le cambies la semántica a un elemento nativo</h3>
+
+<pre><code class="lang-html">&lt;!-- ❌ El h2 deja de ser encabezado: desaparece de la lista de encabezados
+     con la que los usuarios de lector de pantalla navegan la página --&gt;
+&lt;h2 role="button" tabindex="0"&gt;Preguntas frecuentes&lt;/h2&gt;
+
+&lt;!-- ✅ El encabezado sigue siendo encabezado y contiene el control --&gt;
+&lt;h2&gt;
+  &lt;button aria-expanded="false" aria-controls="faq-1"&gt;Preguntas frecuentes&lt;/button&gt;
+&lt;/h2&gt;
+&lt;div id="faq-1" hidden&gt;...&lt;/div&gt;</code></pre>
+
+<div class="info">
+  Este patrón —encabezado que <em>contiene</em> el botón, en vez de encabezado que <em>es</em> el botón— es el acordeón correcto de la APG, y es un buen ejemplo de por qué el HTML semántico gana: los usuarios de lector de pantalla navegan saltando entre encabezados (tecla <kbd>H</kbd> en NVDA/JAWS). Si convertís los encabezados en botones, borraste el mapa de la página.
+</div>
+
+<h3>Entonces, ¿cuándo SÍ se usa ARIA?</h3>
+
+<p>ARIA no es el enemigo: es una herramienta cara. Se justifica en cuatro casos:</p>
+
+<div class="step"><strong>1. No existe elemento nativo.</strong> Pestañas, árbol, grilla editable, combobox con autocompletado. HTML no tiene nada equivalente.</div>
+
+<div class="step"><strong>2. Comunicar estado dinámico.</strong> <code>aria-expanded</code>, <code>aria-current="page"</code>, <code>aria-selected</code>, <code>aria-pressed</code>, <code>aria-busy</code>. Acá ARIA es insustituible y barato.</div>
+
+<div class="step"><strong>3. Expresar relaciones que el DOM no expresa.</strong> <code>aria-describedby</code> para atar un mensaje de error a su campo, <code>aria-controls</code>, <code>aria-labelledby</code> para nombrar una región con su propio encabezado.</div>
+
+<div class="step"><strong>4. Anunciar cambios asíncronos.</strong> <code>aria-live</code> y <code>role="status"</code> / <code>role="alert"</code> — la sección FS6.6.</div>
+
+<div class="warn">
+  <strong>El dato incómodo:</strong> los informes del WebAIM Million vienen mostrando hace años que las páginas que usan ARIA presentan, <strong>en promedio, más errores detectables que las que no lo usan</strong>. No es que ARIA cause errores: es que se usa justamente donde el problema es difícil, y se usa mal. Tratá cada atributo ARIA que agregás como una <em>afirmación que te comprometés a mantener verdadera</em>. Un <code>aria-expanded</code> que se queda en <code>"false"</code> cuando el panel está abierto es peor que no tener nada: le mentís al usuario con total confianza.
+</div>
+
+<h2>FS6.4 Foco: el recurso más escaso de la interfaz</h2>
+
+<p>El foco es <strong>uno solo</strong> por documento y es la posición del cursor para todo el que no usa mouse: teclado, switch, control por voz, lector de pantalla en modo formulario. Es también la parte de la accesibilidad que ninguna herramienta automática puede evaluar de verdad, porque requiere juzgar si el orden y los saltos tienen sentido.</p>
+
+<p>Son tres problemas distintos que se suelen mezclar: <strong>orden</strong>, <strong>visibilidad</strong> y <strong>gestión programática</strong>.</p>
+
+<h3>Orden de foco</h3>
+
+<p>El orden sigue el <strong>DOM</strong>, no lo que se ve. Todo lo que CSS reordena visualmente —<code>flex-direction: row-reverse</code>, <code>order</code>, <code>grid-area</code>, <code>position: absolute</code>— crea una discrepancia entre el orden visual y el de tabulación. Eso es una falla de <strong>WCAG 2.4.3 Focus Order (A)</strong> y de <strong>1.3.2 Meaningful Sequence (A)</strong>.</p>
+
+<pre><code class="lang-css">/* El bug clásico de un layout "responsive" hecho con order */
+.acciones { display: flex; }
+.acciones .cancelar { order: 2; }   /* Se ve segundo... */
+.acciones .confirmar { order: 1; }  /* ...pero el DOM lo tabula primero */
+
+/* Con teclado: Tab llega a "Cancelar" (que se ve a la derecha),
+   después a "Confirmar" (que se ve a la izquierda). Desorientante,
+   y en un flujo de pago es directamente peligroso. */</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla operativa:</strong> si tenés que reordenar visualmente algo que contiene controles, <strong>reordenalo en el DOM</strong> y usá CSS para el layout, no para la secuencia. En React eso suele significar ordenar el array antes de renderizar, no aplicar clases distintas. El costo de hacerlo bien es cero; el de hacerlo mal es invisible hasta que alguien lo prueba con teclado.
+</div>
+
+<h3><code>tabindex</code>: tres valores, dos permitidos</h3>
+
+<table>
+<thead><tr><th>Valor</th><th>Efecto</th><th>Veredicto</th></tr></thead>
+<tbody>
+<tr><td><code>tabindex="0"</code></td><td>Agrega el elemento al orden natural, en la posición del DOM</td><td>✅ Para elementos que necesitan foco y no lo tienen nativamente</td></tr>
+<tr><td><code>tabindex="-1"</code></td><td>Enfocable solo por código (<code>el.focus()</code>), fuera del recorrido de <kbd>Tab</kbd></td><td>✅ Imprescindible: destinos de skip links, contenedores de anuncio, ítems de un widget con roving tabindex</td></tr>
+<tr><td><code>tabindex="1"</code> y mayores</td><td>Crea un orden de tabulación paralelo que se recorre <strong>antes</strong> que todo el resto del documento</td><td>❌ <strong>Nunca.</strong> Ni una vez</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Por qué el <code>tabindex</code> positivo es indefendible.</strong> No es "poco elegante": es <strong>global y contagioso</strong>. Un solo <code>tabindex="1"</code> en un componente de terceros hace que ese elemento se tabule antes que el logo, antes que el menú, antes que todo. Y a partir de ahí, cada componente que quiera aparecer en un lugar razonable necesita su propio número, más alto. Terminás manteniendo una numeración global en una aplicación con lazy loading y componentes montados dinámicamente. Es imposible de gobernar en un design system.
+</div>
+
+<h3>Foco visible y <code>:focus-visible</code></h3>
+
+<p>El pecado original del frontend es <code>*:focus { outline: none }</code>, escrito porque el anillo del navegador "afea" los clics con mouse. Rompe <strong>WCAG 2.4.7 Focus Visible (AA)</strong> para todos los usuarios de teclado.</p>
+
+<p>La solución moderna es <code>:focus-visible</code>: el navegador aplica su propia heurística para decidir si el foco vino de una interacción de teclado (o de un contexto donde el indicador es útil) y solo entonces matchea. Soporte universal desde 2022.</p>
+
+<pre><code class="lang-css">/* El patrón correcto */
+:focus { outline: none; }             /* quitamos el default... */
+:focus-visible {                       /* ...y lo devolvemos donde importa */
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Los inputs de texto SIEMPRE deben mostrar foco, aunque venga del mouse:
+   el usuario necesita saber dónde va a escribir. */
+input:focus, textarea:focus, select:focus {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}</code></pre>
+
+<div class="tip">
+  <strong>Por qué <code>outline</code> y no <code>box-shadow</code>.</strong> Los dos se ven parecido, pero en el <strong>modo de alto contraste forzado de Windows</strong> (<code>forced-colors: active</code>) el navegador descarta las sombras y los fondos que definiste, y respeta <code>outline</code>. Un anillo de foco hecho con <code>box-shadow</code> simplemente <em>no existe</em> para los usuarios de ese modo — que son, justamente, muchos de los que más dependen de ver el foco. Desde que <code>outline</code> sigue el <code>border-radius</code> del elemento en todos los navegadores modernos, la excusa estética se terminó.
+</div>
+
+<pre><code class="lang-css">/* Verificá tu indicador de foco en el modo forzado */
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: 3px solid CanvasText;   /* colores del sistema, no los tuyos */
+    outline-offset: 2px;
+  }
+}</code></pre>
+
+<div class="info">
+  <strong>WCAG 2.2</strong> agregó dos criterios sobre esto. <strong>2.4.11 Focus Not Obscured (Minimum), nivel AA</strong>: el elemento enfocado no puede quedar <em>completamente</em> tapado por otro contenido — el caso típico es el header <code>position: sticky</code> o la barra de cookies que cubre lo que acabás de tabular. <strong>2.4.13 Focus Appearance (AAA)</strong> fija tamaño y contraste mínimos del indicador. El primero rompe muchísimos sitios existentes y se arregla, casi siempre, con <code>scroll-margin-top</code> igual a la altura del header sticky.
+</div>
+
+<h3>Gestión programática: abrir, atrapar, devolver</h3>
+
+<p>Cuando abrís un diálogo modal, el foco tiene que <strong>entrar</strong>, <strong>quedar atrapado adentro</strong> mientras está abierto, y <strong>volver al disparador</strong> al cerrar. La trampa de foco intencional es correcta y necesaria; lo que WCAG prohíbe (<strong>2.1.2 No Keyboard Trap</strong>) es la trampa de la que no se puede salir con el teclado.</p>
+
+<pre><code class="lang-javascript">// El ciclo completo, con el detalle que casi todos se olvidan:
+// qué hacer si el disparador ya no existe cuando cerrás.
+let disparador = null;
+
+function abrirModal(dialogo) {
+  disparador = document.activeElement;      // 1. guardar de dónde venimos
+  dialogo.showModal();                       // 2. &lt;dialog&gt; nativo: inert + Escape gratis
+  var primero = dialogo.querySelector('[autofocus], button, [href], input, select, textarea');
+  if (primero) primero.focus();              // 3. entrar al contenido
+}
+
+function cerrarModal(dialogo, contenedorDeRespaldo) {
+  dialogo.close();
+  // 4. devolver el foco — pero el disparador puede haberse borrado
+  //    (era el botón "Eliminar" de una fila que acabamos de eliminar)
+  if (disparador &amp;&amp; document.contains(disparador)) {
+    disparador.focus();
+  } else {
+    contenedorDeRespaldo.setAttribute('tabindex', '-1');
+    contenedorDeRespaldo.focus();            // un ancestro estable: la tabla, el main
+  }
+  disparador = null;
+}</code></pre>
+
+<p>Dos piezas de plataforma que eliminan casi todo el código artesanal de esta área:</p>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Qué resuelve</th><th>Qué te sigue tocando</th></tr></thead>
+<tbody>
+<tr><td><code>&lt;dialog&gt;</code> + <code>showModal()</code></td><td>Trampa de foco, <kbd>Esc</kbd> para cerrar, <em>top layer</em> (sin peleas de <code>z-index</code>), <code>::backdrop</code>, resto de la página inerte</td><td>Elegir el foco inicial, devolver el foco al cerrar, y animar el cierre (necesita <code>@starting-style</code> y <code>transition-behavior: allow-discrete</code>)</td></tr>
+<tr><td>El atributo <code>inert</code></td><td>Saca un subárbol entero del orden de tabulación <strong>y</strong> del árbol de accesibilidad, con una línea</td><td>Acordarte de quitarlo. Reemplaza el viejo hack de <code>aria-hidden</code> + <code>tabindex="-1"</code> elemento por elemento</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error de <code>aria-hidden</code> más frecuente:</strong> ponerlo sobre un contenedor que tiene adentro elementos enfocables. El resultado es un fantasma — el usuario tabula hacia algo que existe para el navegador pero no para el lector de pantalla, que se queda mudo. Es tan común que axe tiene una regla dedicada (<code>aria-hidden-focus</code>). Si querés ocultar algo de verdad, usá <code>inert</code>, <code>hidden</code> o <code>display: none</code>, que sacan de los dos mundos a la vez.
+</div>
+
+<h2>FS6.5 Widgets complejos: los patrones de la APG</h2>
+
+<p>La <strong>ARIA Authoring Practices Guide (APG)</strong> del W3C documenta, patrón por patrón, qué roles, qué estados y —lo más importante— <strong>qué teclas</strong> tiene que soportar cada widget. No es normativa, pero es lo más cercano a un canon que existe, y los usuarios de tecnología asistiva esperan exactamente ese comportamiento porque es el que aprendieron en el resto de las aplicaciones.</p>
+
+<table>
+<thead><tr><th>Patrón</th><th>Teclado obligatorio</th><th>Dificultad real</th><th>Recomendación</th></tr></thead>
+<tbody>
+<tr><td><strong>Disclosure</strong> (acordeón, "ver más")</td><td><kbd>Enter</kbd>/<kbd>Espacio</kbd> alternan. Nada más</td><td>Baja</td><td>✅ Escribilo a mano: es <code>&lt;button aria-expanded&gt;</code> + un contenedor</td></tr>
+<tr><td><strong>Modal dialog</strong></td><td><kbd>Esc</kbd> cierra, <kbd>Tab</kbd> circula adentro</td><td>Media</td><td>✅ <code>&lt;dialog&gt;</code> nativo, y sumale el retorno de foco</td></tr>
+<tr><td><strong>Tabs</strong></td><td><kbd>←</kbd><kbd>→</kbd> mueven, <kbd>Home</kbd>/<kbd>End</kbd> a los extremos, <em>roving tabindex</em> (una sola parada de Tab para todo el grupo)</td><td>Media</td><td>⚠️ Se puede, si respetás el roving tabindex</td></tr>
+<tr><td><strong>Menu button</strong> (menú de aplicación)</td><td><kbd>↓</kbd> abre y enfoca el primero, flechas navegan, letras saltan, <kbd>Esc</kbd> cierra y devuelve foco</td><td>Alta</td><td>⚠️ Solo para <em>acciones</em>. Nunca para navegación de sitio</td></tr>
+<tr><td><strong>Combobox</strong> (autocompletado)</td><td>Flechas sin perder el cursor de texto, <kbd>Enter</kbd> selecciona, <kbd>Esc</kbd> revierte, anuncio del conteo de resultados</td><td><strong>Muy alta</strong></td><td>❌ No lo escribas. Librería auditada o <code>&lt;select&gt;</code></td></tr>
+<tr><td><strong>Tree / Treegrid</strong></td><td>Flechas en dos ejes, expandir/colapsar, <em>type-ahead</em>, niveles anunciados</td><td><strong>Muy alta</strong></td><td>❌ Librería</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El error de <code>role="menu"</code> en la navegación del sitio.</strong> Es tentador: se llama "menú", se ve como un menú. Pero <code>role="menu"</code> y <code>role="menuitem"</code> están definidos para <strong>menús de aplicación</strong>, del tipo Archivo → Guardar. Cuando un lector de pantalla entra en un <code>role="menu"</code> cambia a <em>modo aplicación</em>: las teclas de lectura rápida dejan de funcionar y el usuario queda encerrado en un modelo de interacción que no esperaba, para leer una lista de enlaces. La navegación de un sitio es <code>&lt;nav&gt;&lt;ul&gt;&lt;li&gt;&lt;a&gt;</code>, y el desplegable es un <strong>disclosure</strong>. Punto.
+</div>
+
+<h3>El disclosure: el widget que sí conviene escribir</h3>
+
+<pre><code class="lang-html">&lt;div class="submenu"&gt;
+  &lt;button id="btn-cuenta" aria-expanded="false" aria-controls="menu-cuenta"&gt;
+    Mi cuenta
+    &lt;svg aria-hidden="true" focusable="false"&gt;&lt;!-- la flechita --&gt;&lt;/svg&gt;
+  &lt;/button&gt;
+
+  &lt;ul id="menu-cuenta" hidden&gt;
+    &lt;li&gt;&lt;a href="/perfil"&gt;Perfil&lt;/a&gt;&lt;/li&gt;
+    &lt;li&gt;&lt;a href="/facturacion"&gt;Facturación&lt;/a&gt;&lt;/li&gt;
+    &lt;li&gt;&lt;a href="/salir"&gt;Cerrar sesión&lt;/a&gt;&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/div&gt;</code></pre>
+
+<pre><code class="lang-javascript">var boton = document.getElementById('btn-cuenta');
+var panel = document.getElementById('menu-cuenta');
+
+function alternar(abrir) {
+  boton.setAttribute('aria-expanded', String(abrir));
+  panel.hidden = !abrir;   // hidden lo saca del árbol Y del tab order
+}
+
+boton.addEventListener('click', function () {
+  alternar(boton.getAttribute('aria-expanded') !== 'true');
+});
+
+// Escape cierra y devuelve el foco al disparador: barato y esperado
+panel.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') { alternar(false); boton.focus(); }
+});
+
+// Clic afuera. Ojo: NO cerramos en 'blur', porque eso rompe el clic
+// en los propios ítems y genera bugs imposibles de reproducir.
+document.addEventListener('click', function (e) {
+  if (!panel.contains(e.target) &amp;&amp; e.target !== boton) alternar(false);
+});</code></pre>
+
+<div class="rule">
+  <strong>📌 El detalle que separa un disclosure correcto de uno roto:</strong> el panel cerrado se oculta con <code>hidden</code> (o <code>display: none</code>), <strong>no</strong> con <code>opacity: 0</code>, <code>visibility</code> heredada mal, <code>height: 0</code> con <code>overflow: hidden</code>, ni <code>transform: translateY(-100%)</code>. Todas esas técnicas dejan los enlaces <em>enfocables e invisibles</em>: el usuario de teclado tabula hacia la nada y el foco desaparece de la pantalla. Es uno de los bugs de accesibilidad más frecuentes en menús animados. Si necesitás animar, animá y después aplicá <code>hidden</code> en el <code>transitionend</code>, o usá <code>transition-behavior: allow-discrete</code>.
+</div>
+
+<h3>Por qué el combobox es tan difícil</h3>
+
+<p>Reimplementar un combobox accesible es de las cosas más difíciles del frontend, y conviene entender exactamente por qué antes de aceptar el ticket:</p>
+
+<div class="step"><strong>El patrón cambió.</strong> ARIA 1.0 ponía <code>role="combobox"</code> en un contenedor; desde ARIA 1.2 va en el <code>&lt;input&gt;</code> mismo. Hay tutoriales de las dos épocas circulando, y el marcado viejo se comporta distinto en cada lector.</div>
+
+<div class="step"><strong>Foco real vs <code>aria-activedescendant</code>.</strong> O movés el foco del DOM a cada opción —y perdés el cursor de texto, así que el usuario no puede seguir escribiendo— o dejás el foco en el input y señalás la opción "activa" con <code>aria-activedescendant</code>. La segunda es la correcta y la que tiene soporte más irregular entre lectores.</div>
+
+<div class="step"><strong>Hay que anunciar el conteo.</strong> "3 resultados disponibles" en una live region, sin gritarlo en cada tecla y sin quedarse mudo cuando pasa de 3 a 0.</div>
+
+<div class="step"><strong>El comportamiento cambia con cada versión de cada lector.</strong> NVDA, JAWS y VoiceOver implementan matices distintos, y una actualización puede romper lo que andaba. Mantenerlo es un costo <em>permanente</em>, no un costo de desarrollo.</div>
+
+<div class="tip">
+  <strong>La decisión senior.</strong> Usá <code>&lt;select&gt;</code> cuando alcance —es feo pero es perfecto, y en móvil abre el selector nativo del sistema. Si necesitás autocompletado, usá una librería con gente dedicada a accesibilidad detrás (React Aria de Adobe, Radix, Ariakit, Headless UI) y <strong>auditala igual</strong>: "es accesible" en el README no es evidencia. Escribir el tuyo se justifica solo si tenés presupuesto para probarlo en tres lectores de pantalla en cada release. Casi nadie lo tiene, y está bien: eso es una decisión de recursos, no una derrota.
+</div>
+
+<h2>FS6.6 Contenido dinámico: live regions y la SPA muda</h2>
+
+<p>Un lector de pantalla lee lo que está en el punto donde el usuario tiene el cursor. Si algo cambia en otra parte de la pantalla, <strong>no se entera</strong>: no hay ningún mecanismo automático que lo notifique. Ese es todo el problema del contenido dinámico, y la solución son las <em>live regions</em>.</p>
+
+<table>
+<thead><tr><th>Marcado</th><th>Equivale a</th><th>Para qué</th></tr></thead>
+<tbody>
+<tr><td><code>aria-live="polite"</code></td><td><code>role="status"</code></td><td>Confirmaciones, conteos de resultados, "guardado". Espera a que el usuario termine de escuchar lo que estaba leyendo</td></tr>
+<tr><td><code>aria-live="assertive"</code></td><td><code>role="alert"</code></td><td><strong>Interrumpe</strong> lo que se está leyendo. Solo para errores que bloquean o pérdida de datos inminente</td></tr>
+<tr><td><code>role="log"</code></td><td>—</td><td>Chat, consola: se agregan mensajes en orden y el viejo no se relee</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>La regla que casi nadie cumple:</strong> el contenedor de la live region tiene que <strong>existir en el DOM antes</strong> de que aparezca el mensaje. Si insertás un <code>&lt;div role="alert"&gt;Error&lt;/div&gt;</code> completo, muchos lectores no lo anuncian, porque lo que observan es la <em>mutación</em> de una región que ya estaban vigilando. El patrón correcto es montar el contenedor vacío al cargar la página y escribirle el texto después.
+</div>
+
+<pre><code class="lang-html">&lt;!-- Se monta una vez, vacío, en el layout raíz --&gt;
+&lt;div id="anuncios" role="status" aria-live="polite" aria-atomic="true"
+     class="visually-hidden"&gt;&lt;/div&gt;</code></pre>
+
+<pre><code class="lang-javascript">var region = document.getElementById('anuncios');
+var pendiente = null;
+
+function anunciar(texto) {
+  // Limpiar primero fuerza una mutación aunque el texto sea idéntico
+  // al anterior ("1 resultado" dos veces seguidas se anunciaría una sola).
+  region.textContent = '';
+  clearTimeout(pendiente);
+  pendiente = setTimeout(function () { region.textContent = texto; }, 100);
+}
+
+anunciar('3 productos encontrados');</code></pre>
+
+<p>Los cinco errores de live regions, en orden de frecuencia:</p>
+
+<div class="step"><strong>1. Usar <code>assertive</code> para cosas amables.</strong> "Guardado ✓" con <code>role="alert"</code> interrumpe al usuario en la mitad de una frase, cada vez. Es el equivalente auditivo de un modal que se abre solo.</div>
+
+<div class="step"><strong>2. Dos mensajes muy seguidos.</strong> El segundo pisa al primero antes de que se lea. Necesitás una cola con un pequeño retardo, no dos escrituras seguidas.</div>
+
+<div class="step"><strong>3. <code>aria-atomic</code> mal puesto.</strong> Con <code>true</code> se relee toda la región; con <code>false</code> (el valor por defecto) solo la parte que cambió. Para un contador que pasa de "2 items" a "3 items", <code>true</code> lee la frase entera y <code>false</code> puede leer solo "3".</div>
+
+<div class="step"><strong>4. Anunciar demasiado.</strong> Una live region atada a un campo de búsqueda que se dispara con cada tecla convierte el sitio en tortura. Poné un <em>debounce</em>, como harías con la petición.</div>
+
+<div class="step"><strong>5. Ocultar la región con <code>display: none</code>.</strong> Eso la saca del árbol de accesibilidad: no anuncia nada. Se oculta con una clase <code>.visually-hidden</code> (posición absoluta, 1×1 px, <code>clip-path</code>), que la mantiene en el árbol.</div>
+
+<h3>La SPA que cambia de página sin que nadie se entere</h3>
+
+<p>Cuando el navegador navega de verdad, hace tres cosas para la tecnología asistiva: carga un documento nuevo, <strong>anuncia el <code>&lt;title&gt;</code></strong> y <strong>resetea el foco</strong> al principio del documento. Un router del lado del cliente no hace ninguna de las tres. El resultado es que el usuario de lector de pantalla hace clic en "Facturación", escucha silencio absoluto, y su cursor sigue parado en el enlace de un menú que ya no existe.</p>
+
+<pre><code class="lang-javascript">// El patrón completo, agnóstico de framework.
+// Se dispara DESPUÉS de que el contenido nuevo se pintó.
+function alNavegar(tituloDePagina) {
+  // 1. El título: lo usan los lectores, el historial y las pestañas
+  document.title = tituloDePagina + ' · Mi App';
+
+  // 2. Mover el foco. Este es el paso que casi nadie implementa.
+  var destino = document.querySelector('main h1') || document.querySelector('main');
+  if (destino) {
+    destino.setAttribute('tabindex', '-1');   // enfocable por código, no por Tab
+    destino.focus({ preventScroll: false });
+    // Lo quitamos al perder el foco para no dejar basura en el DOM
+    destino.addEventListener('blur', function limpiar() {
+      destino.removeAttribute('tabindex');
+      destino.removeEventListener('blur', limpiar);
+    });
+  }
+
+  // 3. Opcional: reforzar con un anuncio explícito
+  anunciar('Navegaste a ' + tituloDePagina);
+}</code></pre>
+
+<div class="info">
+  <strong>El trade-off de dónde poner el foco.</strong> Al <code>&lt;h1&gt;</code>: se lee el título de la página, que es exactamente la información que el usuario necesita, pero se pierde el contenido que hubiera arriba (un breadcrumb, por ejemplo). Al <code>&lt;main&gt;</code>: se anuncia la landmark y el usuario puede recorrer todo desde arriba, pero el anuncio es más pobre. La mayoría de las guías se inclina por el <code>h1</code>. Lo que <strong>no</strong> es una opción es no mover el foco: dejarlo en un elemento que se desmontó lo manda a <code>&lt;body&gt;</code>, y el siguiente <kbd>Tab</kbd> arranca desde el principio de la página, cada vez.
+</div>
+
+<div class="mistake">
+  <strong>El primo cercano: el skip link roto.</strong> <code>&lt;a href="#contenido" class="skip-link"&gt;Saltar al contenido&lt;/a&gt;</code> funciona solo si <code>#contenido</code> es enfocable. Si es un <code>&lt;main id="contenido"&gt;</code> sin <code>tabindex="-1"</code>, varios navegadores mueven el <em>scroll</em> pero no el <em>foco</em>: el usuario ve que la página bajó, presiona <kbd>Tab</kbd>, y vuelve al segundo enlace del header. Y verificá que el skip link se haga visible con <code>:focus</code>: uno permanentemente oculto no sirve para nada.
+</div>
+
+<h2>FS6.7 Formularios: donde se pierde la plata</h2>
+
+<p>Los formularios concentran la mayor densidad de fallas de accesibilidad de cualquier interfaz, y son justo donde ocurre la conversión. Un checkout inaccesible no es un problema de cumplimiento: es una pérdida de ingresos medible.</p>
+
+<h3>Etiqueta real, no <code>placeholder</code></h3>
+
+<pre><code class="lang-html">&lt;!-- ❌ El placeholder no es una etiqueta --&gt;
+&lt;input type="email" placeholder="Tu email"&gt;
+&lt;!-- Desaparece al escribir (el usuario ya no sabe qué campo es),
+     tiene contraste bajo por defecto, no todos los lectores lo anuncian,
+     y desaparece del autocompletado del navegador. --&gt;
+
+&lt;!-- ✅ Etiqueta real, asociada por id --&gt;
+&lt;label for="email"&gt;Correo electrónico&lt;/label&gt;
+&lt;input type="email" id="email" name="email"
+       autocomplete="email" required
+       aria-describedby="email-ayuda email-error"
+       aria-invalid="false"&gt;
+&lt;p id="email-ayuda" class="ayuda"&gt;Te vamos a mandar la confirmación acá.&lt;/p&gt;
+&lt;p id="email-error" class="error" hidden&gt;&lt;/p&gt;</code></pre>
+
+<div class="info">
+  El atributo <code>autocomplete</code> con los tokens estándar (<code>email</code>, <code>given-name</code>, <code>street-address</code>, <code>cc-number</code>…) es el criterio <strong>WCAG 1.3.5 Identify Input Purpose (AA)</strong>. Le sirve a quien tiene una discapacidad cognitiva o motriz, y de paso <strong>a todos los demás</strong>: mejora la conversión en móvil de forma medible. Es el ejemplo más limpio de accesibilidad que se paga sola.
+</div>
+
+<h3>Errores: asociados, anunciados y accionables</h3>
+
+<pre><code class="lang-javascript">function marcarError(input, mensaje) {
+  var id = input.id + '-error';
+  var p = document.getElementById(id);
+
+  input.setAttribute('aria-invalid', 'true');
+  // describedby puede listar varios ids: la ayuda Y el error
+  p.textContent = mensaje;
+  p.hidden = false;
+}
+
+function limpiarError(input) {
+  input.setAttribute('aria-invalid', 'false');
+  var p = document.getElementById(input.id + '-error');
+  p.textContent = '';
+  p.hidden = true;
+}
+
+// Al enviar: resumen arriba + foco al resumen. NO al primer campo:
+// el usuario necesita saber CUÁNTOS errores hay antes de arreglar el primero.
+function mostrarResumen(errores) {
+  var caja = document.getElementById('resumen-errores');
+  caja.innerHTML = '&lt;h2&gt;Hay ' + errores.length + ' problemas en el formulario&lt;/h2&gt;';
+  var ul = document.createElement('ul');
+  errores.forEach(function (err) {
+    var a = document.createElement('a');
+    a.href = '#' + err.id;               // enlace directo al campo
+    a.textContent = err.mensaje;
+    var li = document.createElement('li');
+    li.appendChild(a);
+    ul.appendChild(li);
+  });
+  caja.appendChild(ul);
+  caja.hidden = false;
+  caja.setAttribute('tabindex', '-1');
+  caja.focus();
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Tres reglas de mensajes de error.</strong> <strong>(1)</strong> Nunca solo color: el borde rojo es invisible para el 8% de los varones con daltonismo, y es una falla de <strong>WCAG 1.4.1 Use of Color (A)</strong>. Sumá texto y, si querés, un ícono. <strong>(2)</strong> El texto dice <em>qué hacer</em>, no solo que está mal: "La contraseña necesita al menos 8 caracteres" gana a "Contraseña inválida". <strong>(3)</strong> Validá en <code>blur</code> o al enviar, no en cada tecla: gritarle "email inválido" a alguien que escribió la primera letra es hostil para todos, y en un lector de pantalla es directamente insoportable.
+</div>
+
+<pre><code class="lang-css">/* :user-invalid solo matchea DESPUÉS de que el usuario interactuó.
+   Reemplaza al viejo :invalid, que pintaba de rojo un formulario vacío
+   apenas cargaba la página. Soporte amplio desde 2023. */
+input:user-invalid {
+  border-color: var(--danger);
+  outline-color: var(--danger);
+}
+input:user-invalid + .error::before { content: "⚠ "; }</code></pre>
+
+<h3>Agrupación: <code>fieldset</code> y <code>legend</code></h3>
+
+<pre><code class="lang-html">&lt;fieldset&gt;
+  &lt;legend&gt;¿Cómo querés recibir el pedido?&lt;/legend&gt;
+  &lt;label&gt;&lt;input type="radio" name="envio" value="casa"&gt; A domicilio&lt;/label&gt;
+  &lt;label&gt;&lt;input type="radio" name="envio" value="sucursal"&gt; Retiro en sucursal&lt;/label&gt;
+&lt;/fieldset&gt;
+
+&lt;!-- Sin el fieldset, el lector anuncia "A domicilio, botón de radio, 1 de 2"
+     y el usuario nunca escucha la pregunta que está respondiendo. --&gt;</code></pre>
+
+<div class="tip">
+  <code>&lt;fieldset&gt;</code> y <code>&lt;legend&gt;</code> tienen estilos por defecto difíciles de domar (el <code>legend</code> se posiciona sobre el borde y no acepta <code>display: flex</code> en el padre sin peleas). La alternativa válida cuando el diseño lo exige es <code>&lt;div role="group" aria-labelledby="id-del-titulo"&gt;</code>, que produce prácticamente el mismo nodo en el árbol de accesibilidad sin ningún estilo heredado. Es uno de los pocos casos donde reemplazar semántica nativa por ARIA es una decisión sensata — y el motivo es puramente de CSS, así que dejalo escrito en un comentario.
+</div>
+
+<div class="warn">
+  <strong>WCAG 2.2 sumó dos criterios que rompen patrones comunes.</strong> <strong>3.3.7 Redundant Entry (A)</strong>: no le pidas dos veces el mismo dato en un mismo proceso (el clásico "repetí tu email"), salvo que sea esencial. <strong>3.3.8 Accessible Authentication (Minimum) (AA)</strong>: el login no puede exigir un test cognitivo — y eso incluye <strong>bloquear el pegado en el campo de contraseña o de código OTP</strong>. Ese <code>onpaste="return false"</code> que alguien puso "por seguridad" es, desde WCAG 2.2, una falla de nivel AA. Además nunca aportó seguridad: empuja a la gente a elegir contraseñas que pueda escribir de memoria.
+</div>
+
+<h2>FS6.8 Testing real: lo que axe no ve</h2>
+
+<p>axe-core es excelente en lo suyo. Está diseñado para tener <strong>casi cero falsos positivos</strong>: si reporta algo, está mal. Por eso mismo es conservador, y por eso cubre solo esa franja del 30–40% de los criterios que se pueden decidir mirando el marcado.</p>
+
+<table>
+<thead><tr><th>Lo que una máquina SÍ puede decidir</th><th>Lo que NO puede decidir</th></tr></thead>
+<tbody>
+<tr><td>Que una imagen no tiene <code>alt</code></td><td>Si el <code>alt</code> describe la imagen o dice "imagen1.jpg"</td></tr>
+<tr><td>La relación de contraste de dos colores</td><td>Si el texto sobre una foto es legible en la parte clara</td></tr>
+<tr><td>Que un input no tiene etiqueta asociada</td><td>Si la etiqueta se entiende</td></tr>
+<tr><td>Que hay un <code>tabindex</code> positivo</td><td>Si el orden de foco resultante tiene sentido</td></tr>
+<tr><td>Que faltan encabezados o saltan niveles</td><td>Si la estructura refleja el contenido</td></tr>
+<tr><td>Que un <code>aria-labelledby</code> apunta a un id inexistente</td><td>Si el nombre del botón corresponde a lo que el botón hace</td></tr>
+<tr><td>Que hay <code>aria-hidden</code> sobre algo enfocable</td><td>Si el mensaje de error le sirve a alguien</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ "Cero violaciones de axe" no es una métrica de accesibilidad.</strong> Es una métrica de <em>cuántos problemas automatizables están resueltos</em>. Un sitio con cero violaciones puede ser completamente inutilizable con teclado. El Worked Example de este módulo es exactamente ese caso. Si tu definición de "listo" es el número de axe, estás optimizando el termómetro.
+</div>
+
+<h3>Los cinco tests manuales que valen más que cualquier herramienta</h3>
+
+<div class="step"><strong>1. Solo teclado, 10 minutos.</strong> Guardá el mouse. <kbd>Tab</kbd> por todo el flujo crítico. Tres preguntas: ¿<em>siempre</em> ves dónde está el foco? ¿Podés hacer todo lo que se puede hacer con mouse? ¿Podés <em>salir</em> de todo lo que abriste? Es el test con mejor relación costo/hallazgos que existe: encuentra el 80% de los problemas serios y no requiere instalar nada.</div>
+
+<div class="step"><strong>2. Un lector de pantalla real, 30 minutos.</strong> <strong>NVDA</strong> es gratis, para Windows, y en la encuesta de usuarios de WebAIM aparece como lector primario del 37,7% y como herramienta usada por el 65,6% de los encuestados. <strong>JAWS</strong> lidera el uso primario de escritorio con 40,5% pero es pago. <strong>VoiceOver</strong> viene en macOS e iOS (<kbd>Cmd</kbd>+<kbd>F5</kbd>) y es el más usado en móvil, con 70,6%. Empezá por el que tengas: aprender a moverte lleva media hora y cambia para siempre cómo escribís HTML.</div>
+
+<div class="step"><strong>3. Zoom al 400%.</strong> Es <strong>WCAG 1.4.10 Reflow (AA)</strong>. En una ventana de 1280 px, 400% equivale a un viewport de 320 px CSS. ¿Aparece scroll horizontal? ¿Se pierde contenido? ¿Los menús quedan fuera de pantalla? Descubre exactamente los mismos bugs que un teléfono chico, así que se paga dos veces.</div>
+
+<div class="step"><strong>4. Zoom solo de texto al 200%.</strong> <strong>WCAG 1.4.4 Resize Text (AA)</strong>. Distinto del anterior: agranda el texto sin agrandar el layout. Revienta todo componente con <code>height</code> fija en píxeles y todo texto con <code>overflow: hidden</code>. Es la razón por la que los contenedores se dimensionan con <code>min-height</code> y las tipografías con unidades relativas.</div>
+
+<div class="step"><strong>5. Los dos media queries reveladores.</strong> <code>prefers-reduced-motion: reduce</code> (WCAG 2.3.3): ¿tus animaciones se apagan, o le provocás vértigo a alguien con trastorno vestibular? Y <code>forced-colors: active</code>: ¿sobrevive tu interfaz cuando el sistema reemplaza todos tus colores? En DevTools los dos se emulan desde el panel <em>Rendering</em>, sin cambiar nada del sistema.</div>
+
+<h3>Herramientas, con su costo</h3>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Qué aporta</th><th>Costo / límite</th></tr></thead>
+<tbody>
+<tr><td><strong>axe DevTools</strong> (extensión)</td><td>El motor de referencia; explica cada violación y muestra el nodo</td><td>Solo el 30–40% de los criterios; lo avanzado es de pago</td></tr>
+<tr><td><strong>Lighthouse</strong> (a11y)</td><td>Ya está en Chrome; usa axe-core por debajo</td><td>Un subconjunto de axe con un puntaje que da falsa seguridad: 100/100 no significa nada</td></tr>
+<tr><td><strong>WAVE</strong></td><td>Superpone íconos sobre la página: excelente para ver estructura y contraste en contexto. Alimenta el informe WebAIM Million</td><td>Visual: no se integra en CI</td></tr>
+<tr><td><strong>Accessibility Insights</strong></td><td>Además del escaneo, una guía de <strong>tests manuales asistidos</strong> paso a paso</td><td>Lleva tiempo humano — que es justamente el punto</td></tr>
+<tr><td><strong>@axe-core/playwright</strong></td><td>Lo mete en CI y frena regresiones nuevas</td><td>Falla contra el DOM renderizado: hay que llegar al estado que querés probar</td></tr>
+<tr><td><strong>Testing Library</strong> (<code>getByRole</code>)</td><td>Presiona indirectamente: si no podés encontrar el elemento por su rol y nombre accesible, la tecnología asistiva tampoco</td><td>No es un chequeo de accesibilidad, pero previene muchísimo</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-javascript">// Playwright + axe con una estrategia de baseline.
+// La clave NO es exigir cero violaciones desde el día uno en un legacy:
+// es impedir que aparezcan NUEVAS.
+import { test, expect } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
+import baseline from './a11y-baseline.json';
+
+test('checkout sin regresiones de accesibilidad', async ({ page }) =&gt; {
+  await page.goto('/checkout');
+  await page.getByRole('button', { name: /pagar/i }).waitFor();
+
+  const r = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+    .analyze();
+
+  const nuevas = r.violations.filter((v) =&gt; !baseline.conocidas.includes(v.id));
+  expect(nuevas, JSON.stringify(nuevas, null, 2)).toEqual([]);
+});
+
+// Y el test que axe NO puede hacer: el orden de foco del flujo crítico.
+test('el checkout se completa solo con teclado', async ({ page }) =&gt; {
+  await page.goto('/checkout');
+  const orden = [];
+  for (let i = 0; i &lt; 8; i++) {
+    await page.keyboard.press('Tab');
+    orden.push(await page.evaluate(() =&gt; {
+      const a = document.activeElement;
+      return a.getAttribute('aria-label') || a.textContent.trim().slice(0, 30);
+    }));
+  }
+  expect(orden).toEqual([
+    'Saltar al contenido', 'Inicio', 'Mi cuenta',
+    'Nombre', 'Email', 'Tarjeta', 'Cupón', 'Pagar',
+  ]);
+});</code></pre>
+
+<div class="tip">
+  <strong>Ese segundo test es el que rinde.</strong> Congela el orden de tabulación del flujo que da plata. Cuando alguien inserte un banner promocional en el medio del formulario o reordene con <code>order</code>, el test falla con un diff legible en el pull request, no seis meses después en un reclamo. Escribilo una vez por flujo crítico, no por componente.
+</div>
+
+<h2>FS6.9 Más allá de la discapacidad permanente</h2>
+
+<p>El argumento habitual para invertir en accesibilidad es el porcentaje de la población con discapacidad. Es un argumento válido y suele fracasar en las reuniones de priorización, porque suena a nicho. El marco de <strong>diseño inclusivo</strong> de Microsoft lo reformula de una manera que funciona mucho mejor: para cada capacidad hay una limitación <em>permanente</em>, una <em>temporal</em> y una <em>situacional</em>.</p>
+
+<table>
+<thead><tr><th>Capacidad</th><th>Permanente</th><th>Temporal</th><th>Situacional</th></tr></thead>
+<tbody>
+<tr><td>Ver</td><td>Ceguera</td><td>Cirugía ocular, pupilas dilatadas</td><td>Sol directo sobre la pantalla, brillo al mínimo por batería</td></tr>
+<tr><td>Oír</td><td>Sordera</td><td>Otitis</td><td>Un bar ruidoso, un tren, ver video sin auriculares en la oficina</td></tr>
+<tr><td>Usar las dos manos</td><td>Amputación</td><td>Brazo enyesado</td><td>Sostener a un bebé, viajar con una valija, manejar</td></tr>
+<tr><td>Procesar / recordar</td><td>Discapacidad cognitiva</td><td>Migraña, medicación</td><td>Estrés, sueño, hacer dos cosas a la vez</td></tr>
+<tr><td>Ancho de banda</td><td>—</td><td>Plan agotado</td><td>Conexión de 3G en un subte</td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>🚸 El efecto rampa (<em>curb cut effect</em>).</strong> Las rampas en las esquinas se construyeron por los usuarios de silla de ruedas, después de años de activismo. Hoy las usan carritos de bebé, valijas con rueditas, repartidores con changuitos, gente mayor y cualquiera que ande en bicicleta. La cantidad de beneficiarios superó por órdenes de magnitud al grupo original. En software pasa lo mismo con los subtítulos —la mayoría de quienes los usan oye perfectamente—, con el modo oscuro, con el autocompletado y con el control por voz.
+</div>
+
+<div class="warn">
+  <strong>El costo de aplicar esto sin criterio</strong> es construir features "inclusivas" que nadie usa, porque partieron de una persona imaginada en vez de una necesidad observada. El argumento situacional sirve para <em>justificar la inversión</em> y para <em>ampliar el testing</em> (probá tu app con una mano, con el sol de frente, con red lenta), no para inventar requerimientos. La accesibilidad bien hecha en su mayor parte <strong>cae de la arquitectura</strong>: elegir el elemento correcto, no romper el foco, no depender del color. Todo eso es gratis si se hace desde el principio y carísimo si se agrega al final.
+</div>
+
+<h2>FS6.10 El marco legal en 2026: qué es "conformidad"</h2>
+
+<p>Hasta 2024 esto era, para la mayoría de los equipos, un tema teórico. Dejó de serlo.</p>
+
+<h3>WCAG 2.2 — el estándar contra el que construís hoy</h3>
+
+<p>WCAG 2.2 es Recomendación del W3C desde octubre de 2023. Agregó <strong>nueve criterios</strong> y —dato poco conocido— <strong>eliminó 4.1.1 Parsing</strong>, que exigía HTML bien formado: se quitó porque las tecnologías asistivas ya no parsean el HTML directamente, sino que toman los datos del árbol de accesibilidad del navegador. Los cuatro criterios nuevos que más rompen código existente:</p>
+
+<table>
+<thead><tr><th>Criterio</th><th>Nivel</th><th>Qué rompe en la práctica</th></tr></thead>
+<tbody>
+<tr><td><strong>2.4.11</strong> Focus Not Obscured (Minimum)</td><td>AA</td><td>Headers <code>sticky</code>, barras de cookies y chats flotantes que tapan el elemento enfocado</td></tr>
+<tr><td><strong>2.5.7</strong> Dragging Movements</td><td>AA</td><td>Todo drag-and-drop necesita una alternativa de un solo puntero: kanban, reordenar listas, sliders de rango, mapas</td></tr>
+<tr><td><strong>2.5.8</strong> Target Size (Minimum)</td><td>AA</td><td>Objetivos de menos de 24×24 px CSS sin espaciado suficiente: iconitos de acciones en tablas densas, "×" de cerrar, paginación</td></tr>
+<tr><td><strong>3.3.8</strong> Accessible Authentication (Minimum)</td><td>AA</td><td>Bloquear el pegado en contraseñas u OTP; puzzles o cálculos como parte del login</td></tr>
+</tbody>
+</table>
+
+<h3>WCAG 3.0 — importante, pero no todavía</h3>
+
+<div class="info">
+  <strong>Estado a septiembre de 2026:</strong> WCAG 3.0 (que pasa a llamarse <em>W3C Accessibility Guidelines</em>) sigue en <strong>Working Draft</strong>. El borrador publicado el <strong>3 de marzo de 2026</strong> describe <strong>174 requisitos</strong>. Cambia el modelo de conformidad: en vez del binario A/AA/AAA, propone niveles graduados <strong>Bronze / Silver / Gold</strong>, y amplía el alcance más allá de la web —apps móviles, PDF, realidad virtual, interfaces de voz, IoT—. La Candidate Recommendation se anticipa para el <strong>cuarto trimestre de 2027</strong> y la Recomendación final <strong>no antes de 2028</strong>. Las dos versiones van a coexistir varios años.
+</div>
+
+<div class="rule">
+  <strong>📌 Qué hacer con esta información hoy: nada, salvo no confundirte.</strong> WCAG 2.2 AA es contra lo que construís y contra lo que te van a auditar. Si alguien te vende "cumplimiento WCAG 3.0" en 2026, está vendiendo humo sobre un borrador. Lo único útil de mirarlo ahora es que la dirección —evaluar <em>tareas completas</em> y no elementos aislados— confirma lo que ya conviene hacer: probar flujos, no componentes.
+</div>
+
+<h3>Europa: EN 301 549 y la European Accessibility Act</h3>
+
+<p><strong>EN 301 549</strong> es la norma técnica europea para accesibilidad de productos y servicios TIC. Su versión vigente, <strong>V3.2.1</strong> (marzo de 2021), incorpora <strong>WCAG 2.1 nivel AA</strong>; la revisión <strong>V4.1.1</strong> está prevista para publicarse durante 2026, y la expectativa es que alinee con WCAG 2.2.</p>
+
+<p>La <strong>European Accessibility Act</strong> (Directiva 2019/882) es la ley que le da dientes. Sus fechas:</p>
+
+<div class="step"><strong>28 de junio de 2025 — ya pasó.</strong> Los requisitos se volvieron aplicables a productos y servicios nuevos: comercio electrónico, banca de consumo, transporte de pasajeros, libros y lectores electrónicos, servicios de comunicación, y las plataformas digitales asociadas. Si vendés a consumidores europeos, te aplica aunque tu empresa esté en otro continente.</div>
+
+<div class="step"><strong>28 de junio de 2030 — la ventana que queda.</strong> Los contratos de servicio firmados antes de junio de 2025 pueden continuar hasta que expiren, y como tope hasta esa fecha. No es una prórroga general: es una excepción acotada.</div>
+
+<div class="step"><strong>2026 — la fiscalización se puso seria.</strong> Las primeras demandas al amparo de la EAA se presentaron en Francia en noviembre de 2025, y durante 2026 las autoridades de vigilancia de varios Estados miembros ampliaron sus programas de auditoría. Las multas las fija cada país: van desde unos 60.000 € en Irlanda hasta cerca de 900.000 € en Suecia.</div>
+
+<h3>Estados Unidos: ADA, y la prórroga de abril de 2026</h3>
+
+<p>El <strong>Título III</strong> de la ADA (empresas privadas abiertas al público) <strong>no tiene norma técnica</strong>: los tribunales vienen usando WCAG como referencia de facto, y el volumen de demandas por sitios web es alto y sostenido hace años.</p>
+
+<p>El <strong>Título II</strong> (gobiernos estatales y locales) sí la tiene desde la regla final del Departamento de Justicia de 2024, que fija <strong>WCAG 2.1 nivel AA</strong>. Y acá hubo una novedad de este año:</p>
+
+<div class="warn">
+  <strong>Cambio de 2026:</strong> el <strong>20 de abril de 2026</strong> —cuatro días antes del vencimiento original— el DOJ publicó una regla interina que <strong>corre los plazos un año</strong>. Las entidades grandes (poblaciones de 50.000 habitantes o más) ahora tienen hasta el <strong>26 de abril de 2027</strong>, y las chicas y los distritos especiales hasta el <strong>26 de abril de 2028</strong>. Lo sustantivo <strong>no cambió</strong>: el estándar sigue siendo WCAG 2.1 AA, y la prórroga no suspende las obligaciones generales de no discriminación y comunicación efectiva, que ya sostenían reclamos por accesibilidad web antes de que existiera cualquier norma técnica.
+</div>
+
+<h3>Qué significa realmente "conformidad"</h3>
+
+<p>Esta es la parte que los equipos técnicos casi siempre entienden mal. La conformidad con WCAG es una <strong>afirmación sobre páginas o procesos concretos, contra una versión y un nivel determinados, en una fecha determinada</strong>. No es un sello permanente sobre "el sitio".</p>
+
+<p>Consecuencias prácticas:</p>
+
+<ul>
+  <li>La conformidad se declara por <strong>página completa</strong> y por <strong>proceso completo</strong>. Si el paso 3 del checkout falla, todo el proceso de compra es no conforme, aunque los pasos 1, 2 y 4 estén impecables.</li>
+  <li><strong>Se vence con cada deploy.</strong> Una auditoría de marzo no dice nada sobre el código de septiembre. Por eso el valor real no está en la auditoría puntual, sino en los tests de regresión que la sostienen.</li>
+  <li>El instrumento formal es el <strong>VPAT</strong> (la plantilla) que se completa para producir un <strong>ACR</strong> (<em>Accessibility Conformance Report</em>). Si vendés software B2B o al sector público, te lo van a pedir en la compra, y firmarlo sin haber probado nada es una declaración falsa con tu nombre.</li>
+</ul>
+
+<div class="danger">
+  <strong>⚠️ Los overlays no dan conformidad, y ahora hay jurisprudencia.</strong> En enero de 2025 la <strong>FTC</strong> anunció que <strong>accessiBe</strong> pagaría <strong>1 millón de dólares</strong> para cerrar un caso por publicidad engañosa; la orden quedó firme en abril de 2025. La empresa promocionaba que su widget de IA hacía cualquier sitio "totalmente conforme" con WCAG 2.1 AA en 48 horas, y la FTC concluyó que esas afirmaciones no estaban respaldadas por evidencia competente y confiable. Más de <strong>800 empresas</strong> con overlays instalados fueron demandadas igual.<br><br>
+  <strong>Por qué no funcionan, técnicamente:</strong> parchean el DOM en tiempo de ejecución con heurísticas —generan <code>alt</code> adivinado, asignan roles por nombre de clase— y no pueden arreglar lo que este módulo entero trata: el orden de foco, la estructura de encabezados, la gestión de foco en modales, la semántica de los widgets, o si el mensaje de error sirve. Muchas veces <strong>rompen</strong> la configuración del lector de pantalla del propio usuario. Y no tocan el código fuente, que es lo que mira tanto un escáner como un perito.
+</div>
+
+<h2>FS6.11 Cuándo NO perseguir AAA</h2>
+
+<p>El propio W3C recomienda <strong>no</strong> adoptar AAA como política general para sitios completos, porque para algunos tipos de contenido es imposible cumplir todos los criterios de ese nivel. AAA es un objetivo <strong>por criterio</strong>, no un nivel al que se aspira globalmente.</p>
+
+<table>
+<thead><tr><th>Criterio AAA</th><th>Qué exige</th><th>Cuándo SÍ vale la pena</th></tr></thead>
+<tbody>
+<tr><td><strong>1.4.6</strong> Contrast (Enhanced)</td><td>7:1 en texto normal (contra 4.5:1 en AA)</td><td>En el cuerpo de artículos largos y documentación. Elimina casi cualquier paleta de marca: no lo apliques a la UI entera</td></tr>
+<tr><td><strong>2.4.13</strong> Focus Appearance</td><td>Tamaño y contraste mínimos del indicador de foco</td><td>✅ Casi siempre: en un design system se implementa <strong>una vez</strong> y sale gratis. De los AAA con mejor relación costo-beneficio</td></tr>
+<tr><td><strong>2.2.6</strong> Timeouts</td><td>Avisar de cualquier inactividad que pueda hacer perder datos</td><td>✅ En pagos, formularios largos y sesiones bancarias. Barato y evita reclamos</td></tr>
+<tr><td><strong>2.4.9</strong> Link Purpose (Link Only)</td><td>El texto del enlace se entiende <em>solo</em>, sin contexto</td><td>Prohíbe "leer más" y "hacé clic acá". Vale la pena como norma de redacción; imposible de imponer a contenido cargado por usuarios</td></tr>
+<tr><td><strong>3.1.5</strong> Reading Level</td><td>Nivel de lectura de secundaria básica</td><td>❌ Imposible en documentación técnica, contratos o contenido médico. Perseguirlo ahí es teatro</td></tr>
+<tr><td><strong>1.2.6</strong> Sign Language</td><td>Interpretación en lengua de señas para todo audio pregrabado</td><td>Costoso de verdad. Solo con público identificado o mandato específico</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La política sensata:</strong> <strong>AA como piso no negociable</strong> en todo el producto, y una <strong>lista corta y explícita de criterios AAA</strong> que adoptás donde son baratos o donde el riesgo lo justifica. Escribila en el repositorio. Un equipo que dice "apuntamos a AAA" sin esa lista está diciendo "no medimos nada": el enunciado es tan inalcanzable que nadie lo verifica nunca.
+</div>
+
+<div class="concept">
+  <strong>💡 Y el otro lado de la moneda.</strong> Hay cosas que <strong>no están en WCAG</strong> y que a un usuario real le importan más que varios criterios AA: que el mensaje de error diga qué hacer, que el formulario se pueda completar en dos sesiones, que no haga falta memoria de trabajo para no perderse, que la ayuda esté donde se necesita. WCAG es el <strong>piso legal y verificable</strong>, no la definición completa de "usable por una persona con discapacidad". Cumplir al 100% y ser inusable es perfectamente posible — y el camino más rápido para llegar ahí es tratar la accesibilidad como una lista de chequeo.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el dropdown "accesible" hecho con divs</h2>
+
+<blockquote>Un equipo entrega el menú de cuenta del header. Pasa el diseño, pasa el code review y pasa el escaneo de axe. Dos semanas después llega un reclamo formal: un empleado que usa NVDA no puede cerrar sesión. Vamos a auditarlo y a reescribirlo.</blockquote>
+
+<h3>Paso 1 — El código que llegó a producción</h3>
+
+<pre><code class="lang-html">&lt;div class="dropdown"&gt;
+  &lt;div class="trigger" onclick="toggle()"&gt;
+    Mi cuenta &lt;span class="chev"&gt;▾&lt;/span&gt;
+  &lt;/div&gt;
+  &lt;div class="menu" id="menu"&gt;
+    &lt;div class="item" onclick="location.href='/perfil'"&gt;Perfil&lt;/div&gt;
+    &lt;div class="item" onclick="location.href='/facturacion'"&gt;Facturación&lt;/div&gt;
+    &lt;div class="item" onclick="location.href='/salir'"&gt;Cerrar sesión&lt;/div&gt;
+  &lt;/div&gt;
+&lt;/div&gt;</code></pre>
+
+<pre><code class="lang-css">.menu { opacity: 0; pointer-events: none; transition: opacity .2s; }
+.menu.abierto { opacity: 1; pointer-events: auto; }
+.item { padding: 4px 10px; font-size: 13px; }   /* alto resultante: ~21px */</code></pre>
+
+<h3>Paso 2 — La auditoría, en tres pasadas</h3>
+
+<p><strong>axe DevTools:</strong> <em>1 violación — color-contrast en <code>.chev</code></em>. Eso es todo. La herramienta no ve nada más, porque no hay nada que un análisis del marcado pueda objetar: son <code>div</code> con texto y contraste correcto. <strong>Este es el momento en que la mayoría de los equipos declara victoria.</strong></p>
+
+<p><strong>Teclado:</strong> <kbd>Tab</kbd> pasa del logo directamente al buscador. El trigger <strong>no existe</strong> en el recorrido. No hay forma de abrir el menú sin mouse. Un usuario de teclado no puede cerrar sesión.</p>
+
+<p><strong>Árbol de accesibilidad (DevTools) + NVDA:</strong></p>
+
+<pre><code class="lang-html">generic
+  StaticText "Mi cuenta"
+  StaticText "▾"
+generic                          &lt;-- el menú "cerrado", que sigue en el árbol
+  StaticText "Perfil"
+  StaticText "Facturación"
+  StaticText "Cerrar sesión"
+
+&lt;!-- NVDA en modo navegación lee, en medio del header:
+     "Mi cuenta ▾ Perfil Facturación Cerrar sesión"
+     Seis textos sueltos, siempre presentes, sin ningún control. --&gt;</code></pre>
+
+<h3>Paso 3 — Las seis fallas, con su criterio</h3>
+
+<table>
+<thead><tr><th>#</th><th>Falla</th><th>Criterio WCAG</th><th>A quién afecta</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>El trigger no es enfocable: no hay manera de abrir el menú con teclado</td><td><strong>2.1.1</strong> Keyboard (A)</td><td>Teclado, switch, lector de pantalla</td></tr>
+<tr><td>2</td><td>El trigger no tiene rol de control ni nombre accesible: en el árbol es <code>generic</code></td><td><strong>4.1.2</strong> Name, Role, Value (A)</td><td>Lector de pantalla, control por voz</td></tr>
+<tr><td>3</td><td>No hay ningún estado de abierto/cerrado que comunicar</td><td><strong>4.1.2</strong> Name, Role, Value (A)</td><td>Lector de pantalla</td></tr>
+<tr><td>4</td><td>Los ítems son <code>div</code> con <code>onclick</code>: no son enlaces, no se abren en pestaña nueva, no se anuncian como navegación</td><td><strong>2.1.1</strong> + <strong>4.1.2</strong></td><td>Todos los que no usan mouse, y también los que sí</td></tr>
+<tr><td>5</td><td>El menú "cerrado" con <code>opacity: 0</code> sigue en el árbol de accesibilidad: contenido fantasma que se lee siempre</td><td><strong>1.3.1</strong> Info and Relationships (A)</td><td>Lector de pantalla</td></tr>
+<tr><td>6</td><td>Abierto, no se cierra con <kbd>Esc</kbd> ni devuelve el foco</td><td><strong>2.1.2</strong> No Keyboard Trap (A)</td><td>Teclado</td></tr>
+<tr><td>7</td><td><em>Bonus:</em> los ítems miden ~21 px de alto, por debajo del mínimo</td><td><strong>2.5.8</strong> Target Size (AA, WCAG 2.2)</td><td>Motricidad fina, pantallas táctiles</td></tr>
+</tbody>
+</table>
+
+<h3>Paso 4 — La decisión de diseño (lo que separa a un senior)</h3>
+
+<p>Antes de escribir una línea hay que elegir el patrón, y es la decisión más importante de todo el ejercicio. La APG ofrece dos candidatos:</p>
+
+<table>
+<thead><tr><th></th><th><strong>Menu Button</strong> (APG)</th><th><strong>Disclosure</strong> + lista de enlaces</th></tr></thead>
+<tbody>
+<tr><td>Roles</td><td><code>menu</code> / <code>menuitem</code></td><td>Ninguno especial: <code>button</code> + <code>ul</code> + <code>a</code></td></tr>
+<tr><td>Teclado a implementar</td><td>Flechas, <kbd>Home</kbd>/<kbd>End</kbd>, <em>type-ahead</em>, roving tabindex, <kbd>Esc</kbd></td><td><kbd>Enter</kbd>/<kbd>Espacio</kbd> y <kbd>Esc</kbd>. El resto lo hace <kbd>Tab</kbd></td></tr>
+<tr><td>Efecto en el lector</td><td>Entra en <strong>modo aplicación</strong>: las teclas de lectura rápida dejan de funcionar</td><td>Modo navegación normal: los enlaces aparecen en la lista de enlaces</td></tr>
+<tr><td>Adecuado para</td><td><strong>Acciones</strong> de una app (Cortar, Pegar, Exportar)</td><td><strong>Navegación</strong></td></tr>
+</tbody>
+</table>
+
+<p>El contenido de este menú son <strong>tres enlaces de navegación</strong>. Elegimos <strong>disclosure</strong>: es más simple, más barato de mantener, y —lo importante— es lo que el usuario espera de un menú de sitio. Usar <code>role="menu"</code> acá sería más código para un resultado peor.</p>
+
+<h3>Paso 5 — El código después</h3>
+
+<pre><code class="lang-html">&lt;div class="dropdown"&gt;
+  &lt;button type="button" id="trigger-cuenta"
+          aria-expanded="false" aria-controls="menu-cuenta"&gt;
+    Mi cuenta
+    &lt;span class="chev" aria-hidden="true"&gt;▾&lt;/span&gt;
+  &lt;/button&gt;
+
+  &lt;ul class="menu" id="menu-cuenta" hidden&gt;
+    &lt;li&gt;&lt;a href="/perfil"&gt;Perfil&lt;/a&gt;&lt;/li&gt;
+    &lt;li&gt;&lt;a href="/facturacion"&gt;Facturación&lt;/a&gt;&lt;/li&gt;
+    &lt;li&gt;&lt;a href="/salir"&gt;Cerrar sesión&lt;/a&gt;&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/div&gt;</code></pre>
+
+<pre><code class="lang-css">.dropdown { position: relative; }
+
+/* Ya no hace falta pointer-events: hidden saca del árbol Y del tab order */
+.menu { position: absolute; margin: 0; padding: .25rem 0; list-style: none; }
+
+/* 2.5.8 Target Size: 24px de alto mínimo, con holgura */
+.menu a {
+  display: block;
+  min-height: 44px;              /* cómodo en táctil, muy por encima del mínimo */
+  padding: .6rem 1rem;
+  display: flex; align-items: center;
+}
+
+/* 2.4.7 Focus Visible, con outline para sobrevivir a forced-colors */
+.dropdown button:focus-visible,
+.menu a:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+}
+
+/* 2.3.3: si el usuario pidió menos movimiento, sin transiciones */
+@media (prefers-reduced-motion: reduce) {
+  .menu { transition: none; }
+}</code></pre>
+
+<pre><code class="lang-javascript">var trigger = document.getElementById('trigger-cuenta');
+var menu = document.getElementById('menu-cuenta');
+
+function alternar(abrir) {
+  trigger.setAttribute('aria-expanded', String(abrir));
+  menu.hidden = !abrir;
+}
+
+trigger.addEventListener('click', function () {
+  alternar(trigger.getAttribute('aria-expanded') !== 'true');
+});
+
+// Escape cierra desde cualquier lado del componente y devuelve el foco.
+// Sin esto, el usuario de teclado queda navegando el menú sin salida clara.
+document.querySelector('.dropdown').addEventListener('keydown', function (e) {
+  if (e.key === 'Escape' &amp;&amp; trigger.getAttribute('aria-expanded') === 'true') {
+    alternar(false);
+    trigger.focus();
+  }
+});
+
+// Cerrar al salir del componente con Tab (no con blur, que rompe el clic)
+document.addEventListener('focusin', function (e) {
+  if (!e.target.closest('.dropdown')) alternar(false);
+});</code></pre>
+
+<h3>Paso 6 — Qué arregló cada cambio</h3>
+
+<table>
+<thead><tr><th>Cambio</th><th>Falla que resuelve</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><code>&lt;div class="trigger"&gt;</code> → <code>&lt;button&gt;</code></td><td>1, 2 y el bonus de teclado (<kbd>Enter</kbd>/<kbd>Espacio</kbd> gratis)</td><td>Un <code>reset</code> de CSS del botón. Nada más</td></tr>
+<tr><td><code>aria-expanded</code> sincronizado</td><td>3</td><td>Dos líneas, y el compromiso de no desincronizarlo nunca</td></tr>
+<tr><td><code>&lt;div class="item"&gt;</code> → <code>&lt;li&gt;&lt;a href&gt;</code></td><td>4, y de yapa recupera "abrir en pestaña nueva", el menú contextual y el prefetch</td><td>Ajustar CSS de lista</td></tr>
+<tr><td><code>opacity: 0</code> → <code>hidden</code></td><td>5</td><td>Perdés la transición de opacidad; se recupera con <code>allow-discrete</code> si importa</td></tr>
+<tr><td>Handler de <kbd>Escape</kbd> + retorno de foco</td><td>6</td><td>Cinco líneas</td></tr>
+<tr><td><code>min-height: 44px</code></td><td>7 (2.5.8)</td><td>El menú es más alto. Es una decisión de diseño, no técnica</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-javascript">// Y el chequeo que queda escrito, para que la corrección no se degrade sola.
+// Nótese que NO usa selectores CSS: usa rol y nombre accesible, que es
+// exactamente lo que ve la tecnología asistiva.
+test('el menú de cuenta se opera con teclado', async ({ page }) =&gt; {
+  await page.goto('/');
+  const boton = page.getByRole('button', { name: 'Mi cuenta' });
+
+  await expect(boton).toHaveAttribute('aria-expanded', 'false');
+  await boton.focus();
+  await page.keyboard.press('Enter');
+  await expect(boton).toHaveAttribute('aria-expanded', 'true');
+
+  // Los ítems son enlaces reales y están en el árbol
+  await expect(page.getByRole('link', { name: 'Cerrar sesión' })).toBeVisible();
+
+  await page.keyboard.press('Escape');
+  await expect(boton).toHaveAttribute('aria-expanded', 'false');
+  await expect(boton).toBeFocused();          // el foco volvió al disparador
+});</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá <code>&lt;button&gt;</code>".</strong> Son tres. <strong>(a)</strong> axe dio una sola violación en un componente completamente inutilizable con teclado: la herramienta funcionó bien y aun así el resultado engañó a todo el equipo. <strong>(b)</strong> La reescritura correcta tiene <em>menos</em> código que la original, porque delegar en la plataforma es siempre más barato que reimplementarla. <strong>(c)</strong> La decisión que más valor aportó no fue técnica sino de diseño: elegir <em>disclosure</em> en vez de <em>menu</em>. Eso no lo detecta ninguna herramienta ni lo arregla ningún atributo.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Un botón muestra el texto visible "Guardar cambios" y tiene <code>aria-label="Guardar"</code>. ¿Qué está mal y a quién afecta?</summary>
+<p>Dos cosas. Primero, <code>aria-label</code> tiene mayor precedencia que el contenido en el cálculo del nombre accesible, así que el nombre pasa a ser "Guardar" y <strong>el texto visible desaparece del árbol de accesibilidad</strong>: no aporta información, la reemplaza. Segundo, y más grave, el nombre accesible ya no contiene el texto visible, lo que rompe <strong>WCAG 2.5.3 Label in Name (nivel A)</strong>. Afecta directamente a los usuarios de <em>control por voz</em> (Dragon, Voice Control, Voice Access): dicen "hacé clic en Guardar cambios" —lo que leen en la pantalla— y no pasa nada, porque el sistema busca por nombre accesible. El control queda inalcanzable. La corrección es borrar el <code>aria-label</code>: el texto visible ya era un nombre perfecto. Si hiciera falta desambiguar, se agrega texto oculto <em>dentro</em> del botón, no un atributo que lo tape.</p></details>
+
+<details><summary>Después de una navegación en tu SPA actualizás <code>document.title</code>. ¿Por qué eso solo no alcanza y qué más hay que hacer?</summary>
+<p>Porque en una navegación real el navegador hace <strong>tres</strong> cosas para la tecnología asistiva: carga un documento nuevo, anuncia el título y <strong>resetea el foco</strong> al principio. Un router del cliente no dispara ninguna: cambiar el título por script no genera un anuncio confiable en todos los lectores, y sobre todo el foco se queda donde estaba —típicamente en un enlace de un menú que acaba de desmontarse, con lo cual cae a <code>&lt;body&gt;</code> y el siguiente <kbd>Tab</kbd> arranca desde el logo, cada vez—. El patrón completo es: actualizar <code>document.title</code>, <strong>mover el foco</strong> a un contenedor con <code>tabindex="-1"</code> (el <code>&lt;h1&gt;</code> de la vista nueva, o el <code>&lt;main&gt;</code>), y opcionalmente reforzar con un anuncio en una live region <code>polite</code> que ya exista en el DOM. Sin el paso del foco, el usuario de lector de pantalla no tiene forma de saber que la página cambió ni desde dónde seguir leyendo.</p></details>
+
+<details><summary>axe reporta cero violaciones en tu checkout. ¿Podés decirle al cliente que es accesible?</summary>
+<p>No. Podés decir que <strong>no quedan problemas de los que axe detecta</strong>, que es entre el 30% y el 40% de los criterios de WCAG y solo los que se deciden mirando el marcado. Sigue sin verificarse todo lo que requiere juicio: si el orden de foco es coherente, si los <code>alt</code> describen las imágenes, si los nombres de los botones corresponden a lo que hacen, si los mensajes de error explican qué hacer, si se puede completar el flujo entero solo con teclado, si funciona al 400% de zoom, si el modal devuelve el foco. Antes de afirmar nada hacen falta, como mínimo, los cinco tests manuales: teclado solo, un lector de pantalla real, zoom al 400%, zoom de texto al 200%, y <code>prefers-reduced-motion</code> más <code>forced-colors</code>. Y aun entonces, la conformidad es una afirmación fechada sobre <em>ese</em> proceso: el próximo deploy la vence.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>La tecnología asistiva no lee tu DOM: lee el <strong>árbol de accesibilidad</strong>, donde cada nodo tiene <strong>rol, nombre, estado y valor</strong>. Todo el módulo se reduce a controlar esas cuatro cosas, y el panel de accesibilidad de DevTools es la única fuente de verdad.</li>
+  <li>El <strong>nombre accesible</strong> se calcula con precedencia <code>aria-labelledby</code> &gt; <code>aria-label</code> &gt; marcado nativo/contenido &gt; <code>title</code>. Un <code>aria-label</code> mal puesto no agrega: <strong>tapa</strong> el contenido y rompe WCAG 2.5.3 para los usuarios de control por voz.</li>
+  <li><strong>Primera regla de ARIA: no uses ARIA.</strong> ARIA declara, no implementa: <code>role="button"</code> no responde a <kbd>Enter</kbd> y <code>aria-disabled</code> no bloquea nada. Un <code>&lt;button&gt;</code> nativo trae foco, teclado, estados, integración con formularios y visibilidad en alto contraste forzado — gratis y sin bugs.</li>
+  <li><strong>Foco:</strong> el orden lo manda el DOM, no el CSS; <code>tabindex</code> solo <code>0</code> y <code>-1</code> (positivo jamás); estilá <code>:focus-visible</code> con <code>outline</code>, no con <code>box-shadow</code>; y en cada modal guardá el disparador para devolverle el foco al cerrar. <code>&lt;dialog&gt;</code> e <code>inert</code> eliminan casi todo el código artesanal.</li>
+  <li><strong>Widgets:</strong> seguí la APG. El disclosure escribilo; el combobox y el árbol delegalos en una librería auditada. Y <code>role="menu"</code> es para acciones de aplicación, <strong>nunca</strong> para navegación de sitio.</li>
+  <li><strong>Contenido dinámico:</strong> la live region tiene que existir vacía antes del mensaje; <code>assertive</code> solo para lo que bloquea. En una SPA, cada navegación necesita título nuevo <strong>más</strong> movimiento explícito del foco.</li>
+  <li><strong>Testing:</strong> las herramientas automáticas cubren el 30–40% de los criterios; el WebAIM Million 2026 encontró fallas detectables en el <strong>95,9%</strong> de las home pages, con 56,1 errores de promedio y subiendo. Los cinco tests manuales (teclado, lector real, 400%, texto al 200%, reduced-motion/forced-colors) valen más que cualquier escáner. En CI, <em>baseline</em> más tests de orden de foco.</li>
+  <li><strong>Legal 2026:</strong> WCAG 2.2 AA es el objetivo real; WCAG 3.0 sigue en borrador (marzo de 2026, 174 requisitos, Bronze/Silver/Gold) con Recomendación no antes de 2028. La <strong>EAA</strong> rige desde el 28 de junio de 2025 y su fiscalización se intensificó en 2026. En EE.UU. el DOJ prorrogó el Título II al <strong>26 de abril de 2027</strong> (entidades grandes) sin cambiar el estándar. Los <strong>overlays</strong> no dan conformidad: accessiBe pagó 1 millón de dólares a la FTC por afirmar lo contrario.</li>
+  <li><strong>AAA no es un nivel al que se aspira globalmente</strong> —el propio W3C lo desaconseja—: es un objetivo por criterio. AA como piso, más una lista corta y escrita de criterios AAA donde son baratos o el riesgo lo justifica.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Abrí el árbol de accesibilidad completo (Chrome DevTools, panel Accessibility) en tres sitios que uses todos los días. Anotá, para cada uno, cuántos nodos <code>generic</code> encontrás donde debería haber un control, y cuántos controles tienen nombre accesible vacío.</li>
+  <li>Escribí cinco variantes de un mismo botón usando cada fuente de nombre accesible (<code>aria-labelledby</code>, <code>aria-label</code>, contenido, <code>title</code>, y las dos primeras combinadas). Verificá en DevTools qué nombre calcula el navegador en cada caso y confirmá el orden de precedencia sin mirar la tabla.</li>
+  <li>Tomá un componente propio hecho con <code>div</code> y <code>onclick</code> y reescribilo con elementos nativos. Contá las líneas de JavaScript antes y después, y anotá qué comportamientos recuperaste gratis.</li>
+  <li>Recorré tu proyecto solo con teclado durante diez minutos, con el mouse desenchufado. Anotá cada lugar donde <strong>(a)</strong> perdiste de vista el foco, <strong>(b)</strong> no pudiste hacer algo que sí se puede con mouse, <strong>(c)</strong> no pudiste salir de algo que abriste.</li>
+  <li>Instalá NVDA (Windows) o activá VoiceOver (<kbd>Cmd</kbd>+<kbd>F5</kbd> en macOS) y navegá una página tuya con los ojos cerrados durante cinco minutos. Escribí las tres cosas que más te sorprendieron.</li>
+  <li>Implementá el patrón completo de anuncio de navegación de SPA (título + foco + live region) en tu router. Verificá con un lector de pantalla que la navegación se anuncia y que el siguiente <kbd>Tab</kbd> arranca dentro del contenido nuevo.</li>
+  <li>Agregá <code>@axe-core/playwright</code> a tu CI con estrategia de baseline: archivá las violaciones actuales y hacé fallar el build solo ante violaciones <em>nuevas</em>. Sumá un test que congele el orden de tabulación de tu flujo más importante.</li>
+  <li>Auditá un formulario tuyo contra los cuatro criterios nuevos de WCAG 2.2 que más rompen (2.4.11, 2.5.7, 2.5.8, 3.3.8). Para cada falla, estimá el costo de corregirla y decidí explícitamente si se corrige o se documenta como deuda con fecha.</li>
+</ol>
+
+<section class="quiz" id="quizFS6">
+  <style>
+    #quizFS6{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizFS6 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizFS6 .q{margin-bottom:1.5rem}
+    #quizFS6 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizFS6 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizFS6 .opt:hover{border-color:var(--accent)}
+    #quizFS6 .opt:disabled{cursor:default}
+    #quizFS6 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizFS6 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizFS6 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizFS6 .exp.show{display:block}
+    #quizFS6 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un dropdown hecho con <code>div</code> y <code>onclick</code> pasa el escaneo de axe con una sola violación de contraste, pero no se puede abrir con teclado. ¿Qué te dice eso sobre el proceso del equipo?</p>
+    <button class="opt">Que axe tiene un bug: debería haber detectado los <code>div</code> sin rol</button>
+    <button class="opt">Que hay que subir la severidad de las reglas de axe a "crítica" y volver a escanear</button>
+    <button class="opt">Que el equipo confundió "sin violaciones automatizables" con "accesible": las herramientas cubren el 30–40% de los criterios y no pueden juzgar orden ni operabilidad de foco</button>
+    <div class="exp">axe funcionó exactamente como está diseñado: es conservador para no producir falsos positivos, y un <code>div</code> con texto no es objetable por análisis del marcado. Lo que falta no es configuración sino los tests manuales — empezando por el más barato de todos: recorrer el flujo con <kbd>Tab</kbd> y sin mouse. Cero violaciones es una métrica de cuántos problemas <em>automatizables</em> están resueltos, no de accesibilidad.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tenés <code>&lt;button aria-label="Cerrar"&gt;Cancelar suscripción&lt;/button&gt;</code>. ¿Cuál es el problema más grave?</p>
+    <button class="opt">El <code>aria-label</code> reemplaza al contenido en el nombre accesible: el texto visible desaparece del árbol y los usuarios de control por voz no pueden activar el botón (falla WCAG 2.5.3)</button>
+    <button class="opt">Ninguno serio: <code>aria-label</code> es información adicional que se suma al texto visible</button>
+    <button class="opt">Que <code>aria-label</code> no se puede usar en <code>&lt;button&gt;</code>, solo en elementos con <code>role</code> explícito</button>
+    <div class="exp">En el cálculo del nombre accesible, <code>aria-label</code> tiene más precedencia que el contenido del elemento: no agrega, <strong>tapa</strong>. El nombre resultante es "Cerrar" y "Cancelar suscripción" deja de existir para la tecnología asistiva. Alguien que usa Dragon o Voice Control dice lo que ve en pantalla y el sistema no encuentra ningún control con ese nombre — eso es exactamente lo que prohíbe <strong>WCAG 2.5.3 Label in Name (A)</strong>. La corrección es borrar el atributo.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tu empresa vende a consumidores en la UE. Marketing propone instalar un overlay de accesibilidad para "cumplir la European Accessibility Act". ¿Cuál es la respuesta técnicamente correcta?</p>
+    <button class="opt">Es razonable como solución temporal: los overlays cubren la mayoría de los criterios de WCAG mientras se remedia el código</button>
+    <button class="opt">Un overlay no da conformidad: parchea el DOM en runtime con heurísticas y no puede arreglar orden de foco, estructura ni semántica de widgets — y en 2025 la FTC multó a accessiBe con 1 millón de dólares por afirmar que sí lo hacía</button>
+    <button class="opt">No hace falta nada: la EAA todavía no entró en vigencia y el primer vencimiento recién es en 2030</button>
+    <div class="exp">La EAA es aplicable a productos y servicios nuevos <strong>desde el 28 de junio de 2025</strong> —2030 es solo el tope para contratos de servicio firmados antes de esa fecha— y durante 2026 la fiscalización se intensificó. Sobre los overlays: la FTC concluyó que las afirmaciones de conformidad de accessiBe no estaban respaldadas por evidencia, y más de 800 empresas con overlays instalados fueron demandadas igual. Un widget en runtime no puede corregir el orden de tabulación, la estructura de encabezados, la gestión de foco de un modal ni la semántica de un widget: eso se arregla en el código fuente, que es lo que miran tanto un escáner como un perito.</div>
+  </div>
+
+  <div class="score" id="scoreFS6"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizFS6');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreFS6').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con FS7.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../fs5-css-escala/lecture.html">← FS5: CSS a escala</a>
+  <a href="../fs7-build-entrega/lecture.html">FS7: Build y entrega →</a>
+</nav>
+
+</div>
+</body>
+</html>

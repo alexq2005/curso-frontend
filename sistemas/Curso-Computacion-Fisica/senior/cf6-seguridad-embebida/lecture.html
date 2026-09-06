@@ -1,0 +1,1064 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CF6 — Seguridad embebida: el atacante tiene el dispositivo en la mano · Computación Física Senior</title>
+  <meta name="description" content="Modelo de amenazas de un dispositivo físico, secure boot y cadena de confianza, actualización firmada con anti-rollback, almacenamiento de claves, cripto en MCU, JTAG/SWD en producción, glitching y canales laterales a nivel de mecanismo y contramedida, TRNG, identidad por dispositivo y la normativa CRA / RED / ETSI EN 303 645.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física Senior</a>
+  <a href="../../index.html">⚡ Curso de Computación Física</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CF6</span>
+  <span class="badge">⏱ 70–140 min</span>
+  <span class="badge">🎯 Pre-req: CF2 (arquitectura de firmware) + CF3 (energía)</span>
+  <span class="badge">🔐 Seguridad defensiva</span>
+</div>
+
+<article>
+
+<h1>CF6 — Seguridad embebida: el atacante tiene el dispositivo en la mano</h1>
+
+<blockquote class="author">"En seguridad web discutís cuánto confiás en el cliente. En seguridad embebida el cliente <em>es</em> el atacante, y está sentado con un soldador." — el cambio de modelo</blockquote>
+
+<div class="danger">
+  <strong>⚖️ Alcance y encuadre legal de este módulo.</strong> Todo lo que sigue es <strong>defensivo</strong>: se explica cómo funcionan los ataques para poder <em>detectarlos, prevenirlos y auditar los propios diseños</em>. No vas a encontrar acá exploits funcionales, herramientas ofensivas operativas, parámetros de ataque ni procedimientos reproducibles para extraer una clave de un dispositivo. Analizar, sondear o intentar acceder a hardware ajeno sin autorización escrita del titular puede constituir delito: en Argentina la <strong>Ley 26.388</strong> incorporó al Código Penal el acceso ilegítimo a sistemas informáticos (art. 153 bis) y el daño informático (arts. 183 y 184), y a eso se suman las cláusulas contractuales y la propiedad intelectual del firmware. <strong>La práctica va sobre equipos propios</strong>, sobre placas de evaluación que compraste, o dentro de un programa de divulgación con permiso explícito y por escrito.
+</div>
+
+<h2>CF6.0 Por qué este módulo</h2>
+
+<p>Todo lo que aprendiste sobre seguridad hasta acá asume, sin decirlo, una frontera: el servidor está de un lado y el atacante del otro, y entre los dos hay una red. Esa frontera es la que hace que tenga sentido hablar de TLS, de <em>rate limiting</em>, de rotar una clave comprometida. Es la que hace que un secreto en el servidor sea, efectivamente, un secreto.</p>
+
+<p>En un dispositivo embebido esa frontera no existe. El producto que diseñaste se vende en una caja, se lo lleva cualquiera, y una fracción de esos "cualquiera" va a abrirlo. Con tiempo. Con una estación de soldadura, un analizador lógico de sesenta dólares y una fuente de laboratorio. Sin apuro, sin un WAF que le corte la conexión, sin logs que lo delaten, y con la posibilidad de comprar diez unidades más si rompe la primera.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> La seguridad embebida no es "la misma seguridad, más chica". Es <strong>otro modelo de amenazas</strong>, porque cambia el supuesto más básico de todos: el atacante tiene <em>acceso físico ilimitado</em> al sistema que querés proteger. De ahí se derivan tres consecuencias que no tienen equivalente en la web: <strong>(1)</strong> cualquier cosa escrita en la flash es legible salvo que hardware específico lo impida, <strong>(2)</strong> el atacante puede alterar el <em>entorno físico</em> de ejecución —tensión, reloj, temperatura— y con eso alterar lo que ejecuta tu código, y <strong>(3)</strong> puede <em>observar</em> el consumo eléctrico del chip mientras opera y aprender de eso. Nada de esto se arregla con más código.
+</div>
+
+<div class="analogy">
+  <strong>🔎 La analogía útil.</strong> Un servidor es una caja fuerte en un banco: el atacante tiene que llegar hasta ella. Un dispositivo IoT es una caja fuerte que vos <strong>le enviaste por correo a la casa del ladrón</strong>, junto con las herramientas para abrirla y todo el tiempo del mundo. La pregunta ya no es "¿puede abrirla?" —a fuerza de plata y horas, casi siempre puede—; la pregunta es <strong>"¿cuánto le cuesta abrirla, y qué gana adentro"</strong>. Todo el módulo es una forma sistemática de subir el numerador y bajar el denominador.
+</div>
+
+<p>Y hay una razón de coyuntura para estudiarlo <em>ahora</em>. Durante veinte años la seguridad embebida fue opcional: un diferencial que algunos fabricantes ofrecían y la mayoría ignoraba. Eso se terminó por vía regulatoria. Desde el <strong>1 de agosto de 2025</strong> los requisitos de ciberseguridad del <em>Radio Equipment Directive</em> son obligatorios para todo equipo de radio conectado que se venda en la UE, y a partir del <strong>11 de septiembre de 2026</strong> empiezan a regir las obligaciones de <em>reporte</em> del <strong>Cyber Resilience Act</strong>, con la aplicación plena el <strong>11 de diciembre de 2027</strong>. Un producto que hoy no tiene secure boot ni un canal de actualización firmado no es un producto "con menos features": dentro de poco es un producto que no se puede poner en el mercado europeo.</p>
+
+<div class="info">
+  <strong>Qué NO cubre este módulo, y dónde está.</strong> Los fundamentos de criptografía —qué es AES, qué es una firma digital, qué garantiza un hash— y el modelado de amenazas genérico se dan en el <a href="../../../Curso-Ciberseguridad/m01-criptografia/lecture.html">módulo de criptografía</a> y en <a href="../../../Curso-Ciberseguridad/senior/cs1-threat-modeling/lecture.html">CS1 — Threat modeling</a> del Curso de Ciberseguridad. Acá damos por sabido todo eso y nos concentramos en lo que <em>cambia</em> cuando el sistema es un chip de 64 KB de RAM que el atacante puede desoldar.
+</div>
+
+<h2>CF6.1 El modelo de amenazas de un dispositivo físico</h2>
+
+<p>Un modelo de amenazas es una respuesta ordenada a cuatro preguntas: <strong>qué protejo</strong>, <strong>de quién</strong>, <strong>qué puede hacer ese alguien</strong> y <strong>qué asumo que no puede hacer</strong>. La cuarta es la que casi nadie escribe y la única que después se puede auditar.</p>
+
+<h3>Los activos: qué estás protegiendo realmente</h3>
+
+<p>El error de arranque más común es creer que el activo es "el dispositivo". No lo es. En un producto conectado hay al menos cuatro activos con valores, dueños y consecuencias distintas:</p>
+
+<table>
+<thead><tr><th>Activo</th><th>Qué pasa si se compromete</th><th>Quién pierde</th><th>¿Es recuperable?</th></tr></thead>
+<tbody>
+<tr><td><strong>El firmware</strong> (propiedad intelectual)</td><td>Clonación del producto, competencia con tu propio código, ingeniería inversa de algoritmos</td><td>La empresa</td><td>No: una vez extraído, está extraído</td></tr>
+<tr><td><strong>Las claves criptográficas</strong></td><td>Suplantación del dispositivo, firmado de firmware falso, lectura de tráfico</td><td>Empresa + todos los usuarios</td><td>Solo si hay rotación y revocación previstas</td></tr>
+<tr><td><strong>Los datos del usuario</strong> (mediciones, audio, ubicación, credenciales de Wi-Fi)</td><td>Violación de privacidad, exposición regulatoria (GDPR / Ley 25.326)</td><td>El usuario</td><td>No</td></tr>
+<tr><td><strong>La red a la que se conecta</strong></td><td>El dispositivo se vuelve pivote hacia la LAN doméstica o la red industrial</td><td>El usuario y terceros</td><td>Parcialmente, si hay segmentación</td></tr>
+<tr><td><strong>La integridad funcional</strong></td><td>El dispositivo hace algo peligroso: abre una puerta, apaga una bomba, falsea una medición</td><td>Puede ser una persona física</td><td>Depende del daño</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El activo más caro casi nunca es el que estás mirando.</strong> Muchos equipos protegen obsesivamente el firmware (su IP) y dejan las credenciales de Wi-Fi del usuario en texto plano en un sector de flash. La IP vale lo que vale tu empresa; las credenciales de Wi-Fi valen la red entera de una casa o una planta. <strong>Ordená los activos por daño a terceros, no por daño propio</strong> — es además lo que te va a exigir la normativa.
+</div>
+
+<h3>Las capacidades del atacante: definí niveles, no un "atacante" abstracto</h3>
+
+<p>"Un atacante" no es una categoría útil. Lo que sirve es una escala de capacidades con costo asociado, porque tu diseño va a apuntar a un escalón concreto y a declararlo:</p>
+
+<table>
+<thead><tr><th>Nivel</th><th>Qué puede hacer</th><th>Equipamiento y costo típico</th><th>Tiempo</th></tr></thead>
+<tbody>
+<tr><td><strong>N0 — Remoto</strong></td><td>Hablar con el dispositivo por la red: puertos abiertos, API, protocolo propio</td><td>Una notebook. USD 0</td><td>Minutos</td></tr>
+<tr><td><strong>N1 — Curioso con destornillador</strong></td><td>Abrir la caja, identificar chips, buscar el datasheet, conectar UART si hay pines expuestos</td><td>Destornillador, adaptador USB-serie. USD 20</td><td>Horas</td></tr>
+<tr><td><strong>N2 — Hobbista con banco</strong></td><td>Leer buses SPI/I²C con analizador lógico, desoldar y volcar una flash externa, intentar depuración por JTAG/SWD</td><td>Analizador lógico, estación de aire caliente, programador. USD 200–600</td><td>Días</td></tr>
+<tr><td><strong>N3 — Laboratorio comercial</strong></td><td>Inyección de fallos por tensión y reloj, análisis de consumo, medición de tiempos con precisión</td><td>Osciloscopio, plataforma de inyección de fallos, sondas. USD 5.000–50.000</td><td>Semanas</td></tr>
+<tr><td><strong>N4 — Laboratorio de silicio</strong></td><td>Decapsulado químico del chip, sondeo con microscopía, inyección de fallos por láser, edición del circuito con haz de iones</td><td>Sala limpia, FIB, microscopio. USD 1.000.000 y personal especializado</td><td>Meses</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El salto que importa está entre N1 y N2.</strong> La mayoría de los productos que se rompen públicamente caen en N1 o N2: un header de depuración con la serigrafía intacta, una flash SPI externa sin cifrar, un firmware que se descarga sin autenticar del sitio del fabricante. <strong>Diseñar contra N2 cubre el 95% de los incidentes reales</strong> y cuesta relativamente poco. Diseñar contra N4 es un proyecto de años y solo tiene sentido en tarjetas de pago, módulos SIM, HSM y poco más.
+</div>
+
+<h3>Los supuestos: la parte que hay que escribir</h3>
+
+<p>Un modelo de amenazas sin supuestos explícitos es una lista de deseos. Los supuestos son las afirmaciones que, si dejan de valer, invalidan el diseño entero — y por eso son lo primero que hay que revisar cuando aparece un incidente:</p>
+
+<div class="step">
+  <strong>Plantilla de supuestos para un producto embebido.</strong> Escribila en el repositorio, no en una reunión.
+  <ul>
+    <li><strong>S1.</strong> Asumimos que el atacante tiene acceso físico permanente a al menos una unidad y puede destruirla.</li>
+    <li><strong>S2.</strong> Asumimos que todo lo almacenado en flash interna sin protección de lectura es legible.</li>
+    <li><strong>S3.</strong> Asumimos que todo lo que viaja por un bus externo (SPI, I²C, UART) es observable con USD 200 de equipo.</li>
+    <li><strong>S4.</strong> <em>No</em> nos protegemos contra un adversario con capacidad de decapsulado (N4). Si el activo lo justifica, cambia el diseño y cambia el chip.</li>
+    <li><strong>S5.</strong> Asumimos que la máquina de aprovisionamiento en fábrica es de confianza; si esa máquina cae, cae la flota. (Este supuesto tiene su propio plan de mitigación.)</li>
+    <li><strong>S6.</strong> Asumimos que una unidad comprometida <em>no</em> compromete a las demás. Este supuesto es el que rompe la clave compartida de flota.</li>
+  </ul>
+</div>
+
+<div class="mistake">
+  <strong>El antipatrón: "seguridad por oscuridad de la placa".</strong> "Nadie va a saber que ese pin es SWD", "el protocolo es propietario", "hay que desoldar el chip". Todo eso <em>sube el costo del ataque en horas</em>, que es útil, pero no es una defensa: se rompe una vez, se publica una vez, y a partir de ahí el costo para el siguiente es cero. La oscuridad es una capa de <strong>demora</strong>, nunca la capa de fondo. La prueba práctica: preguntate qué queda en pie el día que alguien publique el <em>writeup</em> completo. Lo que quede en pie es tu seguridad real.
+</div>
+
+<h2>CF6.2 Secure boot y la cadena de confianza</h2>
+
+<p>Secure boot responde a una sola pregunta: <strong>¿el código que estoy por ejecutar es el que yo autoricé?</strong> Y la responde antes de saltar a ese código, no después.</p>
+
+<p>La estructura es siempre la misma, cambian los nombres. Hay una <strong>raíz de confianza</strong> (<em>root of trust</em>) que no se puede modificar: típicamente unas pocas kilopalabras de ROM grabadas en la máscara del chip en fábrica, más un hash o una clave pública almacenados en memoria de una sola escritura. Esa ROM verifica la firma de la etapa siguiente, y solo si verifica, salta. La etapa siguiente hace lo mismo con la que sigue. Una cadena.</p>
+
+<pre><code class="lang-c">/* Estructura de una imagen firmada — esquema conceptual.
+   En la práctica usás un formato ya definido (MCUboot, ESP-IDF, SBSFU)
+   en vez de inventar el tuyo: el formato propio es donde aparecen los bugs. */
+
+#include &lt;stdint.h&gt;
+
+#define IMG_MAGIC   0x96F3B83Du
+
+typedef struct {
+    uint32_t magic;          /* identifica el formato                        */
+    uint32_t hdr_size;       /* dónde empieza el payload                     */
+    uint32_t img_size;       /* cuántos bytes cubre la firma                 */
+    uint32_t version;        /* MONOTÓNICA: la base del anti-rollback        */
+    uint8_t  key_id;         /* qué clave pública verifica esta imagen       */
+    uint8_t  alg;            /* p.ej. ECDSA-P256 + SHA-256                   */
+    uint16_t flags;
+    uint8_t  signature[64];  /* r || s de la firma ECDSA                     */
+} img_header_t;</code></pre>
+
+<div class="rule">
+  <strong>📌 La firma cubre el header <em>y</em> el payload.</strong> Si la firma cubre solo el binario, un atacante puede alterar el header —por ejemplo, el campo <code>version</code>— sin romperla. Es un error de diseño clásico: el campo que usás para decidir si aceptás la imagen queda fuera de lo que la firma protege. Regla general: <strong>todo campo del que dependa una decisión de seguridad tiene que estar adentro de lo firmado</strong>, con la sola excepción de la firma misma.
+</div>
+
+<h3>El eslabón que no verifica anula la cadena</h3>
+
+<p>Esta es la propiedad que hay que entender de memoria: <strong>una cadena de confianza vale lo que vale su eslabón más débil, y un eslabón que no verifica no es débil: es inexistente.</strong> Si la ROM verifica el bootloader, el bootloader verifica la aplicación, y la aplicación carga un blob de coeficientes DSP desde una flash SPI externa <em>sin verificar</em>, entonces todo el esfuerzo anterior protege exactamente nada si ese blob puede alterar el flujo de control.</p>
+
+<pre><code class="lang-c">/* El bug que más veces vi en revisiones de bootloader.
+   La verificación se hace, se loguea... y se continúa igual. */
+
+/* ❌ MAL: el resultado se calcula y se descarta */
+void arrancar_mal(void)
+{
+    int ok = verificar_firma(&amp;g_img);
+    if (!ok) {
+        log_warn("firma inválida");   /* y nada más */
+    }
+    saltar_a_aplicacion();            /* salta SIEMPRE */
+}
+
+/* ✅ BIEN: falla cerrada, sin ruta alternativa */
+void arrancar_bien(void)
+{
+    if (verificar_firma(&amp;g_img) != FIRMA_OK) {
+        marcar_imagen_invalida();
+        intentar_slot_alternativo();  /* A/B: ver CF2 */
+        entrar_en_modo_recuperacion();/* NO devuelve   */
+    }
+    saltar_a_aplicacion();
+}</code></pre>
+
+<div class="danger">
+  <strong>⛔ Fail-closed, siempre.</strong> En seguridad embebida, cuando algo no se puede verificar, el sistema <strong>no arranca esa imagen</strong>. Nunca "arranca igual y avisa". Este principio choca de frente con el instinto de disponibilidad del ingeniero de campo —"si no arranca, tengo un ladrillo en el techo de un cliente"— y por eso necesitás una <strong>ruta de recuperación diseñada</strong>: un slot de respaldo verificado, un modo de recuperación en ROM, un canal de actualización de emergencia. La recuperación es parte del diseño de secure boot, no un parche posterior.
+</div>
+
+<h3>El costo real de secure boot</h3>
+
+<table>
+<thead><tr><th>Costo</th><th>Magnitud típica (Cortex-M4 a 80 MHz)</th><th>Comentario</th></tr></thead>
+<tbody>
+<tr><td><strong>Tiempo de arranque</strong></td><td>+30 a +250 ms</td><td>SHA-256 de 256 KB más una verificación ECDSA-P256. Con acelerador por hardware baja a decenas de ms</td></tr>
+<tr><td><strong>Flash</strong></td><td>+8 a +30 KB</td><td>Bootloader con la biblioteca cripto mínima</td></tr>
+<tr><td><strong>RAM</strong></td><td>+2 a +8 KB</td><td>Buffers de hash y contexto de verificación</td></tr>
+<tr><td><strong>Energía por arranque</strong></td><td>+1 a +10 mJ</td><td>Crítico en un nodo a pila que arranca a cada rato: ver CF3</td></tr>
+<tr><td><strong>Complejidad de producción</strong></td><td>Alta</td><td>Infraestructura de firmado, custodia de la clave privada, línea de fábrica que provisiona</td></tr>
+<tr><td><strong>Riesgo de <em>bricking</em></strong></td><td>Real</td><td>Un error en el bootloader es irrecuperable en campo. Se testea más que ninguna otra parte</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El costo que subestiman todos es el último de la tabla.</strong> El bootloader es el único componente del sistema que <em>no podés actualizar de forma segura</em> con el mismo mecanismo que actualiza todo lo demás — actualizarlo es actualizarle el piso a quien está parado sobre él. Por eso el bootloader se mantiene <strong>chico, aburrido y sin features</strong>: cada línea que le agregás es una línea que no vas a poder arreglar. Si el proyecto tiene presupuesto para una sola auditoría externa, gastalo acá.
+</div>
+
+<div class="tip">
+  <strong>No escribas tu propio bootloader seguro.</strong> Usá <strong>MCUboot</strong> (multiplataforma, auditado, integrado con Zephyr y nRF Connect SDK), el secure boot de <strong>ESP-IDF</strong> en ESP32, o <strong>SBSFU</strong> en STM32. Ahorrás meses y, más importante, heredás años de bugs ajenos ya encontrados. El código de verificación de firma escrito a mano es un generador industrial de vulnerabilidades: comparaciones que salen antes de tiempo, largos que no se validan, punteros que se confían.
+</div>
+
+<h2>CF6.3 Actualización de firmware segura</h2>
+
+<p>Si tu producto vive cinco años en campo, la pregunta no es <em>si</em> va a necesitar una actualización, sino cuántas. Y el canal de actualización es, por lejos, <strong>el vector de ataque más valioso de todo el sistema</strong>: quien lo controla no ataca un dispositivo, ataca la flota entera desde un teclado. Es el único punto donde un atacante remoto (N0) puede lograr lo que en cualquier otro lado requeriría acceso físico.</p>
+
+<p>En <a href="../cf2-arquitectura-firmware/lecture.html">CF2</a> viste el mecanismo A/B: dos slots, se escribe en el inactivo, se marca, se reinicia, y si la imagen nueva no confirma en N arranques se vuelve sola a la anterior. Ese mecanismo resuelve la <strong>disponibilidad</strong>. Acá le agregamos la <strong>autenticidad</strong> y la <strong>frescura</strong>, que son propiedades distintas y hacen falta las tres.</p>
+
+<table>
+<thead><tr><th>Propiedad</th><th>Qué garantiza</th><th>Qué la provee</th><th>Qué pasa si falta</th></tr></thead>
+<tbody>
+<tr><td><strong>Autenticidad</strong></td><td>La imagen la produjo quien dice</td><td>Firma asimétrica verificada en el dispositivo</td><td>Cualquiera instala su firmware: control total remoto</td></tr>
+<tr><td><strong>Integridad</strong></td><td>No se alteró un byte en el camino</td><td>La misma firma (cubre el hash del payload)</td><td>Corrupción silenciosa, o alteración dirigida</td></tr>
+<tr><td><strong>Frescura</strong> (anti-rollback)</td><td>No es una versión vieja legítima</td><td>Contador monotónico en OTP o en un contador seguro</td><td>Se reinstala una versión firmada con un fallo ya parcheado</td></tr>
+<tr><td><strong>Confidencialidad</strong></td><td>El binario no se lee en tránsito</td><td>Cifrado del payload (opcional, protege IP)</td><td>Se extrae la IP y se estudia el binario, pero no se compromete el dispositivo</td></tr>
+<tr><td><strong>Disponibilidad</strong></td><td>Si sale mal, el equipo vuelve solo</td><td>A/B + confirmación + watchdog (CF2)</td><td>Ladrillos en campo, camión, costo</td></tr>
+</tbody>
+</table>
+
+<h3>Anti-rollback: por qué volver atrás es una vulnerabilidad</h3>
+
+<p>Esta es la propiedad que más se omite y la más contraintuitiva. La versión 1.3 de tu firmware tenía un desbordamiento en el parser del protocolo. La 1.4 lo arregló. Todos los dispositivos están en 1.4. ¿Estás bien?</p>
+
+<p>No, si el dispositivo acepta instalar la 1.3. Porque la 1.3 <strong>está firmada legítimamente por vos</strong> — la firma no caduca, y verificar la firma solo dice "esto lo hice yo", no "esto es lo último que hice". Un atacante con acceso al canal de actualización presenta la 1.3, el dispositivo verifica que la firma es válida, la instala, y el agujero vuelve. Después lo explota.</p>
+
+<div class="concept">
+  <strong>💡 Firma ≠ frescura.</strong> Una firma digital prueba <em>origen</em>, no <em>actualidad</em>. Para probar actualidad hace falta <strong>estado en el dispositivo que solo pueda avanzar</strong>: un contador que se incrementa y nunca puede volver atrás, ni con acceso físico. Ese contador vive en OTP/fuses o en un contador monotónico de un elemento seguro. Es exactamente el mismo problema que un <em>nonce</em> resuelve en un protocolo de red, con la diferencia de que acá el estado tiene que sobrevivir a que el atacante desconecte la batería.
+</div>
+
+<pre><code class="lang-c">/* Anti-rollback con contador monotónico en OTP.
+   La versión de seguridad es distinta de la versión de producto:
+   solo sube cuando la imagen nueva arregla algo que hace inaceptable
+   volver a la anterior. Quemar un bit de OTP es IRREVERSIBLE. */
+
+#include &lt;stdint.h&gt;
+#include &lt;stdbool.h&gt;
+
+bool aceptar_imagen(const img_header_t *h)
+{
+    if (verificar_firma_de(h) != FIRMA_OK)
+        return false;                       /* autenticidad */
+
+    uint32_t minimo = otp_leer_version_minima();
+    if (h-&gt;sec_version &lt; minimo) {
+        log_warn("rollback rechazado: %u &lt; %u", h-&gt;sec_version, minimo);
+        return false;                       /* frescura     */
+    }
+    return true;
+}
+
+/* Se llama DESPUÉS de que la imagen nueva confirmó que arranca y funciona
+   (CF2: el flag de confirmación tras N arranques sanos). Adelantarse acá
+   es como quemarse el puente de vuelta antes de cruzar. */
+void confirmar_y_avanzar(const img_header_t *h)
+{
+    if (h-&gt;sec_version &gt; otp_leer_version_minima())
+        otp_quemar_version_minima(h-&gt;sec_version);   /* irreversible */
+}</code></pre>
+
+<div class="danger">
+  <strong>⛔ El contador de OTP es un recurso finito y de un solo sentido.</strong> Un chip típico da entre 16 y 64 incrementos en toda la vida del producto. Si incrementás la versión de seguridad en cada release, a los dos años te quedaste sin cuenta y el producto ya no puede recibir protección anti-rollback nunca más. Y si lo incrementás <em>antes</em> de confirmar que la imagen nueva funciona, y la imagen nueva no funciona, acabás de convertir el dispositivo en un ladrillo: no puede avanzar y ya no puede volver. <strong>Separá la versión de producto (sube siempre) de la versión de seguridad (sube solo cuando volver atrás es inaceptable), y quemá el fusible solo después de la confirmación.</strong>
+</div>
+
+<h3>Firmado: dónde vive la clave privada</h3>
+
+<p>La clave privada que firma tus imágenes es <strong>el activo más valioso de la empresa</strong>, medido en daño potencial. Si se filtra, cualquiera puede firmar firmware que todos tus dispositivos van a aceptar como legítimo, y no hay actualización que lo arregle porque el atacante puede firmar la actualización también.</p>
+
+<pre><code class="lang-bash"># Generación del par de claves de firma. Esto se hace UNA vez,
+# en una máquina aislada, y la privada NO sale de ahí.
+# En producción esta clave vive en un HSM o en un servicio de firmado,
+# nunca en el repositorio ni en el runner de CI.
+
+openssl ecparam -name prime256v1 -genkey -noout -out firma-priv.pem
+openssl ec -in firma-priv.pem -pubout -out firma-pub.pem
+
+# La PÚBLICA (o su hash) se graba en el dispositivo en fábrica.
+# Solo la pública viaja: si se filtra, no pasa nada.
+openssl ec -in firma-pub.pem -pubin -outform DER -out firma-pub.der
+sha256sum firma-pub.der    # este hash es el que va en los fuses
+
+# Firmado de una imagen con MCUboot (la herramienta hace header + firma):
+imgtool sign \
+  --key firma-priv.pem \
+  --header-size 0x200 \
+  --align 8 \
+  --version 1.4.0 \
+  --security-counter 3 \
+  --slot-size 0x40000 \
+  app.bin app-firmada.bin
+
+imgtool verify --key firma-pub.pem app-firmada.bin</code></pre>
+
+<div class="mistake">
+  <strong>Los tres lugares donde NO va la clave privada de firmado.</strong> <strong>(1)</strong> En el repositorio, ni siquiera cifrada ni en una rama vieja — el historial de git es para siempre. <strong>(2)</strong> Como variable de entorno del <em>runner</em> de CI, donde cualquier persona con permiso de escribir un workflow puede hacerla imprimir. <strong>(3)</strong> En la notebook del líder técnico "por ahora". Lo correcto: un servicio de firmado que recibe un artefacto y devuelve la firma, con la clave dentro de un HSM o un módulo en la nube, autenticación por identidad de máquina, y <strong>un registro auditable de cada firma emitida</strong>. Ese log es lo que te permite responder, el día del incidente, la única pregunta que importa: "¿esta imagen la firmamos nosotros?".
+</div>
+
+<div class="tip">
+  <strong>Grabá dos claves públicas, no una.</strong> Un dispositivo que confía en una sola clave de firmado no tiene forma de sobrevivir a la rotación de esa clave. Con dos claves autorizadas (o con un esquema de <em>key_id</em> y una lista) podés emitir una actualización firmada con la clave A que revoque la clave A e instale la confianza en la B. Cuesta unos cientos de bytes de OTP y es la diferencia entre "rotamos la clave" y "reemplazamos la flota". Este es el mismo razonamiento de gestión de claves que ves en <a href="../../../Curso-Ciberseguridad/senior/cs7-cripto-aplicada/lecture.html">CS7 — Criptografía aplicada</a>, aplicado a un contexto donde no hay servidor que reconfigurar.
+</div>
+
+<h2>CF6.4 Almacenamiento de claves: por qué una clave en flash es una clave pública</h2>
+
+<p>Escribiste una clave AES de 128 bits en un arreglo constante. El compilador la puso en <code>.rodata</code>, que terminó en la flash interna. Vos la ves como un secreto. El chip la ve como diecisiete bytes cualesquiera en la dirección 0x0800A3C0.</p>
+
+<pre><code class="lang-c">/* ❌ El antipatrón número uno de la industria embebida.
+   No importa cuántos comentarios amenazantes le pongas alrededor. */
+static const uint8_t clave_aes[16] = {
+    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};   /* ¡SECRETO! ¡NO TOCAR! */</code></pre>
+
+<p>Ese arreglo es recuperable por cualquiera que pueda leer la flash. Y "poder leer la flash" es más fácil de lo que suena: si la protección de lectura no está activada, un programador de USD 15 lo hace en segundos; si la flash es externa (una SPI NOR al lado del MCU), se lee del bus sin siquiera desoldarla; y si el firmware se puede descargar del sitio web del fabricante, ni siquiera hace falta el dispositivo.</p>
+
+<div class="rule">
+  <strong>📌 Regla operativa: un secreto que el CPU puede leer, un atacante también.</strong> La única forma de tener un secreto real en un dispositivo físico es que <strong>el CPU nunca lo lea</strong>: la clave vive dentro de un bloque de hardware que hace la operación criptográfica por vos y devuelve solo el resultado. Vos le pasás un <em>handle</em> ("clave número 3"), no una clave. Ese es el salto conceptual completo entre "guardar una clave" y "usar una clave sin tenerla".
+</div>
+
+<h3>Las opciones reales, con su costo</h3>
+
+<table>
+<thead><tr><th>Dónde vive la clave</th><th>Resiste hasta</th><th>Costo BOM</th><th>Costo de integración</th><th>Cuándo usarlo</th></tr></thead>
+<tbody>
+<tr><td><strong>Flash interna, en claro</strong></td><td>Nada (N1)</td><td>USD 0</td><td>Ninguno</td><td>Nunca, para un secreto real</td></tr>
+<tr><td><strong>Flash interna + protección de lectura (RDP)</strong></td><td>N1, parcialmente N2</td><td>USD 0</td><td>Bajo: activar un byte de opción</td><td>Línea base obligatoria. No es suficiente sola</td></tr>
+<tr><td><strong>OTP / fuses del MCU</strong></td><td>N2</td><td>USD 0</td><td>Bajo, pero <strong>irreversible</strong></td><td>Hash de la clave pública de firmado, contador anti-rollback, ID de dispositivo</td></tr>
+<tr><td><strong>Motor cripto con clave no legible</strong> (la clave se carga en un registro que el CPU no puede leer de vuelta)</td><td>N2, algo de N3</td><td>USD 0 (está en el chip)</td><td>Medio: hay que rediseñar el flujo</td><td>La mejor relación costo/beneficio en MCU moderno</td></tr>
+<tr><td><strong>TrustZone-M / mundo seguro</strong></td><td>N2–N3 frente a software</td><td>USD 0 en Cortex-M23/M33/M55</td><td><strong>Alto</strong>: dos proyectos, dos linkers, una API entre mundos</td><td>Cuando hay que aislar de tu propia aplicación y de bibliotecas de terceros</td></tr>
+<tr><td><strong>Secure element externo</strong> (ATECC608, SE05x, OPTIGA)</td><td>N3, a veces certificado contra N4</td><td>USD 0,50 – 3</td><td>Medio: un bus I²C más y una API</td><td>Identidad por dispositivo, TLS mutuo, claves que nunca deben salir</td></tr>
+<tr><td><strong>PUF</strong> (la clave se <em>deriva</em> de variaciones físicas del silicio, no se almacena)</td><td>N3–N4</td><td>Incluido en chips que lo traen</td><td>Medio-alto</td><td>Cuando no querés que la clave exista en ningún lado en reposo</td></tr>
+</tbody>
+</table>
+
+<h3>El cambio de mentalidad: del secreto al <em>handle</em></h3>
+
+<pre><code class="lang-c">/* ✅ El patrón correcto: la clave nunca aparece en tu espacio de memoria.
+   Ejemplo con la PSA Crypto API, que es el estándar de facto en MCU
+   y la interfaz que usan Mbed TLS, TF-M y varios elementos seguros. */
+
+#include "psa/crypto.h"
+
+/* En APROVISIONAMIENTO (fábrica): se importa una vez, con la política
+   de uso que va a tener para siempre. NO_EXPORT es la línea clave. */
+psa_status_t provisionar(const uint8_t *material, size_t len,
+                         psa_key_id_t *id_out)
+{
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+
+    psa_set_key_usage_flags(&amp;attr, PSA_KEY_USAGE_ENCRYPT |
+                                   PSA_KEY_USAGE_DECRYPT);
+    /* Sin PSA_KEY_USAGE_EXPORT: el hardware se niega a devolverla.
+       No es una convención de nuestro código: es una política que
+       el motor cripto hace cumplir. */
+    psa_set_key_algorithm(&amp;attr, PSA_ALG_GCM);
+    psa_set_key_type(&amp;attr, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&amp;attr, 256);
+    psa_set_key_lifetime(&amp;attr, PSA_KEY_LIFETIME_PERSISTENT);
+
+    return psa_import_key(&amp;attr, material, len, id_out);
+}
+
+/* En OPERACIÓN: solo circula el identificador. Un volcado completo
+   de la RAM del dispositivo no revela la clave, porque no está ahí. */
+psa_status_t cifrar(psa_key_id_t id,
+                    const uint8_t *nonce, size_t nonce_len,
+                    const uint8_t *claro, size_t claro_len,
+                    uint8_t *salida, size_t salida_cap, size_t *salida_len)
+{
+    return psa_aead_encrypt(id, PSA_ALG_GCM,
+                            nonce, nonce_len,
+                            NULL, 0,               /* datos asociados */
+                            claro, claro_len,
+                            salida, salida_cap, salida_len);
+}</code></pre>
+
+<div class="info">
+  <strong>Qué es realmente un OTP / fusible.</strong> Es memoria de una sola escritura: cada bit arranca en un estado y se puede llevar al otro <strong>una vez</strong>, físicamente (fundiendo una vía o programando una celda que no se puede borrar). No hay comando de "desquemar". Se usa para lo que tiene que ser inmutable de por vida: el hash de la clave pública de firmado, el número de serie, el contador anti-rollback, y los bits que deshabilitan la depuración. La contracara: <strong>un error de aprovisionamiento en fábrica es una placa a la basura</strong>, y por eso la línea de producción necesita su propio procedimiento de verificación antes de quemar nada.
+</div>
+
+<div class="warn">
+  <strong>TrustZone-M no es magia y cuesta caro en ingeniería.</strong> Divide el MCU en un mundo seguro y uno no seguro, con memoria, periféricos e interrupciones particionados. El beneficio es real: aunque tu aplicación tenga un desbordamiento explotable, el atacante queda del lado no seguro. El costo también: <strong>dos proyectos que compilar, dos scripts de linker, una capa de llamadas entre mundos (<em>veneers</em>) que hay que diseñar como si fuera una API pública</strong>, depuración más difícil, y un modelo mental nuevo para todo el equipo. Si nadie en el equipo lo usó antes, presupuestá semanas, no días. Y ojo: una API mal diseñada entre mundos —que acepta punteros del lado no seguro sin validar a qué apuntan— reintroduce exactamente el agujero que TrustZone venía a cerrar.
+</div>
+
+<h2>CF6.5 Cifrado en un MCU: qué entra en el presupuesto</h2>
+
+<p>La criptografía en un microcontrolador no se elige por elegancia matemática: se elige por <strong>ciclos, bytes de RAM, bytes de flash y microjoules</strong>. Un algoritmo perfectamente seguro que agota la pila de tu nodo en tres meses en vez de dos años es, para el producto, un algoritmo inservible.</p>
+
+<h3>Órdenes de magnitud que conviene tener en la cabeza</h3>
+
+<table>
+<thead><tr><th>Operación</th><th>Cortex-M4 a 80 MHz, software</th><th>Con acelerador HW</th><th>RAM de trabajo</th><th>Nota</th></tr></thead>
+<tbody>
+<tr><td>SHA-256, 1 KB</td><td>~ 130.000 ciclos (1,6 ms)</td><td>~ 10.000 ciclos</td><td>~ 200 B</td><td>Barato y omnipresente</td></tr>
+<tr><td>AES-128-GCM, 1 KB</td><td>~ 200.000 ciclos (2,5 ms)</td><td>~ 8.000 ciclos</td><td>~ 500 B</td><td>Acelerador AES en casi todo MCU moderno</td></tr>
+<tr><td>ChaCha20-Poly1305, 1 KB</td><td>~ 90.000 ciclos (1,1 ms)</td><td>rara vez acelerado</td><td>~ 400 B</td><td><strong>Gana cuando NO hay acelerador AES</strong></td></tr>
+<tr><td>ECDSA-P256, firmar</td><td>~ 4.000.000 ciclos (50 ms)</td><td>~ 300.000 ciclos</td><td>~ 3 KB</td><td>Cara, pero puntual</td></tr>
+<tr><td>ECDSA-P256, verificar</td><td>~ 9.000.000 ciclos (110 ms)</td><td>~ 600.000 ciclos</td><td>~ 3 KB</td><td>Es la del arranque seguro</td></tr>
+<tr><td>ECDH-P256</td><td>~ 4.500.000 ciclos (56 ms)</td><td>~ 350.000 ciclos</td><td>~ 3 KB</td><td>Una vez por sesión TLS</td></tr>
+<tr><td>RSA-2048, verificar</td><td>~ 3.000.000 ciclos</td><td>—</td><td>~ 6 KB</td><td>Verificar es barato…</td></tr>
+<tr><td>RSA-2048, firmar</td><td>~ 200.000.000 ciclos (2,5 s)</td><td>—</td><td>~ 8 KB</td><td>…firmar es prohibitivo en MCU</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Estos números son órdenes de magnitud, no una hoja de datos.</strong> Varían con la biblioteca (Mbed TLS, tinycrypt, wolfSSL, micro-ecc), el nivel de optimización, el ancho del bus de flash y si hay caché. <strong>Medilos en tu placa</strong> con un contador de ciclos (<code>DWT-&gt;CYCCNT</code> en Cortex-M) antes de comprometerte con un presupuesto de tiempo o de energía. Un valor medido vale más que cualquier tabla, incluida esta.
+</div>
+
+<h3>Por qué ECC y no RSA</h3>
+
+<p>Para un nivel de seguridad equivalente, RSA necesita claves de 2048 o 3072 bits mientras que una curva elíptica necesita 256. En un servidor eso da igual. En un MCU con 128 KB de flash y 20 KB de RAM la diferencia es estructural:</p>
+
+<ul>
+  <li><strong>Tamaño de clave y de firma:</strong> una firma ECDSA-P256 ocupa 64 bytes; una RSA-2048, 256. Multiplicado por cada certificado de una cadena TLS, eso es RAM que no tenés.</li>
+  <li><strong>Tamaño del certificado:</strong> una cadena X.509 con RSA-2048 puede pasar los 3 KB; con ECC baja a menos de 1 KB. En un enlace LPWAN, cada byte cuesta tiempo de aire y batería.</li>
+  <li><strong>Costo de firmar:</strong> si el dispositivo tiene que <em>firmar</em> (autenticación mutua, atestación), RSA es directamente inviable: segundos de CPU por operación.</li>
+  <li><strong>Aceleradores:</strong> los bloques de hardware de los MCU modernos aceleran curvas elípticas, no exponenciación modular grande.</li>
+</ul>
+
+<div class="tip">
+  <strong>Regla de selección rápida.</strong> ¿Tu MCU tiene acelerador AES? Usá <strong>AES-GCM</strong>. ¿No tiene? Usá <strong>ChaCha20-Poly1305</strong>: fue diseñado para ser rápido en software con operaciones de 32 bits, que es exactamente lo que un Cortex-M hace bien, y encima <strong>es naturalmente de tiempo constante</strong> (no usa tablas de sustitución indexadas por el secreto, que es de donde salen los canales laterales por caché). Para firma: <strong>ECDSA o Ed25519 sobre P-256/Curve25519</strong>. Para intercambio de claves: <strong>ECDH</strong>. RSA solo si un sistema legado te obliga.
+</div>
+
+<div class="danger">
+  <strong>⛔ El error fatal de AES-GCM en embebido: reutilizar el nonce.</strong> GCM es seguro <em>si y solo si</em> el par (clave, nonce) no se repite jamás. Un nonce que se reutiliza con la misma clave no debilita GCM: lo <strong>rompe</strong>, y expone además la clave de autenticación, con lo cual el atacante puede falsificar mensajes. Y en embebido esto pasa constantemente por una razón específica: <strong>el contador de nonce vive en RAM y el dispositivo se reinicia</strong>. Vuelve de cero, y arranca a repetir la secuencia entera de nonces que ya usó. Soluciones: contador persistido en almacenamiento no volátil, nonce derivado de un valor único de sesión negociado en cada conexión, o usar un modo que tolere repetición. Si el diseño depende de un contador en RAM, <strong>ya está roto</strong> y hay que asumirlo antes de fabricar.
+</div>
+
+<pre><code class="lang-c">/* Medición honesta del costo cripto en tu placa. Sin esto,
+   cualquier presupuesto de energía o latencia es una suposición. */
+#include &lt;stdint.h&gt;
+#include "core_cm4.h"
+
+static void ciclos_init(void)
+{
+    CoreDebug-&gt;DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT-&gt;CYCCNT = 0;
+    DWT-&gt;CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+void medir_verificacion(void)
+{
+    ciclos_init();
+    uint32_t t0 = DWT-&gt;CYCCNT;
+    (void) verificar_firma(&amp;g_img);
+    uint32_t t1 = DWT-&gt;CYCCNT;
+
+    uint32_t ciclos = t1 - t0;
+    uint32_t us     = ciclos / (SystemCoreClock / 1000000u);
+    /* Energía aproximada: ciclos x consumo medio x periodo.
+       Con 6 mA a 3,3 V y 80 MHz -&gt; ~0,25 nJ por ciclo. Ver CF3. */
+    printf("verificacion: %lu ciclos, %lu us\n", ciclos, us);
+}</code></pre>
+
+<div class="info">
+  <strong>Dónde se cruza esto con CF3 (energía).</strong> En un nodo alimentado a pila, la cripto no se paga en milisegundos: se paga en <strong>carga de la batería</strong>. Verificar una firma en cada arranque, en un dispositivo que arranca cada diez minutos, puede ser una fracción medible de la vida útil. Las salidas son de diseño, no de código: arrancar menos veces (mantener contexto en RAM retenida), usar el acelerador por hardware, o verificar la imagen completa solo tras una actualización y no en cada arranque —esto último es una decisión de riesgo explícita, que se documenta en el modelo de amenazas, no una optimización silenciosa.
+</div>
+
+<h2>CF6.6 Interfaces de depuración: la puerta que quedó abierta</h2>
+
+<p>JTAG y SWD existen para que vos puedas parar el núcleo, leer cualquier registro, leer y escribir cualquier dirección de memoria, y ejecutar paso a paso. Es exactamente la capacidad que un atacante querría tener. Un dispositivo en producción con depuración habilitada no tiene seguridad: tiene una interfaz de administración total, documentada por el fabricante del chip, con herramientas gratis.</p>
+
+<p>Es, de lejos, <strong>el hallazgo más frecuente en auditorías de hardware</strong>. No porque sea difícil de cerrar, sino porque cerrarlo es un paso de la línea de producción que alguien tiene que acordarse de hacer, y "acordarse" no es un control.</p>
+
+<h3>Los niveles de protección y qué significan de verdad</h3>
+
+<table>
+<thead><tr><th>Nivel (nomenclatura STM32, análoga en otras familias)</th><th>Qué permite</th><th>¿Reversible?</th><th>Uso</th></tr></thead>
+<tbody>
+<tr><td><strong>RDP 0</strong> — sin protección</td><td>Depuración completa, lectura y escritura de flash</td><td>Sí</td><td>Desarrollo. Nunca sale de la mesa</td></tr>
+<tr><td><strong>RDP 1</strong> — protección de lectura</td><td>El depurador conecta, pero no puede leer flash ni SRAM. Volver a RDP 0 <strong>borra toda la flash</strong></td><td>Sí, con borrado masivo</td><td>Producción con posibilidad de RMA/reprogramación</td></tr>
+<tr><td><strong>RDP 2</strong> — protección total</td><td>La interfaz de depuración queda deshabilitada de forma permanente</td><td><strong>No</strong></td><td>Producción de alto valor. Sin vuelta atrás jamás</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Los límites conocidos de estos niveles, dichos sin vueltas.</strong> Las protecciones de lectura son <strong>controles razonables, no garantías absolutas</strong>. Hay literatura académica revisada por pares que ha demostrado, en varias familias de microcontroladores de distintos fabricantes, que ciertos niveles de protección pueden ser evadidos por un adversario de nivel N3 con equipamiento de inyección de fallos, y que en algunos casos incluso un adversario N2 encontró rutas de degradación del nivel de protección. Esto <strong>no</strong> significa que no haya que activarlas —activarlas sigue siendo obligatorio y elimina de un plumazo al atacante N1 y a buena parte del N2—. Significa que <strong>no podés apoyar tu único secreto de flota sobre RDP y quedarte tranquilo</strong>. Consultá las notas de errata y los avisos de seguridad de tu fabricante para la familia y la revisión de silicio específicas que estés usando, y diseñá suponiendo que la protección puede fallar: defensa en profundidad, no un solo muro.
+</div>
+
+<h3>Cerrar la puerta, y verificar que quedó cerrada</h3>
+
+<div class="step">
+  <strong>Lista de control de depuración para producción.</strong>
+  <ul>
+    <li><strong>1.</strong> Activar el nivel de protección de lectura como parte del <em>script</em> de producción, no como un paso manual.</li>
+    <li><strong>2.</strong> Deshabilitar o proteger el puerto de acceso de depuración vía los bits de opción / fuses correspondientes.</li>
+    <li><strong>3.</strong> Quitar del firmware de producción todo lo que sea consola de depuración: <em>shell</em> UART, comandos de volcado de memoria, "modo fábrica" con contraseña fija.</li>
+    <li><strong>4.</strong> Verificar en la placa terminada, con la herramienta del fabricante, que el nivel es el esperado — y <strong>registrar ese resultado</strong> junto al número de serie.</li>
+    <li><strong>5.</strong> Auditar por muestreo: tomar N unidades de cada lote y confirmar que el estado de protección es el correcto. Un lote entero mal aprovisionado es un evento real y frecuente.</li>
+    <li><strong>6.</strong> Diseñar el flujo de RMA <em>antes</em>: ¿cómo se diagnostica una unidad devuelta si no podés conectar el depurador? La respuesta suele ser un canal de diagnóstico autenticado en el propio firmware, no bajar la protección.</li>
+  </ul>
+</div>
+
+<pre><code class="lang-bash"># Verificación en la línea de producción: el paso que convierte
+# "lo configuramos" en "está configurado". Se corre sobre la placa
+# terminada, y su salida se guarda con el número de serie.
+
+# STM32 — leer el estado de protección de lectura
+STM32_Programmer_CLI -c port=SWD -ob displ | grep -i "RDP"
+
+# Nordic nRF — el registro APPROTECT tiene que estar protegido
+nrfjprog --memrd 0x10001208 --n 4      # UICR.APPROTECT
+
+# ESP32 — resumen de fusibles: secure boot y flash encryption activos,
+# y los bits de deshabilitación de JTAG quemados
+espefuse.py --port /dev/ttyUSB0 summary
+
+# El script de fábrica FALLA la placa si el estado no es el esperado.
+# Una placa que sale sin protección es una placa defectuosa,
+# igual que una con una soldadura fría.</code></pre>
+
+<div class="mistake">
+  <strong>"Lo deshabilitamos por software al arrancar".</strong> No sirve. Un atacante con acceso físico puede mantener el chip en reset, conectar el depurador y tomar el control <em>antes</em> de que tu código corra, o interrumpir la secuencia de arranque para que esa línea nunca se ejecute. La deshabilitación tiene que ser <strong>de hardware, persistente y evaluada por el propio silicio antes de ejecutar la primera instrucción de tu firmware</strong>. Un bit en RAM que setea tu <code>main()</code> es una intención, no un control.
+</div>
+
+<div class="danger">
+  <strong>⛔ Y el hermano olvidado: el UART de consola.</strong> Muchos productos cierran JTAG con todo rigor y dejan un puerto serie que, a 115200 baudios, imprime el arranque completo, acepta un comando "diag" sin autenticar y permite volcar sectores de memoria. Es la misma puerta, con menos glamour y más fácil de encontrar: dos pines y un adaptador de USD 3. <strong>La consola de depuración es parte de la superficie de ataque y se cierra con el mismo criterio que JTAG.</strong> Si necesitás diagnóstico en campo, que sea un canal autenticado con la identidad del dispositivo, con comandos de solo lectura y sin acceso arbitrario a memoria.
+</div>
+
+<h2>CF6.7 Ataques físicos: mecanismo y contramedida</h2>
+
+<div class="danger">
+  <strong>⚖️ Cómo se trata esta sección.</strong> Lo que sigue explica <strong>por qué</strong> estos ataques funcionan y <strong>qué contramedidas</strong> existen, al nivel de detalle que necesitás para diseñar defensas y para evaluar la hoja de datos de un chip. <strong>No hay parámetros, no hay procedimientos, no hay configuraciones de equipo y no hay nada reproducible.</strong> Es deliberado: entender el mecanismo alcanza y sobra para defenderse; la receta operativa no aporta nada defensivo y sí habilita el uso indebido sobre equipos ajenos, que es delito.
+</div>
+
+<h3>Inyección de fallos: por qué un glitch puede saltear una comparación</h3>
+
+<p>Un procesador es un circuito digital que funciona correctamente <strong>dentro de un rango</strong> de tensión, temperatura y frecuencia. Cada flip-flop necesita que su entrada esté estable durante una ventana antes y después del flanco de reloj. Si el circuito se sale de ese rango por un instante muy breve, alguna señal no llega a tiempo, y el registro captura un valor incorrecto.</p>
+
+<p>Cuando ese registro es el que contiene la instrucción recién leída de la flash, o el resultado de una comparación, o el contador de programa, la consecuencia es que <strong>una instrucción no hace lo que dice el binario</strong>. En la práctica el efecto observado suele describirse como una instrucción que se comporta como si no existiera, o una condición que se evalúa al revés.</p>
+
+<div class="concept">
+  <strong>💡 Por qué esto es tan potente.</strong> Toda la seguridad de tu firmware suele condensarse en <em>una sola comparación</em>: <code>if (firma_valida)</code>, <code>if (pin_correcto)</code>, <code>if (nivel_de_acceso == ADMIN)</code>. Un fallo que altere el resultado de ese único punto no rompe la criptografía —AES sigue siendo AES— sino que <strong>saltea la decisión que la criptografía había tomado bien</strong>. Es la diferencia entre forzar la cerradura y hacer que el guardia mire para otro lado en el momento justo. El atacante no necesita romper nada: necesita que tu código tome una decisión mal, una vez.
+</div>
+
+<p>Las variantes físicas son varias —caída breve de la tensión de alimentación, alteración momentánea del reloj externo, un pulso electromagnético cerca del encapsulado, iluminación con láser sobre el silicio expuesto—, con costos crecientes y precisión creciente. Lo que comparten es el principio: <strong>sacar al circuito de su rango de operación válido en un instante elegido</strong>.</p>
+
+<h3>Contramedidas de firmware contra inyección de fallos</h3>
+
+<p>La idea de fondo es simple: si el atacante puede corromper <em>un</em> evento, hacé que un solo evento no alcance. Se llama <strong>redundancia temporal y espacial</strong>.</p>
+
+<pre><code class="lang-c">/* ❌ Frágil: un solo punto de decisión, y un valor booleano donde
+   cualquier bit alterado da "verdadero". */
+if (verificar_firma(&amp;img) == 0) {
+    saltar_a_aplicacion();
+}
+
+/* ✅ Endurecido: valores "sonoros", doble verificación con la lógica
+   invertida, un retardo variable en el medio, y un contador de
+   flujo que prueba que el camino se recorrió entero. */
+
+#define OK_MAGICO    0xA5C33C5Au   /* muchos bits en 1 y en 0:      */
+#define FALLO_MAGICO 0x5A3CC3A5u   /* difícil de alcanzar por azar   */
+
+static volatile uint32_t g_pasos;  /* volatile: que no lo optimice   */
+
+int arrancar_endurecido(void)
+{
+    g_pasos = 0;
+
+    uint32_t r1 = verificar_firma_hard(&amp;img);   /* devuelve OK_MAGICO */
+    g_pasos++;
+
+    retardo_aleatorio_corto();      /* desincroniza al atacante       */
+
+    uint32_t r2 = verificar_firma_hard(&amp;img);   /* segunda pasada     */
+    g_pasos++;
+
+    /* Ambas tienen que valer el patrón, y tienen que coincidir.
+       Un fallo en una sola de las dos ya no alcanza. */
+    if (r1 != OK_MAGICO || r2 != OK_MAGICO || r1 != r2 || g_pasos != 2) {
+        modo_seguro();              /* NO devuelve */
+    }
+
+    /* Chequeo de flujo: ¿pasamos por donde teníamos que pasar? */
+    if (g_pasos != 2) modo_seguro();
+
+    saltar_a_aplicacion();
+    return 0;
+}</code></pre>
+
+<table>
+<thead><tr><th>Contramedida</th><th>Qué frena</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><strong>Doble (o triple) verificación con lógica distinta</strong></td><td>Fallo único: el atacante necesita acertar dos veces</td><td>Duplica el tiempo de la operación crítica</td></tr>
+<tr><td><strong>Valores "sonoros"</strong> en vez de 0/1</td><td>Que un registro corrupto caiga por azar en "válido"</td><td>Casi cero</td></tr>
+<tr><td><strong>Retardos aleatorios</strong> antes de los puntos críticos</td><td>La sincronización precisa que el ataque necesita</td><td>Latencia media; necesita un TRNG (ver CF6.8)</td></tr>
+<tr><td><strong>Contadores de flujo de control</strong></td><td>Saltos que se saltean bloques enteros de código</td><td>Bajo; agrega ruido al código</td></tr>
+<tr><td><strong>Detectores de tensión, reloj y temperatura</strong> en el chip</td><td>La condición física del ataque, antes del efecto</td><td>USD 0 si el chip los trae; hay que <em>activarlos</em></td></tr>
+<tr><td><strong>Elemento seguro certificado</strong></td><td>La operación crítica se ejecuta en silicio diseñado para resistir</td><td>USD 0,50 – 3 de BOM más integración</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>La contramedida más barata está apagada en tu chip ahora mismo.</strong> Muchos MCU traen detectores de <em>brownout</em>, de falla de reloj y de rango de temperatura, y vienen deshabilitados o mal configurados por defecto. Activarlos cuesta escribir tres registros en el arranque, no cuesta un centavo de BOM, y convierte una clase entera de manipulación física en un reset. Revisá qué tiene tu familia en el capítulo de <em>system controller</em> del manual de referencia: es la mejor relación protección/esfuerzo de todo este módulo.
+</div>
+
+<h3>Canales laterales: por qué el consumo de corriente filtra información</h3>
+
+<p>Un transistor CMOS consume energía sobre todo cuando <strong>cambia de estado</strong>. Un registro que pasa de <code>0x00</code> a <code>0xFF</code> hace conmutar ocho bits; uno que pasa de <code>0x00</code> a <code>0x01</code> hace conmutar uno. El consumo instantáneo del chip es, entonces, una función de <em>cuántos bits cambiaron</em>, y por lo tanto de los datos que se están procesando.</p>
+
+<p>Si esos datos son una clave, el consumo eléctrico contiene información sobre la clave. No de forma directa —una sola traza es puro ruido— sino estadística: con muchas mediciones y correlación, la señal emerge del ruido. Esto es <strong>análisis de potencia</strong>, y su primo es el <strong>análisis de tiempos</strong>, que explota que una operación tarde distinto según el valor del secreto.</p>
+
+<div class="concept">
+  <strong>💡 La consecuencia de diseño: tiempo constante.</strong> Una implementación es <strong>de tiempo constante</strong> cuando su tiempo de ejecución, su patrón de accesos a memoria y sus saltos <strong>no dependen de datos secretos</strong>. No es una optimización ni un detalle de estilo: es un requisito. Y el código de tiempo constante se ve raro a propósito, porque le prohíbe al compilador y al procesador hacer justo lo que están diseñados para hacer: salir antes cuando ya saben la respuesta.
+</div>
+
+<pre><code class="lang-c">/* ❌ El clásico: memcmp sale apenas encuentra una diferencia.
+   El tiempo que tarda revela CUÁNTOS bytes iniciales coincidían. */
+if (memcmp(mac_recibido, mac_calculado, 32) == 0) { /* aceptar */ }
+
+/* ✅ Comparación de tiempo constante: recorre los 32 bytes SIEMPRE
+   y acumula las diferencias sin ramificar sobre el secreto. */
+int comparar_ct(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    volatile uint8_t dif = 0;          /* volatile frena al optimizador */
+    for (size_t i = 0; i &lt; n; i++)
+        dif |= (uint8_t)(a[i] ^ b[i]);
+    return dif == 0;                   /* 1 si son iguales */
+}
+
+/* ❌ Ramificar sobre un bit del secreto: el flujo de control
+   (y con él, el consumo y el tiempo) depende de la clave. */
+for (int i = 0; i &lt; 256; i++)
+    if (bit_de_clave(k, i)) acumular(&amp;p, &amp;q);
+
+/* ✅ Selección sin rama: se calculan ambos caminos y se elige con
+   una máscara aritmética. Cuesta el doble de trabajo, a propósito. */
+static uint32_t selec_ct(uint32_t cond_0_o_1, uint32_t si, uint32_t no)
+{
+    uint32_t mascara = (uint32_t)0 - cond_0_o_1;   /* 0x00..0 o 0xFF..F */
+    return (si &amp; mascara) | (no &amp; ~mascara);
+}</code></pre>
+
+<div class="mistake">
+  <strong>El compilador es tu adversario acá.</strong> Un optimizador agresivo puede reconocer tu bucle de comparación de tiempo constante y "mejorarlo" con una salida temprana, o eliminar por completo el <code>memset</code> con el que borrás una clave de la pila porque nota que ese buffer no se vuelve a leer. Por eso el código criptográfico usa <code>volatile</code>, barreras de compilador y funciones de borrado específicas de la biblioteca. Y por eso —lo repito— <strong>no escribas cripto a mano</strong>: usá Mbed TLS, wolfSSL, tinycrypt, libsodium o el motor por hardware, que ya pelearon esta batalla y la verifican en cada release.
+</div>
+
+<div class="info">
+  <strong>Cuánto te tiene que preocupar esto, con honestidad.</strong> El análisis de canal lateral requiere típicamente un adversario N3: instrumentación, muchas trazas, y acceso físico prolongado y estable. Para una lámpara inteligente es una amenaza teórica. Para un medidor de energía con tarifa, una llave de vehículo, un token de pago o un módulo que custodia la clave de una flota entera, es una amenaza <strong>real y con incentivo económico claro</strong>. La decisión correcta se toma en el modelo de amenazas, no por reflejo: si el activo lo justifica, la respuesta no es endurecer tu C sino <strong>mover la operación crítica a un elemento seguro certificado</strong>, que es silicio diseñado y evaluado para esto y cuesta menos que un ingeniero-mes.
+</div>
+
+<h2>CF6.8 Aleatoriedad: el generador que siempre da lo mismo</h2>
+
+<p>Un dispositivo embebido arranca en un estado casi perfectamente determinista. Sin disco, sin usuario moviendo el mouse, sin red todavía, sin reloj de tiempo real inicializado. Ese es el peor escenario posible para generar números aleatorios, y es exactamente el momento en que muchos diseños los necesitan: para una clave de sesión, un nonce, un identificador, una contraseña inicial.</p>
+
+<pre><code class="lang-c">/* ❌ El bug de seguridad embebida más reproducible que existe.
+   Sin RTC inicializado, time(NULL) devuelve el mismo valor en cada
+   arranque y en CADA UNIDAD de la flota. Todas generan lo mismo. */
+srand(time(NULL));
+for (int i = 0; i &lt; 16; i++)
+    clave_sesion[i] = rand() &amp; 0xFF;
+
+/* Y aunque el RTC funcione: time() tiene resolución de 1 segundo.
+   Un atacante que sabe aproximadamente cuándo arrancó el dispositivo
+   tiene que probar unos pocos miles de semillas. Eso no es una clave:
+   es una contraseña de cuatro dígitos con pasos extra. */</code></pre>
+
+<div class="danger">
+  <strong>⛔ <code>rand()</code> no es un generador criptográfico, y ningún <em>seed</em> lo convierte en uno.</strong> Es un generador pseudoaleatorio pensado para simulaciones y juegos: dado un puñado de salidas, se puede reconstruir su estado interno y predecir todas las siguientes. El problema tiene dos mitades independientes y hacen falta las dos: <strong>(1)</strong> una fuente de entropía física real, y <strong>(2)</strong> un algoritmo de generación criptográficamente seguro que la expanda. Fallar en cualquiera de las dos arruina el resultado, y el síntoma es el mismo: claves predecibles que <em>parecen</em> aleatorias cuando las mirás.
+</div>
+
+<h3>El TRNG por hardware, y cómo verificar que funciona</h3>
+
+<p>La mayoría de los MCU modernos traen un generador de números aleatorios verdaderos: un circuito que amplifica ruido físico —térmico, de <em>jitter</em> entre osciladores— y lo digitaliza. Es la fuente correcta. Pero un TRNG puede fallar de forma silenciosa: si el oscilador de ruido no arranca, o si el bloque quedó sin reloj por una configuración incompleta, el periférico puede seguir entregando bytes... siempre los mismos, o con un sesgo brutal.</p>
+
+<pre><code class="lang-c">/* ✅ Uso correcto: TRNG por hardware, con chequeo de estado.
+   La clave del ejemplo es que el error NO se ignora. */
+#include "psa/crypto.h"
+
+int obtener_aleatorio(uint8_t *dst, size_t n)
+{
+    psa_status_t st = psa_generate_random(dst, n);
+    if (st != PSA_SUCCESS) {
+        /* Un fallo del generador es un fallo de SEGURIDAD, no un aviso.
+           Nunca caer a rand(): eso convierte una falla ruidosa
+           en una vulnerabilidad silenciosa. */
+        entrar_en_modo_seguro_sin_cripto();
+        return -1;
+    }
+    return 0;
+}
+
+/* Chequeo de arranque: barato y detecta el fallo más grosero,
+   que es un TRNG que entrega un valor fijo o casi fijo. */
+bool trng_smoke_test(void)
+{
+    uint8_t a[32], b[32];
+    if (obtener_aleatorio(a, sizeof a) != 0) return false;
+    if (obtener_aleatorio(b, sizeof b) != 0) return false;
+
+    if (memcmp(a, b, sizeof a) == 0) return false;   /* repite */
+
+    unsigned unos = 0;
+    for (size_t i = 0; i &lt; sizeof a; i++)
+        unos += __builtin_popcount(a[i]);
+    /* 256 bits: esperamos ~128 en 1. Un sesgo extremo es sospechoso.
+       Esto NO valida calidad estadística: solo detecta el caso roto. */
+    return (unos &gt; 80u &amp;&amp; unos &lt; 176u);
+}</code></pre>
+
+<p>El <em>smoke test</em> de arriba detecta el generador muerto, no la calidad. Para eso, en banco, se recolecta una muestra grande y se la somete a baterías estadísticas — <strong>sobre tu propio dispositivo</strong>, en la etapa de validación:</p>
+
+<pre><code class="lang-python"># Validación de banco de la salida del TRNG.
+# Se recolecta una muestra grande del dispositivo (varios MB) y se la
+# analiza. Esto se hace UNA vez por diseño, no en producción.
+#
+# Herramientas reconocidas: NIST SP 800-22 / SP 800-90B, dieharder, ent.
+# Este script es solo el primer filtro grosero.
+
+import collections, math
+
+datos = open("muestra_trng.bin", "rb").read()
+print(f"muestra: {len(datos)} bytes")
+
+# 1) Entropía de Shannon por byte: el ideal es 8,0
+frec = collections.Counter(datos)
+n = len(datos)
+H = -sum((c/n) * math.log2(c/n) for c in frec.values())
+print(f"entropia por byte: {H:.4f} / 8.0")
+
+# 2) Sesgo de bits: el ideal es 0,5
+unos = sum(bin(b).count("1") for b in datos)
+print(f"fraccion de unos: {unos/(n*8):.5f}")
+
+# 3) Bytes que nunca aparecieron: con muestra grande deberian ser 0
+print(f"valores ausentes: {256 - len(frec)}")
+
+# 4) La prueba mas util de todas y la que nadie hace:
+#    capturar la salida en los primeros milisegundos tras el arranque,
+#    en 20 unidades distintas, y verificar que NO coinciden.
+#    Ese es el escenario que rompio a miles de dispositivos reales.</code></pre>
+
+<div class="warn">
+  <strong>El fallo histórico: entropía en el arranque.</strong> Se documentaron casos, en flotas grandes de dispositivos conectados, de claves generadas en el primer arranque que resultaron idénticas o predecibles entre unidades, porque la fuente de entropía todavía no tenía material suficiente en ese instante. La lección de diseño es doble: <strong>(1)</strong> no generar claves de largo plazo en el primer arranque en campo si podés generarlas en fábrica con una fuente confiable, y <strong>(2)</strong> si tenés que generarlas en el dispositivo, <strong>esperar a que el TRNG declare que su acumulador de entropía está listo</strong>, y verificar la condición explícitamente en vez de asumirla. El punto 4 del script de arriba —comparar la salida temprana entre unidades— es la prueba que detecta esto antes de fabricar cien mil.
+</div>
+
+<h2>CF6.9 El dispositivo en la red: identidad por unidad</h2>
+
+<p>Llegamos al error de diseño más costoso de la industria, el que aparece en cada informe anual de incidentes de IoT: <strong>una única clave compartida por toda la flota</strong>.</p>
+
+<p>Es una decisión que se toma sola. En el prototipo hay una clave. En la preserie hay una clave, porque provisionar por unidad todavía no está resuelto. En producción hay una clave, porque cambiarlo ahora significa rediseñar la línea de fábrica. Y el día que alguien extrae esa clave de una unidad de USD 40 comprada en línea, <strong>puede suplantar, descifrar o controlar las cien mil</strong>. No hay revocación posible: revocar la clave deja fuera de servicio a la flota entera.</p>
+
+<div class="rule">
+  <strong>📌 Regla no negociable: una identidad criptográfica única por dispositivo.</strong> El compromiso de una unidad tiene que costar exactamente una unidad. Esta es la traducción operativa del supuesto <strong>S6</strong> de tu modelo de amenazas, y es también el criterio con el que un auditor va a evaluar el producto. Si el diseño no lo cumple, no cumple el supuesto, y todo lo que se apoya arriba es aparente.
+</div>
+
+<h3>Aprovisionamiento: dónde nace la identidad</h3>
+
+<table>
+<thead><tr><th>Modelo</th><th>Cómo funciona</th><th>Superficie de riesgo</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><strong>Clave inyectada en fábrica</strong></td><td>La línea genera el par de claves y lo escribe en el dispositivo</td><td>La clave privada <em>existe</em> fuera del chip: la máquina de fábrica la vio</td><td>Bajo. Requiere asegurar la línea (supuesto S5)</td></tr>
+<tr><td><strong>Clave generada en el dispositivo</strong></td><td>El chip genera el par, exporta solo la pública en un CSR</td><td>Depende críticamente de la calidad del TRNG (CF6.8)</td><td>Medio: la línea tiene que recolectar y firmar los CSR</td></tr>
+<tr><td><strong>Identidad de fábrica del silicio</strong></td><td>El chip viene con un certificado del fabricante de silicio ya adentro</td><td>Confiás en la cadena del proveedor</td><td>Bajo para vos, incluido en el precio del chip</td></tr>
+<tr><td><strong>Elemento seguro preprovisionado</strong></td><td>El SE llega con su par de claves ya generado internamente; la privada nunca existió afuera</td><td>Mínima</td><td>USD 0,50 – 3 por unidad</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Aprovisionamiento con la privada generada DENTRO del dispositivo.
+# El objetivo del flujo: que la clave privada no exista jamás
+# en ningun disco, log, ni memoria de la maquina de fabrica.
+
+# 1) El dispositivo genera su par internamente y emite un CSR.
+#    Solo sale del chip la parte publica.
+prov-tool --port /dev/ttyUSB0 genkey --slot 0 --curve P-256
+prov-tool --port /dev/ttyUSB0 csr --slot 0 --cn "dev-$SERIE" &gt; "$SERIE.csr"
+
+# 2) La CA interna firma el CSR. La CA vive en un HSM,
+#    no en la PC de la linea de produccion.
+openssl x509 -req -in "$SERIE.csr" \
+  -CA ca-dispositivos.pem -CAkey /hsm/ca.key -CAcreateserial \
+  -days 3650 -sha256 -out "$SERIE.crt"
+
+# 3) El certificado (publico) vuelve al dispositivo.
+prov-tool --port /dev/ttyUSB0 writecert --slot 0 --file "$SERIE.crt"
+
+# 4) Registro trazable: que se fabrico, cuando, con que CA.
+echo "$SERIE,$(date -Is),$(openssl x509 -in "$SERIE.crt" -noout -fingerprint -sha256)" \
+  &gt;&gt; registro-aprovisionamiento.csv</code></pre>
+
+<h3>TLS en un MCU: qué entra y qué no</h3>
+
+<p>TLS 1.3 en un Cortex-M4 con 128 KB de flash y 32 KB de RAM es viable, pero hay que dimensionarlo con datos, no con optimismo:</p>
+
+<ul>
+  <li><strong>Flash:</strong> una pila TLS mínima (Mbed TLS recortada, wolfSSL, o la del propio SDK) ocupa entre 40 y 90 KB según los conjuntos de cifrado habilitados. Recortá agresivamente: cada suite que no vas a usar es flash regalada y superficie de ataque de regalo.</li>
+  <li><strong>RAM:</strong> el <em>handshake</em> es el pico. Buffers de registro de 16 KB por dirección es el caso peor del estándar; con <code>max_fragment_length</code> negociado bajás a 2 KB por lado y ahí entra en dispositivos chicos.</li>
+  <li><strong>Tiempo y energía del handshake:</strong> con ECDHE-ECDSA-P256 sin acelerador, entre 200 y 800 ms de CPU. En un nodo a pila, <strong>el handshake puede costar más energía que todos los datos del día</strong>. Por eso existe la reanudación de sesión: guardar el ticket y reconectar sin repetir la parte asimétrica.</li>
+  <li><strong>Validación de certificados:</strong> requiere una hora confiable. Un dispositivo sin RTC ni NTP no puede evaluar la vigencia de un certificado, y el atajo habitual —desactivar la comprobación de fechas— <strong>anula la revocación por expiración</strong>. Decisión explícita, documentada, con una mitigación asociada (fijar la clave del servidor, por ejemplo).</li>
+  <li><strong>Autenticación mutua:</strong> es lo que hace que el servidor sepa <em>qué</em> dispositivo habla. Sin ella tenés un canal cifrado con un desconocido.</li>
+</ul>
+
+<div class="warn">
+  <strong>Cuando una clave se filtra: el plan que se escribe antes.</strong> No es "si", es "cuándo". Tres preguntas que tienen que tener respuesta <em>antes</em> de fabricar: <strong>(1) ¿Cómo revocás una identidad?</strong> Lista de revocación en el servidor, o mejor, una lista de permitidos donde dar de baja es quitar una fila. <strong>(2) ¿Cómo rotás?</strong> ¿Podés emitir un certificado nuevo a un dispositivo en campo, y con qué credencial autenticás ese pedido? <strong>(3) ¿Cómo detectás?</strong> Una identidad usada desde dos IP simultáneas, o un dispositivo que reporta desde el otro hemisferio, es la señal más barata de clonación y se implementa del lado servidor, donde sí tenés CPU. <strong>La revocación de flota es un requisito de producto, no una feature de la nube.</strong>
+</div>
+
+<div class="tip">
+  <strong>Segmentá del lado de la red también.</strong> Aunque hagas todo bien, un dispositivo IoT es un candidato permanente a ser el pivote hacia la red del cliente. La recomendación que va en la documentación del producto —y que ETSI EN 303 645 espera— es que el equipo viva en una VLAN o red de invitados, sin acceso lateral al resto. No es una defensa que vos controlás, pero sí es una que podés <em>recomendar explícitamente</em>, y su ausencia en el manual es un hallazgo de auditoría.
+</div>
+
+<h2>CF6.10 Normativa: la seguridad dejó de ser opcional</h2>
+
+<p>Durante dos décadas la única sanción por vender un dispositivo inseguro fue reputacional, y llegaba tarde. Eso cambió. Hoy hay un cuerpo normativo con fechas, obligaciones concretas y consecuencias de acceso al mercado. Si tu producto se vende en Europa —o si tu cliente vende en Europa— esto es requisito de diseño, no papeleo del final.</p>
+
+<table>
+<thead><tr><th>Norma</th><th>Alcance</th><th>Estado / fechas</th><th>Qué exige, en concreto</th></tr></thead>
+<tbody>
+<tr><td><strong>RED — Reglamento Delegado (UE) 2022/30</strong>, arts. 3.3 (d)(e)(f) de la Directiva 2014/53/UE</td><td>Todo equipo de radio conectado a Internet vendido en la UE</td><td><strong>Obligatorio desde el 1 de agosto de 2025</strong> (se pospuso doce meses respecto de la fecha original)</td><td>No dañar la red, proteger datos personales y privacidad, prevenir el fraude. Presunción de conformidad con <strong>EN 18031-1/-2/-3:2024</strong>, referenciadas por la Decisión de Ejecución (UE) 2025/138 — con restricciones específicas que hay que leer</td></tr>
+<tr><td><strong>CRA — Reglamento (UE) 2024/2847</strong> (Cyber Resilience Act)</td><td>Todo "producto con elementos digitales": hardware y software, conectado o no</td><td>En vigor desde el 10/12/2024. <strong>Obligaciones de reporte: 11 de septiembre de 2026.</strong> <strong>Aplicación plena: 11 de diciembre de 2027</strong></td><td>Seguridad por diseño, gestión de vulnerabilidades durante todo el ciclo de vida, <strong>SBOM</strong> en formato legible por máquina, período de soporte declarado (≥ 5 años por regla general), política de divulgación coordinada, y reporte de vulnerabilidades activamente explotadas: <strong>alerta temprana en 24 h, notificación en 72 h</strong>, informe final posterior</td></tr>
+<tr><td><strong>ETSI EN 303 645</strong> (V3.1.3)</td><td>IoT de consumo</td><td>Norma vigente, base de varias regulaciones nacionales</td><td>33 disposiciones obligatorias y 35 recomendaciones. Las tres primeras son las que más productos reprueban: <strong>sin contraseñas por defecto universales</strong>, <strong>un canal de divulgación de vulnerabilidades publicado</strong>, <strong>actualizaciones de software</strong>. Se evalúa con <strong>ETSI TS 103 701</strong> y se implementa con la guía <strong>ETSI TR 103 621</strong></td></tr>
+<tr><td><strong>UK PSTI Act</strong></td><td>Productos conectables de consumo en el Reino Unido</td><td>En vigor desde abril de 2024</td><td>Sin contraseñas por defecto, contacto de seguridad publicado, y <strong>declaración del período mínimo de soporte</strong> en el punto de venta. Es, en la práctica, las tres primeras disposiciones de EN 303 645 con fuerza de ley</td></tr>
+<tr><td><strong>IEC 62443-4-1 / -4-2</strong></td><td>Automatización y control industrial</td><td>Vigente; habitual como requisito contractual</td><td>-4-1: proceso de desarrollo seguro. -4-2: requisitos técnicos por nivel de seguridad (SL 1–4) para componentes</td></tr>
+<tr><td><strong>PSA Certified</strong> / <strong>SESIP</strong></td><td>Esquemas de certificación de silicio, software y dispositivo</td><td>Vigentes. PSA Certified Nivel 1–4; SESIP con perfiles integrados en los niveles 2, 3 y 4</td><td>Nivel 1: cuestionario con auditoría de laboratorio. <strong>Nivel 2: resistencia a ataques de software escalables. Nivel 3: resistencia a ataques físicos y de software sustanciales.</strong> Sirven como evidencia reutilizable frente a CRA y RED</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Lo que estas normas realmente te obligan a construir.</strong> Leídas juntas, no piden features de seguridad sueltas: piden <strong>capacidades organizativas sostenidas en el tiempo</strong>. Un canal de actualización que funcione durante cinco años. Un inventario de qué componentes y versiones lleva cada firmware que enviaste (SBOM). Una dirección de correo que alguien lee cuando un investigador reporta un fallo, y un proceso detrás. Y la capacidad de responder <strong>en 24 horas</strong> cuando aparece una vulnerabilidad explotada. Nada de eso se agrega tres semanas antes del lanzamiento: <strong>son decisiones de arquitectura y de equipo que se toman al principio</strong>, y ese es el verdadero impacto de la regulación sobre tu forma de trabajar.
+</div>
+
+<pre><code class="lang-bash"># SBOM: pasa de "buena practica" a obligacion legal con el CRA.
+# En embebido el desafio es que buena parte del arbol de dependencias
+# no viene de un gestor de paquetes: son submodulos, tarballs y
+# codigo del fabricante del chip copiado a mano.
+
+# Zephyr genera el SBOM del build (SPDX) con su propia herramienta:
+west spdx --init -d build
+west build -b nucleo_l476rg app
+west spdx -d build            # produce los documentos SPDX del build
+
+# Proyectos CMake genericos, con CycloneDX:
+cyclonedx-cli add files --input-directory . \
+  --output-format json --output-file sbom.json
+
+# Cotejar el SBOM contra vulnerabilidades publicadas, en CI:
+grype sbom:sbom.json --fail-on high
+
+# Regla operativa: el SBOM se genera en el MISMO build que produce
+# el binario firmado, y se archiva junto a el. Un SBOM reconstruido
+# despues no describe lo que enviaste: describe lo que creias enviar.</code></pre>
+
+<div class="info">
+  <strong>Dónde se cruza con el resto del campus.</strong> El SBOM, la gestión de dependencias y la firma de artefactos se tratan en profundidad en <a href="../../../Curso-Ciberseguridad/m07-secretos-supply-chain/lecture.html">M07 — Secretos y cadena de suministro</a>. Lo específico de embebido es la parte difícil: acá una "dependencia" puede ser un blob binario del fabricante del silicio, sin versión declarada, sin CVE asociado y sin nadie a quien reclamarle. <strong>Exigí la información de componentes a tus proveedores de silicio y de módulos por contrato</strong> — a partir de diciembre de 2027 la vas a necesitar para poner el producto en el mercado, y conseguirla retroactivamente es mucho más caro.
+</div>
+
+<h2>CF6.11 Cuándo el nivel de protección es suficiente</h2>
+
+<p>Todo lo anterior cuesta: plata en BOM, ciclos, energía, semanas de ingeniería, complejidad de producción y riesgo de <em>bricking</em>. La pregunta profesional no es "¿cómo lo hago más seguro?" —siempre se puede— sino <strong>"¿cuándo paro, y con qué justificación escrita?"</strong>.</p>
+
+<div class="rule">
+  <strong>📌 El criterio económico.</strong> Un control es adecuado cuando <strong>el costo del ataque supera con margen el valor que el atacante obtiene</strong>, sostenido durante toda la vida útil del producto. Las dos partes importan: proteger una lámpara contra un adversario con laboratorio de silicio es tirar plata; proteger un módulo que custodia la clave de una flota entera con un simple bit de RDP es negligencia. <strong>El nivel de protección lo fija el activo, no el entusiasmo del equipo.</strong>
+</div>
+
+<h3>Los dos multiplicadores que la gente olvida</h3>
+
+<p>El cálculo ingenuo —"esta lámpara vale USD 20, nadie va a gastar USD 5.000 en romperla"— falla por dos razones, y las dos son el corazón del análisis:</p>
+
+<div class="step">
+  <strong>Multiplicador 1: escala.</strong> El atacante gasta el costo del ataque <strong>una vez</strong> y lo aplica a toda la flota. Romper una unidad de USD 20 con USD 5.000 de esfuerzo es un mal negocio; romperla y con eso controlar cien mil unidades es un retorno de 400 veces. <strong>Todo lo compartido entre unidades hay que evaluarlo al valor de la flota entera, no al de la unidad.</strong>
+</div>
+
+<div class="step">
+  <strong>Multiplicador 2: lo que el activo custodia.</strong> Una cerradura inteligente vale USD 80; lo que hay detrás de la puerta, no. Un sensor industrial vale USD 300; la línea que puede detener, mucho más. <strong>Valuá el activo por la consecuencia del compromiso, no por el precio de venta.</strong> Y si la consecuencia puede ser daño físico a una persona, el análisis económico deja de aplicar: pasás a un régimen de seguridad funcional donde el criterio es otro.
+</div>
+
+<h3>Tabla de decisión por perfil de producto</h3>
+
+<table>
+<thead><tr><th>Perfil</th><th>Adversario objetivo</th><th>Controles mínimos</th><th>Costo aproximado</th></tr></thead>
+<tbody>
+<tr><td><strong>Juguete / gadget sin red</strong></td><td>N1</td><td>Depuración deshabilitada, sin credenciales embebidas</td><td>Horas de ingeniería</td></tr>
+<tr><td><strong>IoT de consumo conectado</strong> (lámpara, sensor, cámara)</td><td>N2</td><td>Todo lo anterior + secure boot + OTA firmada con anti-rollback + identidad única + TLS mutuo + EN 303 645</td><td>4–10 semanas-ingeniero; BOM +USD 0–1</td></tr>
+<tr><td><strong>Control de acceso / cerradura</strong></td><td>N2–N3</td><td>Todo lo anterior + <strong>secure element</strong> + contramedidas contra fallos en la ruta de decisión + registro de auditoría</td><td>+3–6 semanas; BOM +USD 1–3</td></tr>
+<tr><td><strong>Industrial / infraestructura</strong></td><td>N3</td><td>Todo lo anterior + IEC 62443-4-2 + arranque medido y atestación + segmentación de red + soporte de 10 años</td><td>Meses; proceso certificado</td></tr>
+<tr><td><strong>Pago / identidad / salud crítica</strong></td><td>N4</td><td>Silicio certificado (Common Criteria / SESIP nivel alto), evaluación por laboratorio acreditado</td><td>Años; presupuesto de certificación</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error simétrico al de no proteger nada.</strong> Equipos que gastan seis meses en TrustZone, canales laterales y contramedidas contra inyección de fallos… y despachan con la consola UART abierta y las credenciales de Wi-Fi en texto plano. <strong>La seguridad se rompe por el punto más barato, no por el más sofisticado.</strong> Antes de invertir en el escalón N3, verificá que N1 y N2 estén realmente cerrados — y verificalo <em>sobre una unidad de producción tomada al azar del lote</em>, no sobre el prototipo del escritorio. La diferencia entre esas dos placas es donde viven los hallazgos.
+</div>
+
+<h2>🧑‍🎓 Worked Example — la cerradura inteligente que se rompe sola</h2>
+
+<p>Producto real por su forma, ficticio por sus datos: una cerradura inteligente para departamentos de alquiler temporario. Se abre con una app por BLE y recibe códigos temporales desde la nube por Wi-Fi. Precio de venta USD 89. Ocho mil unidades desplegadas. MCU con Cortex-M4, radio integrada, flash interna de 512 KB, sin elemento seguro.</p>
+
+<p>La auditoría —hecha sobre unidades propias, con autorización del fabricante, que es la única forma legítima de hacerla— encuentra <strong>tres fallas de diseño</strong>. Vamos una por una, y después lo importante: cómo se componen.</p>
+
+<h3>Paso 1 — Las tres fallas, por separado</h3>
+
+<div class="danger">
+  <strong>Falla A — Una única clave AES en toda la flota.</strong> El firmware trae una constante de 16 bytes que cifra los códigos de apertura entre la nube y la cerradura. La misma en las ocho mil unidades. <strong>Impacto aislado:</strong> quien la obtenga puede generar códigos válidos para <em>cualquier</em> cerradura del parque, sin tocarla. <strong>Recuperable:</strong> no. No hay forma de rotarla sin llegar a las ocho mil unidades, y el canal para llegar a ellas depende de la falla C.
+</div>
+
+<div class="danger">
+  <strong>Falla B — SWD habilitado en producción.</strong> El nivel de protección de lectura quedó en 0. El paso de la línea de producción existía en el documento, pero era manual y no se verificaba. <strong>Impacto aislado:</strong> un adversario N2 vuelca la flash completa de una unidad que compró. <strong>Recuperable:</strong> sí para las unidades futuras (se corrige la línea), no para las ocho mil ya vendidas.
+</div>
+
+<div class="danger">
+  <strong>Falla C — Firmware sin firmar.</strong> El bootloader acepta cualquier imagen que llegue por OTA o por el puerto de programación, con un CRC-32 como única validación. <strong>Impacto aislado:</strong> se puede instalar firmware arbitrario en una unidad con acceso físico. Y como el canal OTA tampoco autentica el origen, un atacante que se interponga entre la cerradura y el servidor puede empujar su propia imagen <strong>de forma remota</strong>.
+</div>
+
+<h3>Paso 2 — Cómo se componen: el todo es mucho peor que las partes</h3>
+
+<p>Acá está la lección central del ejemplo, y es la que más cuesta transmitir en una revisión de diseño: <strong>las vulnerabilidades no se suman, se multiplican</strong>. Cada una habilita a la siguiente y desactiva la mitigación que la otra podría haber tenido.</p>
+
+<table>
+<thead><tr><th>Combinación</th><th>Lo que habilita</th><th>Alcance</th></tr></thead>
+<tbody>
+<tr><td><strong>B</strong> sola</td><td>Volcar la flash de la unidad propia</td><td>1 unidad</td></tr>
+<tr><td><strong>B → A</strong></td><td>El volcado contiene la clave de flota. Ahora se pueden generar códigos válidos para todas</td><td><strong>8.000 unidades, remotamente</strong></td></tr>
+<tr><td><strong>B → C</strong></td><td>Con la flash volcada se estudia el binario y se construye una imagen propia, que el bootloader acepta sin firma</td><td>1 unidad, con control total</td></tr>
+<tr><td><strong>A → C</strong></td><td>La clave de flota autentica el canal OTA. Con la clave, el atacante <em>es</em> el servidor: empuja firmware sin tocar ninguna cerradura</td><td><strong>8.000 unidades, remotamente, persistente</strong></td></tr>
+<tr><td><strong>A + B + C</strong></td><td>Compromiso remoto, persistente e <strong>irreparable</strong> de la flota: el atacante puede firmar —bueno, "firmar"— la actualización que arreglaría el problema, y también la que lo mantiene</td><td>Producto terminado</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Por qué la última fila es distinta de todas las anteriores.</strong> Un incidente normal se resuelve con un parche. Acá <strong>el canal de parcheo es parte del compromiso</strong>: el atacante controla el mismo mecanismo con el que arreglarías el problema. La única salida es el recambio físico de ocho mil unidades a USD 89 más logística e instalación — un evento que hunde a una empresa mediana. <strong>Ese es el costo real de no haber firmado el firmware</strong>, y por eso el canal de actualización es el primer control que se diseña, no el último.
+</div>
+
+<h3>Paso 3 — El rediseño, por capas</h3>
+
+<table>
+<thead><tr><th>Ataque a neutralizar</th><th>Control</th><th>Costo de ingeniería</th><th>Costo de BOM</th><th>Costo recurrente</th></tr></thead>
+<tbody>
+<tr><td>Volcado de flash con depurador (N2)</td><td>Protección de lectura activada <strong>por script</strong> en producción + verificación registrada por número de serie</td><td>1 semana (línea de fábrica)</td><td>USD 0</td><td>Segundos por unidad en el test</td></tr>
+<tr><td>Firmware arbitrario, local o remoto</td><td><strong>Secure boot</strong> con ECDSA-P256 (MCUboot) + firmado en HSM + slots A/B</td><td>4 semanas</td><td>USD 0</td><td>+120 ms de arranque, +24 KB de flash</td></tr>
+<tr><td>Reinstalación de una versión vulnerable</td><td><strong>Anti-rollback</strong> con contador de seguridad en OTP</td><td>1 semana</td><td>USD 0</td><td>Presupuesto de fusibles: máximo 16 incrementos de por vida</td></tr>
+<tr><td>Compromiso de la flota desde una unidad</td><td><strong>Identidad única por dispositivo</strong>: par de claves generado en el SE, certificado firmado por la CA interna en aprovisionamiento</td><td>3 semanas (firmware + línea + backend)</td><td><strong>+USD 1,10</strong> (secure element)</td><td>Custodia de la CA en HSM</td></tr>
+<tr><td>Extracción de claves de la flash</td><td>Claves dentro del <strong>secure element</strong>, con política de no exportación</td><td>incluido arriba</td><td>incluido arriba</td><td>+8 ms por operación (bus I²C)</td></tr>
+<tr><td>Inyección de fallos sobre la decisión de apertura (N3)</td><td>Doble verificación con retardo aleatorio en la ruta que acciona el motor + detector de <em>brownout</em> activado</td><td>1 semana</td><td>USD 0</td><td>+15 ms de latencia al abrir</td></tr>
+<tr><td>Interceptación del canal</td><td><strong>TLS 1.3 con autenticación mutua</strong>, certificado de cliente desde el SE</td><td>2 semanas</td><td>USD 0</td><td>+400 ms y ~120 mJ por handshake completo</td></tr>
+<tr><td>Compromiso no detectado</td><td>Telemetría del lado servidor: identidad usada desde dos orígenes, versiones de firmware inesperadas, tasa de fallos de autenticación</td><td>2 semanas (backend)</td><td>USD 0</td><td>Costo de la nube</td></tr>
+<tr><td>Incumplimiento regulatorio</td><td>SBOM en el pipeline, política de divulgación publicada, período de soporte declarado en la caja, proceso de reporte en 24/72 h</td><td>2 semanas + proceso permanente</td><td>USD 0</td><td>Alguien tiene que leer ese buzón, para siempre</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El número que cierra la discusión con la gerencia.</strong> El rediseño completo cuesta aproximadamente <strong>16 semanas-ingeniero y USD 1,10 por unidad</strong>. Sobre ocho mil unidades, el BOM adicional suma <strong>USD 8.800</strong>. El recambio de la flota tras el compromiso de la fila "A + B + C" cuesta <strong>USD 712.000 solo en hardware</strong>, sin contar logística, instalación, la responsabilidad legal por accesos no autorizados a viviendas ni el hecho de que el producto queda muerto en el mercado. <strong>La seguridad embebida no se justifica con miedo: se justifica con esa división.</strong> Y ese cálculo es tu trabajo hacerlo, porque nadie más en la empresa tiene los datos técnicos para hacerlo.
+</div>
+
+<div class="tip">
+  <strong>El orden de implementación importa tanto como la lista.</strong> Si solo tenés presupuesto para tres de los nueve controles, este es el orden: <strong>(1) firmware firmado con anti-rollback</strong> —sin esto no podés arreglar nada más, nunca—, <strong>(2) identidad única por dispositivo</strong> —esto acota cualquier compromiso futuro a una unidad—, <strong>(3) depuración cerrada y verificada en producción</strong> —esto elimina al atacante de menor costo—. Los seis restantes suben el piso; estos tres definen si el producto es recuperable o no cuando algo salga mal. Y algo va a salir mal.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué una firma digital válida no alcanza para aceptar una actualización de firmware?</summary>
+<p>Porque una firma prueba <strong>origen</strong>, no <strong>actualidad</strong>. La versión 1.3, con un fallo ya parcheado, sigue teniendo tu firma legítima para siempre — las firmas no caducan. Un atacante que presente esa imagen vieja pasa la verificación de autenticidad sin problemas, reintroduce la vulnerabilidad y después la explota. Hace falta una segunda propiedad, la <strong>frescura</strong>, y esa exige estado en el dispositivo que solo pueda avanzar: un contador monotónico en OTP o en un elemento seguro, que sobreviva a que el atacante desconecte la alimentación. Además, ese contador es finito (entre 16 y 64 incrementos típicamente) y quemarlo antes de confirmar que la imagen nueva arranca convierte la unidad en un ladrillo, así que se incrementa <em>después</em> de la confirmación y solo cuando volver atrás sería inaceptable.</p></details>
+
+<details><summary>Tu MCU tiene la protección de lectura activada. ¿Podés dar por seguras las claves que guardás en flash?</summary>
+<p>No. La protección de lectura es un control necesario y obligatorio —elimina al atacante N1 y a buena parte del N2— pero <strong>no es una garantía absoluta</strong>: hay literatura académica que demostró evasiones en varias familias de MCU de distintos fabricantes usando inyección de fallos, y a veces con equipamiento de nivel N2. La conclusión de diseño no es "no la actives" sino "no apoyes tu único secreto de flota sobre ella". El patrón correcto es <strong>defensa en profundidad</strong>: protección de lectura activada y verificada en producción, secretos que el CPU nunca lee (motor cripto con clave no exportable o elemento seguro), identidad única por dispositivo para que el compromiso de una unidad cueste una unidad, y detección del lado servidor para enterarte cuando pase.</p></details>
+
+<details><summary>Estás diseñando un sensor de temperatura a pila que reporta por LoRaWAN y se vende a USD 35. ¿Hasta dónde llegás con la protección?</summary>
+<p>Definí el adversario objetivo primero: para este perfil es <strong>N2</strong>, no N3 ni N4. Eso te da una lista corta y clara: depuración deshabilitada y verificada en el test de producción, secure boot con OTA firmada y anti-rollback, identidad única por dispositivo (acá puede alcanzar la del propio silicio o una clave generada en el chip, sin secure element externo), sin credenciales embebidas ni contraseñas por defecto, y cumplimiento de EN 303 645. Lo que <strong>no</strong> hacés: contramedidas contra canales laterales ni TrustZone, porque el activo no lo justifica y en un nodo a pila cada milijoule cuenta —el presupuesto de energía es un requisito tan duro como la seguridad. Y lo que sí hacés aunque no sea "técnico": declarar el período de soporte, publicar el contacto de divulgación de vulnerabilidades y generar el SBOM en el pipeline, porque a partir de las fechas del CRA eso condiciona el acceso al mercado tanto como el hardware.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>El modelo de amenazas cambia por completo</strong> cuando el atacante tiene el dispositivo: acceso físico ilimitado, capacidad de alterar el entorno de ejecución y de observar el consumo. Definí niveles de adversario (N0–N4) y <strong>escribí los supuestos</strong>, sobre todo el que decís que <em>no</em> vas a cubrir.</li>
+  <li><strong>Secure boot</strong> es una cadena, y un eslabón que no verifica no es débil: es inexistente. Falla cerrada siempre, con una ruta de recuperación diseñada. Usá MCUboot / ESP-IDF / SBSFU, no tu propio bootloader.</li>
+  <li><strong>Actualización segura = autenticidad + integridad + frescura + disponibilidad.</strong> La firma prueba origen, no actualidad: el anti-rollback con contador monotónico es imprescindible, y el contador es finito y de un solo sentido.</li>
+  <li><strong>Una clave en flash es una clave pública.</strong> El secreto real es el que el CPU nunca lee: motor cripto con clave no exportable, elemento seguro, OTP, PUF. Pensá en <em>handles</em>, no en claves.</li>
+  <li><strong>Elegí la cripto por presupuesto:</strong> AES-GCM si hay acelerador, ChaCha20-Poly1305 si no; ECC sobre RSA por tamaño y por costo de firmar. Medí ciclos en tu placa. Y jamás reutilices un nonce de GCM — el contador en RAM que se reinicia es el bug clásico.</li>
+  <li><strong>JTAG/SWD y el UART de consola son la misma puerta.</strong> Cerralas por hardware, en un paso automatizado de la línea, y <strong>verificá el estado en cada placa</strong>. Las protecciones de lectura tienen límites demostrados: son una capa, no el muro.</li>
+  <li><strong>Los ataques físicos</strong> —inyección de fallos y canales laterales— explotan que el silicio salga de su rango válido o que el consumo dependa de los datos. Contramedidas: doble verificación, valores sonoros, retardos aleatorios, detectores integrados (gratis y casi siempre apagados) e implementaciones de tiempo constante.</li>
+  <li><strong>Sin entropía real no hay criptografía.</strong> <code>srand(time(NULL))</code> en un dispositivo que arranca siempre igual genera la misma clave en toda la flota. Usá el TRNG, verificá que arrancó, y probá la salida temprana en varias unidades <em>antes</em> de fabricar.</li>
+  <li><strong>Una identidad única por dispositivo</strong> es la regla que convierte el compromiso de una unidad en el compromiso de una unidad. La clave de flota compartida es el error más caro de la industria, y el plan de revocación se escribe antes de fabricar.</li>
+  <li><strong>La normativa fijó fechas:</strong> RED obligatorio desde el 1/8/2025 con EN 18031; CRA con reporte desde el 11/9/2026 (24 h / 72 h) y aplicación plena el 11/12/2027, con SBOM y soporte mínimo de cinco años; EN 303 645 V3.1.3 y PSTI como línea base de consumo. Son capacidades organizativas, no features.</li>
+  <li><strong>Suficiente es cuando el costo del ataque supera el valor del activo</strong>, con dos multiplicadores: la escala de la flota y lo que el dispositivo custodia. Cerrá N1 y N2 antes de gastar un peso en N3.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí el modelo de amenazas completo de un producto tuyo (o de uno que uses): los cinco activos de la tabla de CF6.1 con su valuación, el nivel de adversario objetivo con justificación, y los seis supuestos explícitos. El entregable es un documento de una página en el repositorio, no un párrafo.</li>
+  <li>Sobre una placa de evaluación <strong>tuya</strong>, medí con <code>DWT-&gt;CYCCNT</code> el costo real en ciclos de SHA-256 sobre 64 KB, de una verificación ECDSA-P256 y de AES-GCM sobre 1 KB, con y sin el acelerador por hardware. Armá la tabla con <em>tus</em> números y comparalos con los de CF6.5.</li>
+  <li>Tomá el presupuesto de energía de CF3 para un nodo a pila que arranca cada 10 minutos durante 3 años y calculá qué porcentaje de la batería se va en verificar la firma en cada arranque. Proponé y cuantificá dos alternativas de diseño que bajen ese número.</li>
+  <li>Implementá el <em>smoke test</em> del TRNG de CF6.8 en tu placa y capturá la salida de los primeros 10 ms tras el arranque en al menos cinco encendidos. ¿Coinciden? Documentá qué encontraste; si coinciden, tenés un hallazgo real.</li>
+  <li>Escribí el script de verificación de producción que confirma, sobre una placa terminada, que la protección de lectura está en el nivel esperado, y que <strong>falla el test</strong> si no lo está. Que emita una línea por número de serie a un CSV auditable.</li>
+  <li>Endurecé la ruta de decisión crítica de un firmware tuyo contra fallo único: valores sonoros, doble verificación, contador de flujo de control. Medí cuánta latencia agregó y decidí, con el dato en la mano, si el activo lo justifica.</li>
+  <li>Generá el SBOM de un proyecto embebido tuyo (Zephyr con <code>west spdx</code>, o CycloneDX) y pasalo por un analizador de vulnerabilidades. Contá cuántos componentes aparecen que no sabías que tenías, y cuántos no tienen versión declarada.</li>
+  <li>Auditá la tabla normativa de CF6.10 contra un producto real del mercado: leé su documentación pública y determiná si declara período de soporte, si publica un contacto de divulgación de vulnerabilidades y si documenta el mecanismo de actualización. Es un ejercicio de lectura de documentación pública, no de análisis del dispositivo.</li>
+  <li>Rehacé la tabla de composición del Worked Example para un producto distinto (una cámara, un medidor, un wearable) con sus tres fallas más probables, y calculá el cociente entre el costo del rediseño y el costo del recambio de flota.</li>
+</ol>
+
+<section class="quiz" id="quizCF_S6">
+  <style>
+    #quizCF_S6{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCF_S6 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCF_S6 .q{margin-bottom:1.5rem}
+    #quizCF_S6 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCF_S6 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCF_S6 .opt:hover{border-color:var(--accent)}
+    #quizCF_S6 .opt:disabled{cursor:default}
+    #quizCF_S6 .opt.ok{background:rgba(63,185,80,.16);border-color:var(--success)}
+    #quizCF_S6 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizCF_S6 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCF_S6 .exp.show{display:block}
+    #quizCF_S6 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu bootloader verifica la firma ECDSA de cada imagen antes de instalarla, y la verificación es correcta. Aun así, un atacante logra reinstalar una versión anterior con una vulnerabilidad conocida y la explota. ¿Qué faltó?</p>
+    <button class="opt">La firma estaba mal implementada: si verificara bien, la imagen vieja sería rechazada</button>
+    <button class="opt">Faltaba cifrar el payload de la actualización</button>
+    <button class="opt">Faltaba la propiedad de frescura: un contador monotónico anti-rollback en OTP</button>
+    <div class="exp">La firma prueba <strong>origen</strong>, no <strong>actualidad</strong>, y no caduca: la versión vieja lleva tu firma legítima para siempre. Para rechazarla hace falta estado en el dispositivo que solo pueda avanzar y sobreviva a un corte de alimentación — un contador de versión de seguridad en OTP o en un elemento seguro. Cifrar el payload protege la propiedad intelectual, no la frescura. Y cuidado: ese contador es finito (16–64 incrementos típicos) y solo se quema <em>después</em> de confirmar que la imagen nueva arranca bien.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Estás diseñando un sensor de consumo a pila. El presupuesto no da para un elemento seguro y el MCU no tiene acelerador AES. ¿Qué elegís para cifrar y autenticar la telemetría, y por qué?</p>
+    <button class="opt">ChaCha20-Poly1305: es rápido en software con operaciones de 32 bits y es naturalmente de tiempo constante</button>
+    <button class="opt">AES-256-GCM, porque 256 bits siempre es más seguro que 128 y el estándar lo exige</button>
+    <button class="opt">RSA-2048, porque al ser asimétrico no hace falta compartir clave con el servidor</button>
+    <div class="exp">Sin acelerador AES, ChaCha20-Poly1305 gana claramente: fue diseñado para ser rápido con sumas y rotaciones de 32 bits —justo lo que un Cortex-M hace bien— y al no usar tablas de sustitución indexadas por el secreto evita de entrada una familia de canales laterales. AES-256 por software en un nodo a pila cuesta más ciclos y más energía sin comprar seguridad adicional relevante para este perfil. Y RSA-2048 es inviable: <em>firmar</em> puede llevar segundos de CPU, y los certificados no entran cómodos en la RAM ni en el presupuesto de radio.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tu producto se vende en la UE y ya tiene secure boot, OTA firmada e identidad única por dispositivo. Estás cómodo con la ciberseguridad técnica. ¿Qué te sigue faltando para el Cyber Resilience Act?</p>
+    <button class="opt">Nada: con secure boot, OTA firmada e identidad única el CRA se considera cumplido</button>
+    <button class="opt">Capacidades organizativas: SBOM legible por máquina, período de soporte declarado, política de divulgación y capacidad de reportar en 24/72 h</button>
+    <button class="opt">Certificación PSA Certified Nivel 4, que el CRA exige para todo producto conectado</button>
+    <div class="exp">El CRA no se satisface solo con controles técnicos en el firmware: exige <strong>procesos sostenidos en el tiempo</strong>. Un SBOM en formato legible por máquina generado en el mismo build que el binario, un período de soporte declarado en el punto de venta (por regla general no inferior a cinco años), una política de divulgación coordinada con un canal que alguien efectivamente lee, y la capacidad de emitir una alerta temprana en 24 horas y una notificación en 72 ante una vulnerabilidad activamente explotada — obligación que empieza a regir el 11 de septiembre de 2026, antes que el grueso del reglamento el 11 de diciembre de 2027. PSA Certified es un esquema voluntario que aporta evidencia reutilizable, no un requisito, y ningún nivel de certificación reemplaza esos procesos.</div>
+  </div>
+
+  <div class="score" id="scoreCF_S6"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCF_S6');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCF_S6').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CF7.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cf5-integridad-senal/lecture.html">← CF5: Integridad de señal</a>
+  <a href="../cf7-tinyml-edge/lecture.html">CF7: TinyML en el borde →</a>
+</nav>
+
+</div>
+</body>
+</html>

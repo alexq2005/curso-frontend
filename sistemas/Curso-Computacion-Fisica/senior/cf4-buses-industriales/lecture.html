@@ -1,0 +1,1131 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CF4 — Buses y protocolos: cuando el cable tiene 40 metros y ruido · Computación Física Senior</title>
+  <meta name="description" content="I2C y SPI por dentro (pull-ups, clock stretching, bus colgado, modos CPOL/CPHA), señalización diferencial, RS-485 con terminación y polarización, CAN y su arbitraje no destructivo, Modbus, CAN FD/XL y 10BASE-T1S en 2026, diseño defensivo de protocolo y depuración con osciloscopio.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física Senior</a>
+  <a href="../../index.html">⚡ Curso de Computación Física</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CF4</span>
+  <span class="badge">⏱ 65–140 min</span>
+  <span class="badge">🎯 Pre-req: E03–E05 + CF2</span>
+  <span class="badge">🔌 Buses e integridad</span>
+</div>
+
+<article>
+
+<h1>CF4 — Buses y protocolos: cuando el cable tiene 40 metros y ruido</h1>
+
+<h2>CF4.0 Por qué este módulo</h2>
+
+<p>En <a href="../../e05-sensores-actuadores/lecture.html">E05</a> conectaste sensores por I2C y SPI y funcionó. En el protoboard funciona <em>siempre</em>: los cables miden 10 cm, la única fuente de ruido es la fuente conmutada del USB, y si algo se cuelga apretás el botón de reset. En una planta no tenés nada de eso. Tenés 200 metros de cable pasando al lado de un variador de frecuencia de 15 kW, doce nodos que arrancan y paran en momentos distintos, y un nodo que se muere a las tres de la mañana sin que nadie lo vea hasta que la línea se para.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un bus de escritorio y un bus industrial no se diferencian por la velocidad ni por el número de pines. Se diferencian por <strong>qué pasa cuando algo sale mal</strong>: cuando entra ruido, cuando la distancia estira los flancos, cuando dos nodos hablan a la vez, cuando uno desaparece. I2C y SPI no tienen respuesta para ninguna de esas cuatro preguntas. RS-485 y CAN fueron diseñados alrededor de ellas. Elegir bus es elegir cuál de esos modos de falla estás dispuesto a manejar vos mismo en software.
+</div>
+
+<p>Este módulo va por dentro del protocolo. No es "cómo leer un BME280" —eso ya lo hiciste—, es <strong>por qué el bus se cuelga, qué exactamente estira un pull-up mal calculado, cómo un nodo CAN pierde una arbitración sin corromper nada, y por qué en Modbus el orden de los bytes de un float sigue siendo un problema en 2026</strong>.</p>
+
+<div class="rule">
+  <strong>📌 La pregunta que ordena todo el módulo.</strong> Ante cualquier bus, preguntá tres cosas: <strong>(1)</strong> ¿cómo se detecta un error?, <strong>(2)</strong> ¿qué pasa si dos nodos transmiten al mismo tiempo?, <strong>(3)</strong> ¿cómo me entero de que un nodo desapareció? Si el bus no responde alguna, la respuesta la vas a tener que escribir vos en la capa de aplicación (CF4.11). No hay una cuarta opción.
+</div>
+
+<h2>CF4.1 I2C por dentro: direcciones, ACK, clock stretching y arbitraje</h2>
+
+<p>I2C es <strong>drenaje abierto</strong> (<em>open-drain</em>): ningún dispositivo pone nunca un "1" activo en la línea. Los dispositivos solo saben tirar la línea a masa; el "1" lo produce la resistencia de pull-up cargando la capacitancia del bus. Esa decisión de diseño explica casi todo lo demás: por qué se pueden conectar chips de 3,3 V y 5 V con cuidado, por qué el arbitraje es gratis, por qué un esclavo puede frenar al maestro, y por qué la longitud del bus tiene un techo duro.</p>
+
+<pre><code class="lang-c">// Una transacción de escritura completa, campo por campo
+//
+//  S │ 1101000 │ W │ A │  0x1B  │ A │  0x40  │ A │ P
+//  ▲     ▲       ▲   ▲     ▲      ▲     ▲      ▲   ▲
+//  │     │       │   │     │      │     │      │   └─ STOP: SDA sube con SCL alto
+//  │     │       │   │     │      │     │      └───── ACK del esclavo
+//  │     │       │   │     │      │     └──────────── dato a escribir
+//  │     │       │   │     │      └────────────────── ACK del esclavo
+//  │     │       │   │     └───────────────────────── registro destino
+//  │     │       │   └─────────────────────────────── ACK: el esclavo bajó SDA
+//  │     │       └─────────────────────────────────── R/W = 0 (escritura)
+//  │     └─────────────────────────────────────────── dirección de 7 bits = 0x68
+//  └───────────────────────────────────────────────── START: SDA baja con SCL alto</code></pre>
+
+<h3>Direccionamiento: 112 direcciones, no 128</h3>
+
+<p>Los 7 bits de dirección dan 128 combinaciones, pero <strong>16 están reservadas</strong> por la especificación (0000xxx y 1111xxx: llamada general, byte de START, direccionamiento de 10 bits, Device ID). Quedan <strong>112 direcciones usables</strong>. En la práctica tenés muchas menos, porque cada familia de chips ocupa un rango fijo y solo te deja mover uno o dos bits con pines de configuración.</p>
+
+<div class="mistake">
+  <strong>El choque de direcciones es el problema número uno de I2C en un producto real.</strong> Dos sensores de temperatura del mismo fabricante quieren la misma dirección y solo uno tiene pin de selección. Las salidas: un <strong>multiplexor I2C</strong> (TCA9548A: 8 ramas conmutadas, y de paso te divide la capacitancia del bus en 8), un segundo periférico I2C del micro, o cambiar de proveedor. Esto se decide en el esquemático, no en el firmware: descubrirlo con la placa fabricada cuesta un <em>respin</em>.
+</div>
+
+<h3>ACK / NACK: la única realimentación que tenés</h3>
+
+<p>Después de cada byte, el receptor tira SDA a masa durante el noveno pulso de reloj. Eso es un ACK. Si nadie la tira, la resistencia la deja en alto y el maestro lee un NACK. Es <strong>lo único</strong> que I2C te dice sobre el estado del otro extremo, y es información valiosísima: un NACK en el byte de dirección significa "ese chip no está, o no responde, o está ocupado". Un escaneo del bus es literalmente mandar un START con cada dirección y anotar quién contesta.</p>
+
+<pre><code class="lang-c">// Escaneo de bus: la primera herramienta de diagnóstico de I2C
+// Devuelve un mapa de bits de 128 posiciones con quién respondió.
+void i2c_scan(uint8_t mapa[16]) {
+    memset(mapa, 0, 16);
+    for (uint8_t addr = 0x08; addr &lt;= 0x77; addr++) {   // 0x00-0x07 y 0x78-0x7F reservadas
+        i2c_start();
+        bool ack = i2c_write_byte((uint8_t)((addr &lt;&lt; 1) | 0));  // dirección + W
+        i2c_stop();
+        if (ack) mapa[addr &gt;&gt; 3] |= (uint8_t)(1u &lt;&lt; (addr &amp; 7));
+    }
+}</code></pre>
+
+<div class="tip">
+  En Linux embebido el equivalente es <code class="lang-bash">i2cdetect -y 1</code>. Es la primera orden que corrés ante cualquier problema de I2C, antes de tocar una línea de código: te separa "problema de cableado/alimentación/dirección" de "problema de driver". Si el chip no aparece en el escaneo, no hay driver que lo arregle.
+</div>
+
+<h3>Clock stretching: el esclavo también manda</h3>
+
+<p>El maestro genera SCL, pero como la línea es open-drain, <strong>un esclavo puede mantenerla baja después de que el maestro la soltó</strong>. El maestro, que está obligado a verificar que SCL llegó realmente a nivel alto antes de seguir, espera. Eso es <em>clock stretching</em>: el mecanismo por el cual un esclavo lento dice "dame un momento, todavía estoy convirtiendo".</p>
+
+<table>
+<thead><tr><th>Aspecto</th><th>Realidad</th></tr></thead>
+<tbody>
+<tr><td>Quién lo usa</td><td>ADCs, sensores con conversión larga, esclavos implementados en software (bit-bang)</td></tr>
+<tr><td>Soporte en periféricos de hardware</td><td>Casi universal <em>como maestro</em>; irregular en algunos SoC viejos y en varios adaptadores USB-I2C baratos</td></tr>
+<tr><td>Límite de tiempo</td><td>La especificación base <strong>no fija ninguno</strong>. Solo el modo SMBus impone 25 ms (T<sub>LOW:SEXT</sub>)</td></tr>
+<tr><td>Riesgo</td><td>Un esclavo que estira para siempre bloquea el bus entero: sin timeout, tu firmware queda colgado en una función de librería</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Un <em>stretch</em> sin límite es un cuelgue disfrazado.</strong> Cualquier driver I2C que uses en producción tiene que tener un timeout propio en la espera de SCL alto —típicamente 25–50 ms, tomado prestado de SMBus— y devolver un error, no quedarse en un <code>while (!SCL_alto());</code>. Si el periférico de hardware de tu micro no lo implementa, lo implementás vos con el <em>watchdog</em> de tarea del RTOS (CF1). Un bus I2C es exactamente el tipo de cosa que hace que un firmware "estable" se cuelgue una vez por mes.
+</div>
+
+<h3>Arbitraje multi-maestro: gratis, y casi nunca usado</h3>
+
+<p>Como todos son open-drain, si dos maestros arrancan a la vez el bus queda en la <strong>AND cableada</strong> de lo que ambos transmiten. Cada maestro relee SDA después de escribirla: si escribió un 1 y lee un 0, otro maestro está transmitiendo una dirección de menor valor, así que <strong>pierde el arbitraje y se retira sin corromper nada</strong>. El ganador ni se entera. Es el mismo principio que usa CAN (CF4.8), pero I2C llegó primero.</p>
+
+<div class="info">
+  Multi-maestro en I2C es correcto en el papel y frágil en la práctica: muchos periféricos de hardware lo implementan a medias, la detección de colisión depende de <em>timing</em> fino, y la depuración es horrible. En la mayoría de los diseños reales I2C es de <strong>un solo maestro</strong>, y cuando hacen falta dos cerebros se los conecta por otro camino (SPI, UART, mailbox en RAM compartida). Que un bus soporte algo no significa que convenga usarlo.
+</div>
+
+<h2>CF4.2 Los pull-ups: el cálculo que decide si tu bus anda</h2>
+
+<p>Acá está el número que separa el proyecto de fin de semana del diseño. El valor del pull-up no es "10 k porque siempre pongo 10 k". Está acotado por abajo y por arriba, y las dos cotas se calculan.</p>
+
+<div class="concept">
+  <strong>💡 Las dos cotas.</strong> <strong>Mínimo</strong>: el chip que tira la línea a masa solo puede hundir cierta corriente (I<sub>OL</sub> = 3 mA en la especificación) sin perder el nivel bajo válido (V<sub>OL</sub> = 0,4 V). <strong>Máximo</strong>: el pull-up y la capacitancia del bus forman un RC, y el flanco de subida tiene que completarse dentro del tiempo que permite el modo de velocidad. Entre esas dos cotas está tu ventana. Si el bus está muy cargado, la ventana se cierra y el bus deja de funcionar sin importar qué resistencia pongas.
+</div>
+
+<pre><code class="lang-python"># Cálculo de la ventana de pull-up para I2C (UM10204 rev. 7.0)
+VDD, VOL, IOL = 3.3, 0.4, 3e-3          # V, V, A
+
+def ventana(tr_max, cb):
+    """tr_max: tiempo de subida permitido [s]; cb: capacitancia del bus [F]"""
+    rp_min = (VDD - VOL) / IOL           # no hundir más de 3 mA
+    rp_max = tr_max / (0.8473 * cb)      # 0.8473 = ln(0.7/0.3): 30% -&gt; 70% de VDD
+    return rp_min, rp_max
+
+# Standard mode, 100 kHz: tr = 1000 ns, bus cargado a 400 pF (el tope de la spec)
+print(ventana(1000e-9, 400e-12))   # (967 Ω, 2951 Ω)
+
+# Fast mode, 400 kHz: tr = 300 ns, bus modesto de 200 pF
+print(ventana(300e-9, 200e-12))    # (967 Ω, 1770 Ω)
+
+# Fast mode plus, 1 MHz: tr = 120 ns, 200 pF  →  la ventana se CIERRA
+print(ventana(120e-9, 200e-12))    # (967 Ω, 708 Ω)  ←── rp_max &lt; rp_min: IMPOSIBLE</code></pre>
+
+<div class="rule">
+  <strong>📌 Cuando R<sub>max</sub> queda por debajo de R<sub>min</sub>, no hay resistencia que sirva.</strong> El bus está sobrecargado para esa velocidad. Las únicas salidas reales son: bajar la frecuencia, reducir la capacitancia (menos dispositivos, pistas más cortas, partir el bus con un multiplexor) o usar un <strong>acelerador de bus activo</strong> (LTC4311, TCA4311A) que inyecta corriente durante el flanco de subida. Cambiar el pull-up no arregla nada.
+</div>
+
+<h3>De dónde sale la capacitancia</h3>
+
+<table>
+<thead><tr><th>Fuente</th><th>Aporte típico</th><th>Comentario</th></tr></thead>
+<tbody>
+<tr><td>Pin de cada dispositivo</td><td>5–10 pF</td><td>Está en la hoja de datos como C<sub>i</sub>. Diez sensores ya son 50–100 pF</td></tr>
+<tr><td>Pista de PCB</td><td>~1 pF/cm</td><td>Depende del apilado; 30 cm de pista son ~30 pF</td></tr>
+<tr><td>Cable plano / ribbon</td><td>50–100 pF/m</td><td>Un metro de ribbon se come un cuarto del presupuesto</td></tr>
+<tr><td>Cable apantallado</td><td>100 pF/m o más</td><td>La malla es una placa de un capacitor. Peor que el ribbon</td></tr>
+<tr><td>Punta de osciloscopio pasiva ×1</td><td>~100 pF</td><td>Sí: <strong>medir mal cambia el resultado</strong>. Usá ×10 (~10 pF)</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El techo real de longitud de I2C.</strong> Con 400 pF de presupuesto total y un cable que aporta 100 pF/m, el máximo teórico son <strong>unos 3–4 metros</strong>, y eso asumiendo que el resto del bus no consume nada. En la práctica, I2C fuera de una placa se sostiene bien hasta <strong>30–50 cm</strong>; más allá empieza a ser una lotería que depende de la temperatura del día. I2C <strong>no es un bus de cable</strong>: es un bus de placa. Todo lo que sigue en este módulo existe porque esa frase es cierta.
+</div>
+
+<h2>CF4.3 El bus colgado: cómo pasa y cómo se sale</h2>
+
+<p>Este es el modo de falla característico de I2C y aparece en el 100% de los proyectos que duran lo suficiente. La secuencia es siempre la misma:</p>
+
+<div class="step"><strong>1.</strong> El maestro está leyendo un byte del esclavo. El esclavo está poniendo un bit <strong>0</strong>, o sea, tiene SDA tirada a masa.</div>
+<div class="step"><strong>2.</strong> En ese instante el maestro se reinicia: <em>watchdog</em>, brownout, alguien apretó el botón, un depurador enganchó.</div>
+<div class="step"><strong>3.</strong> El maestro arranca con SCL y SDA como entradas. Pero <strong>el esclavo no se reinició</strong>: sigue en medio de su transferencia, esperando el próximo pulso de reloj para soltar SDA.</div>
+<div class="step"><strong>4.</strong> SDA queda baja para siempre. El maestro intenta generar un START, ve SDA ya en bajo, y todas sus transacciones fallan. El bus está <strong>colgado</strong>.</div>
+
+<p>Es un <em>deadlock</em> puro: cada uno espera al otro. Y no se sale reseteando el maestro otra vez, porque el problema está del otro lado. La única salida por software es <strong>darle al esclavo los pulsos de reloj que le faltan</strong> para que termine su byte y suelte la línea.</p>
+
+<pre><code class="lang-c">// Recuperación de bus colgado. Se llama SIEMPRE al inicializar el bus,
+// antes de configurar el periférico de hardware de I2C.
+// Los pines se manejan como GPIO open-drain durante la maniobra.
+bool i2c_bus_recover(void) {
+    i2c_pins_as_open_drain_gpio();
+    SDA_release();                       // ambos en alto: solo sueltan, no fuerzan
+    SCL_release();
+    delay_us(5);
+
+    if (sda_read()) {                    // SDA ya está libre: no hay nada que recuperar
+        i2c_pins_as_peripheral();
+        return true;
+    }
+
+    // Hasta 9 pulsos: lo máximo que le puede faltar a un esclavo es un byte + ACK
+    for (int i = 0; i &lt; 9 &amp;&amp; !sda_read(); i++) {
+        SCL_drive_low();  delay_us(5);
+        SCL_release();    delay_us(5);
+        if (!scl_read()) return false;   // SCL tampoco sube: falla de hardware, no de estado
+    }
+
+    if (!sda_read()) return false;       // el esclavo sigue trabado: hay que cortarle la alimentación
+
+    // START + STOP para dejar a todos en un estado conocido
+    SDA_drive_low();  delay_us(5);       // START
+    SCL_drive_low();  delay_us(5);
+    SCL_release();    delay_us(5);
+    SDA_release();    delay_us(5);       // STOP
+
+    i2c_pins_as_peripheral();
+    return true;
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Nueve pulsos, no ocho.</strong> Al esclavo le puede faltar terminar los 8 bits del dato <em>más</em> el ciclo de ACK. Nueve es el peor caso. Si después de nueve pulsos SDA sigue baja, no es un problema de secuencia: el esclavo está en un estado del que no sale, y la única recuperación es <strong>cortarle la alimentación</strong>. Por eso en diseños serios cada rama de I2C tiene un <em>load switch</em> controlado por el micro: es la diferencia entre un reinicio remoto y mandar a alguien a la planta.
+</div>
+
+<div class="mistake">
+  <strong>El error de diagnóstico clásico:</strong> ver que el bus falla, medir con el multímetro y encontrar SDA en 0 V, y concluir "se quemó el sensor". Casi nunca está quemado. Está esperando un reloj que nunca va a llegar. Antes de desoldar nada, corré la rutina de recuperación: en la mayoría de los casos el bus vuelve en tres milisegundos.
+</div>
+
+<h2>CF4.4 SPI por dentro: los cuatro modos y el silencio del esclavo</h2>
+
+<p>SPI es lo opuesto a I2C en todo: salidas <em>push-pull</em> (activas en ambos niveles, sin RC que espere), sin direcciones (un pin de selección por dispositivo), sin ACK, sin arbitraje, sin límite de velocidad en la especificación —porque no hay especificación: SPI es una convención de la industria, no un estándar—. Es rápido y tonto, y esa combinación es exactamente lo que querés para un ADC de 10 Msps y exactamente lo que no querés para un bus que sale de la placa.</p>
+
+<h3>CPOL y CPHA: deducirlos de la hoja de datos, no adivinarlos</h3>
+
+<table>
+<thead><tr><th>Modo</th><th>CPOL</th><th>CPHA</th><th>SCK en reposo</th><th>El dato se muestrea en...</th><th>Uso típico</th></tr></thead>
+<tbody>
+<tr><td><strong>0</strong></td><td>0</td><td>0</td><td>Bajo</td><td>Flanco de subida (el primero)</td><td>El más común: memorias flash, muchos sensores</td></tr>
+<tr><td><strong>1</strong></td><td>0</td><td>1</td><td>Bajo</td><td>Flanco de bajada (el segundo)</td><td>Algunos ADC y DAC</td></tr>
+<tr><td><strong>2</strong></td><td>1</td><td>0</td><td>Alto</td><td>Flanco de bajada (el primero)</td><td>Poco frecuente</td></tr>
+<tr><td><strong>3</strong></td><td>1</td><td>1</td><td>Alto</td><td>Flanco de subida (el segundo)</td><td>Común en ADC industriales y radios</td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>La regla mnemotécnica que sirve de verdad:</strong> <strong>CPOL</strong> es el nivel de SCK cuando no pasa nada (0 = reposo bajo). <strong>CPHA</strong> dice en cuál de los dos flancos de cada bit se <em>captura</em> el dato: CPHA=0 captura en el <strong>primer</strong> flanco del período, CPHA=1 en el <strong>segundo</strong>. Y en todos los casos el transmisor cambia el dato en el flanco opuesto al de captura, para que llegue estable.
+</div>
+
+<p>La hoja de datos nunca dice "modo 2". Dice el diagrama. Se lee así:</p>
+
+<pre><code class="lang-c">// Cómo se deduce el modo de un cronograma de hoja de datos
+//
+//        ┌──┐  ┌──┐  ┌──┐  ┌──┐         SCK arranca en ALTO y baja
+//  SCK ──┘  └──┘  └──┘  └──┘  └──       →  reposo alto  →  CPOL = 1
+//
+//  SDO ──╥─────╥─────╥─────╥─────       la flecha de muestreo del datasheet
+//        ▲     ▲     ▲     ▲            cae sobre el flanco de SUBIDA
+//     muestreo (segundo flanco de cada período, porque el primero es la bajada)
+//                                       →  CPHA = 1
+//
+//  CPOL=1, CPHA=1  →  MODO 3
+//
+// Comprobación empírica cuando el datasheet es ambiguo (pasa seguido con
+// clones chinos): leé un registro cuyo valor conozcas —casi todos los chips
+// tienen un WHO_AM_I o CHIP_ID— probando los 4 modos. El correcto es el único
+// que devuelve el valor esperado. Los otros devuelven el dato corrido un bit,
+// que es la firma inconfundible de un CPHA equivocado.</code></pre>
+
+<div class="mistake">
+  <strong>Un CPHA equivocado no da basura: da el dato desplazado un bit.</strong> Leés 0x68 en vez de 0xD0, o 0x34 en vez de 0x68. Si ves valores que son el doble o la mitad exacta de lo esperado, no busques en tu código de conversión: cambiá CPHA. Un CPOL equivocado, en cambio, suele fallar solo en el primer bit o funcionar de casualidad, lo que es todavía peor porque falla intermitentemente al cambiar la frecuencia.
+</div>
+
+<h3>Velocidad real contra velocidad de catálogo</h3>
+
+<p>"SPI llega a 50 MHz" es cierto para el silicio y falso para tu placa. Lo que te limita:</p>
+
+<table>
+<thead><tr><th>Límite</th><th>Magnitud típica</th><th>Qué hacer</th></tr></thead>
+<tbody>
+<tr><td>Retardo de propagación ida y vuelta</td><td>~5 ns por cada 1 m de cable, ×2</td><td>Es el techo duro. Con 20 cm ya perdés ~2 ns de margen</td></tr>
+<tr><td>t<sub>V</sub> del esclavo (dato válido tras el flanco)</td><td>10–40 ns</td><td>Está en la hoja de datos. Sumalo al retardo</td></tr>
+<tr><td>Capacitancia de la línea contra la corriente del <em>driver</em></td><td>Flancos de 5–20 ns</td><td>Serie de 22–33 Ω en el origen (ver <a href="../cf5-integridad-senal/lecture.html">CF5</a>)</td></tr>
+<tr><td>Reflexiones en pistas largas</td><td>Sobrepico y <em>ringing</em></td><td>Terminación serie; el mismo tema de CF5</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ SPI no tiene ACK, y eso es más grave de lo que parece.</strong> Si el esclavo no está alimentado, si el cable de MISO se cortó, si el chip se colgó: el maestro <strong>no se entera</strong>. Recibe 0xFF (línea flotante con pull-up) o 0x00 (línea flotante con pull-down) y sigue como si nada. Un SPI mal defendido reporta alegremente una temperatura de −40 °C o de 850 °C durante días. La defensa mínima es leer siempre un registro de identidad conocido al arrancar y, en el bucle, verificar que el dato esté dentro de un rango físicamente posible <em>y</em> que cambie. Un valor perfectamente constante durante mil lecturas es un sensor muerto, no un sensor estable.
+</div>
+
+<pre><code class="lang-c">// Defensa mínima para un SPI de producción: identidad + plausibilidad + vida
+typedef struct {
+    int16_t  ultimo;
+    uint16_t iguales;      // cuántas lecturas idénticas seguidas
+    bool     valido;
+} sensor_estado_t;
+
+#define REPETICIONES_SOSPECHOSAS 200     // ajustar al ruido real del sensor
+
+bool sensor_leer(sensor_estado_t *st, int16_t *out) {
+    int16_t v = spi_leer_registro_16(REG_TEMP);
+
+    if (v == (int16_t)0xFFFF || v == 0) {          // MISO flotante o a masa
+        st-&gt;valido = false;  return false;
+    }
+    if (v &lt; RANGO_MIN || v &gt; RANGO_MAX) {          // fuera de lo físicamente posible
+        st-&gt;valido = false;  return false;
+    }
+    if (v == st-&gt;ultimo) {
+        if (++st-&gt;iguales &gt; REPETICIONES_SOSPECHOSAS) {   // congelado: sensor muerto
+            st-&gt;valido = false;  return false;
+        }
+    } else {
+        st-&gt;iguales = 0;
+    }
+
+    st-&gt;ultimo = v;  st-&gt;valido = true;  *out = v;
+    return true;
+}</code></pre>
+
+<h2>CF4.5 La tabla honesta: I2C vs SPI vs UART</h2>
+
+<table>
+<thead><tr><th></th><th>I2C</th><th>SPI</th><th>UART</th></tr></thead>
+<tbody>
+<tr><td><strong>Pines</strong></td><td>2 (SDA, SCL)</td><td>3 + 1 por esclavo (CS)</td><td>2 (TX, RX)</td></tr>
+<tr><td><strong>Velocidad práctica</strong></td><td>100 kHz / 400 kHz; 1 MHz con esfuerzo</td><td>1–50 MHz según placa</td><td>9600 bps – 3 Mbps</td></tr>
+<tr><td><strong>Distancia realista</strong></td><td>30–50 cm (techo teórico 3–4 m)</td><td>10–30 cm</td><td>1–15 m con cable decente</td></tr>
+<tr><td><strong>Nodos</strong></td><td>Hasta 112 (limitado por capacitancia mucho antes)</td><td>1 por pin de CS disponible</td><td>2, punto a punto</td></tr>
+<tr><td><strong>Detección de errores</strong></td><td>Solo ACK/NACK: sabés si contestó, no si el dato llegó bien</td><td><strong>Ninguna</strong></td><td>Bit de paridad (débil) o nada</td></tr>
+<tr><td><strong>Reloj</strong></td><td>Compartido (síncrono)</td><td>Compartido (síncrono)</td><td>Independiente (asíncrono): los dos extremos deben coincidir en baudios</td></tr>
+<tr><td><strong>Multi-maestro</strong></td><td>Sí, por arbitraje AND cableada</td><td>No</td><td>No</td></tr>
+<tr><td><strong>Flujo controlado por el esclavo</strong></td><td>Sí (clock stretching)</td><td>No</td><td>Sí, con RTS/CTS por hardware</td></tr>
+<tr><td><strong>Cuándo elegirlo</strong></td><td>Muchos sensores lentos en la misma placa, pocos pines</td><td>Un dispositivo rápido: ADC, flash, pantalla, radio</td><td>Consola, módulos GPS/GSM, enlace punto a punto entre dos placas</td></tr>
+<tr><td><strong>Cuándo NO</strong></td><td>Cualquier cosa que salga de la placa o que sea crítica sin capa extra</td><td>Fuera de la placa, o si necesitás saber si el otro está vivo</td><td>Más de dos nodos, o ambientes ruidosos sin conversión a diferencial</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Ninguno de los tres detecta un bit corrompido.</strong> I2C te dice si alguien contestó; SPI ni eso; UART tiene paridad, que se le escapa cualquier número par de errores. Los tres asumen que el medio es confiable. Esa suposición es razonable dentro de una placa y es falsa apenas hay un conector, un cable y un motor cerca. Ahí empieza el resto del módulo.
+</div>
+
+<h2>CF4.6 Señalización diferencial: la física de por qué el par trenzado gana</h2>
+
+<p>Un bus de un solo hilo (<em>single-ended</em>) mide la tensión de la señal <strong>contra su masa</strong>. Esa es toda la vulnerabilidad. Cualquier cosa que sume tensión al conductor —o que corra la masa— se interpreta como señal.</p>
+
+<div class="concept">
+  <strong>💡 El mecanismo, en una frase.</strong> En señalización diferencial la información no está en la tensión de un cable, sino en la <strong>diferencia entre dos</strong>. Si los dos cables van juntos y trenzados, todo lo que les entra por acoplamiento capacitivo o inductivo les entra <strong>casi igual a los dos</strong> —eso es el <em>modo común</em>—, y la resta lo elimina. El ruido se suma; la diferencia lo cancela.
+</div>
+
+<pre><code class="lang-c">// Un pulso de 3 V de ruido acoplado en un tramo de cable
+//
+// SINGLE-ENDED (una señal contra masa):
+//   señal        2,0 V  +  3,0 V de ruido  =  5,0 V leídos
+//   umbral del receptor: 1,5 V   →   ve un "1" que nadie transmitió.  ERROR.
+//
+// DIFERENCIAL (dos conductores trenzados, A y B):
+//   A            2,0 V  +  3,0 V  =  5,0 V
+//   B            0,5 V  +  3,0 V  =  3,5 V        ← el MISMO ruido en ambos
+//   ─────────────────────────────────────────
+//   A − B        1,5 V             1,5 V          ← la diferencia NO cambió
+//   umbral del receptor: ±200 mV   →   el bit sigue siendo el mismo. OK.</code></pre>
+
+<p>El trenzado no es decorativo: es lo que hace que ambos conductores vean <strong>el mismo</strong> campo. Cada media vuelta invierte la orientación del lazo respecto del campo externo, de modo que la tensión inducida en una media vuelta cancela la de la siguiente. Un par trenzado con 20 vueltas por metro rechaza campos magnéticos varios órdenes de magnitud mejor que dos cables paralelos sueltos. Y como los dos conductores llevan corrientes iguales y opuestas, el lazo que forman es minúsculo: <strong>tampoco emiten</strong>, que es la otra mitad de la compatibilidad electromagnética.</p>
+
+<table>
+<thead><tr><th>Parámetro</th><th>Single-ended (I2C, SPI, UART TTL)</th><th>Diferencial (RS-485, CAN)</th></tr></thead>
+<tbody>
+<tr><td>Referencia del bit</td><td>La masa local del receptor</td><td>El otro conductor del par</td></tr>
+<tr><td>Umbral de decisión</td><td>~0,5·V<sub>DD</sub> (1,65 V en 3,3 V)</td><td>±200 mV de diferencia</td></tr>
+<tr><td>Rango de modo común tolerado</td><td>Prácticamente cero</td><td>−7 V a +12 V (RS-485); −12 V a +12 V (CAN)</td></tr>
+<tr><td>Diferencia de masas entre extremos</td><td>Fatal por encima de unos cientos de mV</td><td>Absorbida hasta el límite de modo común</td></tr>
+<tr><td>Emisión electromagnética propia</td><td>Alta: lazo grande contra el plano de masa</td><td>Baja: corrientes opuestas, lazo mínimo</td></tr>
+<tr><td>Costo</td><td>Cero: sale del pin del micro</td><td>Un transceptor por nodo (1–4 USD) + par trenzado</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Ese rango de modo común de −7 V a +12 V es la razón práctica número uno por la que RS-485 sobrevive en una planta. Entre dos extremos de un edificio, con corrientes de retorno de motores circulando por la estructura, es normal encontrar <strong>varios voltios de diferencia entre las masas</strong>. Para un UART TTL eso es el fin. Para RS-485 es un día cualquiera. Y cuando la diferencia supera esos 7 V —o cuando no querés que circule corriente por el común—, se aísla galvánicamente (CF4.13).
+</div>
+
+<h2>CF4.7 RS-485: terminación, polarización y dirección del transceptor</h2>
+
+<p>RS-485 (hoy TIA/EIA-485-A) es solo una <strong>capa física</strong>: define niveles eléctricos, no tramas. Lo que corre encima lo elegís vos: Modbus RTU, DMX512, Profibus, BACnet MS/TP o tu propio protocolo (CF4.11). Es diferencial, half-duplex por defecto, multipunto, y aguanta 1200 metros. También es donde más gente se equivoca, porque parece un UART con dos cables más.</p>
+
+<h3>Half vs full duplex</h3>
+
+<table>
+<thead><tr><th></th><th>Half duplex (2 hilos)</th><th>Full duplex (4 hilos)</th></tr></thead>
+<tbody>
+<tr><td>Conductores</td><td>Un par + común</td><td>Dos pares + común</td></tr>
+<tr><td>Dirección</td><td>Uno a la vez: hay que conmutar el transceptor</td><td>Simultánea; el maestro puede escuchar mientras habla</td></tr>
+<tr><td>Terminación</td><td>120 Ω en los dos extremos del par</td><td>120 Ω en los dos extremos de <strong>cada</strong> par</td></tr>
+<tr><td>Complejidad del firmware</td><td>Alta: control de DE y <em>timing</em> de vuelta</td><td>Baja: es un UART largo</td></tr>
+<tr><td>Uso</td><td>Modbus RTU, la enorme mayoría del parque instalado</td><td>Enlaces punto a punto rápidos, o cuando el firmware no puede manejar el <em>turnaround</em></td></tr>
+</tbody>
+</table>
+
+<h3>Terminación: 120 Ω, en los dos extremos, y solo ahí</h3>
+
+<p>El par trenzado tiene una impedancia característica de aproximadamente 120 Ω. Una línea de transmisión que termina en una impedancia distinta a la suya <strong>refleja</strong> parte de la energía hacia atrás, y esa reflexión se suma a la señal original produciendo sobrepico y <em>ringing</em>. Poner 120 Ω en el extremo hace que la línea "no vea el final" y absorba la energía sin devolverla. El tema está desarrollado en <a href="../cf5-integridad-senal/lecture.html">CF5</a>; acá interesa la regla operativa.</p>
+
+<pre><code class="lang-c">// Topología correcta: cadena margarita (daisy chain), terminada en los DOS extremos
+//
+//   [120Ω]──┬──────────┬──────────┬──────────┬──────────┬──[120Ω]
+//           │          │          │          │          │
+//        nodo 1     nodo 2     nodo 3     nodo 4     nodo 12
+//        (maestro)
+//
+// Topología INCORRECTA: estrella, o derivaciones (stubs) largas
+//
+//   [120Ω]──┬──────────┬──────────────────┬──[120Ω]
+//           │          │                  │
+//        nodo 1     nodo 2          ┌─────┴─────┐
+//                                   │  40 cm    │   ← cada stub es una antena
+//                                nodo 3      nodo 4      y un punto de reflexión</code></pre>
+
+<div class="rule">
+  <strong>📌 Dos terminadores. Exactamente dos.</strong> Uno en cada extremo eléctrico del cable, no en el nodo "más importante". <strong>Con uno solo</strong> el extremo sin terminar refleja y el error aparece de forma intermitente, dependiendo de la longitud y la velocidad. <strong>Con tres o más</strong> la carga baja de 60 Ω y el transceptor no logra los 1,5 V diferenciales mínimos exigidos: la señal se aplasta y el margen de ruido desaparece. Las derivaciones deben ser lo más cortas posible; la referencia habitual es mantenerlas por debajo de unos 30 cm a velocidades moderadas, y mucho menos si vas rápido.
+</div>
+
+<h3>Polarización de reposo: el problema del bus mudo</h3>
+
+<p>En half-duplex, entre transmisión y transmisión <strong>nadie maneja el bus</strong>: todos los transceptores están en alta impedancia. Las líneas quedan flotando en la tensión que le impongan la terminación y el ruido. Un receptor viejo, con umbral simétrico de ±200 mV, interpreta ese ruido como bits al azar: cada UART del bus ve caracteres fantasma, errores de <em>framing</em>, y tu <em>parser</em> se llena de basura entre trama y trama.</p>
+
+<pre><code class="lang-python"># Polarización de reposo ("fail-safe biasing"): forzar A−B por encima de +200 mV
+# cuando nadie transmite. Las dos terminaciones de 120 Ω quedan en paralelo = 60 Ω.
+#
+#     +5 V ──[Rup]──┬── A ──┐
+#                   │       [60 Ω]   (120 Ω ∥ 120 Ω)
+#      GND ──[Rdn]──┴── B ──┘
+
+VCC, RT_PAR = 5.0, 60.0
+
+def v_idle(rup, rdn=None):
+    rdn = rdn if rdn is not None else rup
+    return VCC * RT_PAR / (rup + RT_PAR + rdn)
+
+print(f"{v_idle(560)*1000:.0f} mV")    # 254 mV  → por encima del umbral: OK
+print(f"{v_idle(1000)*1000:.0f} mV")   # 146 mV  → insuficiente: el bus sigue indefinido
+print(f"{v_idle(4700)*1000:.0f} mV")   #  31 mV  → inútil, es el error típico
+
+# Carga adicional que la polarización impone al transmisor: Rup + Rdn en serie
+print(f"carga extra con 560 Ω: {560+560} Ω")   # 1120 Ω, en paralelo con los 60 Ω</code></pre>
+
+<div class="tip">
+  <strong>Antes de agregar resistencias, leé la hoja de datos del transceptor.</strong> Los transceptores modernos con <em>true fail-safe receiver</em> (SN65HVD1780, MAX3070E, ADM3078E y muchos otros) tienen el umbral <strong>corrido</strong> —típicamente entre −200 mV y −50 mV— de modo que con el bus en reposo la salida es un "1" garantizado sin ninguna polarización externa. Si todos los nodos del bus son de ese tipo, la polarización externa no solo es innecesaria: es contraproducente, porque carga el bus y reduce el margen de tensión diferencial. La regla es <strong>polarizar una sola vez, en un solo punto del bus</strong>, y solo si hace falta.
+</div>
+
+<h3>Control de dirección: el error que produce fallas intermitentes</h3>
+
+<p>En half-duplex el transceptor tiene un pin DE (<em>Driver Enable</em>) que decide si el nodo maneja el bus o escucha. Manejarlo mal es la causa más frecuente de "el bus anda pero pierde tramas cada tanto". Hay dos errores simétricos:</p>
+
+<div class="step"><strong>Soltar temprano.</strong> Bajás DE apenas escribiste el último byte en el registro del UART, pero el UART todavía lo está <em>desplazando</em> por el cable. El último carácter sale truncado. El esclavo lo descarta por CRC y no responde. Se manifiesta como "el último nodo de la lista nunca contesta".</div>
+
+<div class="step"><strong>Soltar tarde.</strong> Bajás DE varios tiempos de bit después del último bit de stop. Durante ese tiempo tu nodo sigue manejando el bus, y si el esclavo empieza a responder rápido, <strong>tu propio transmisor le pisa el arranque de la respuesta</strong>. Se manifiesta como fallas intermitentes que dependen de <em>qué</em> esclavo responde, porque cada uno tiene un tiempo de respuesta distinto. Es el caso del Worked Example.</div>
+
+<pre><code class="lang-c">// El único momento correcto para bajar DE: cuando el registro de DESPLAZAMIENTO
+// terminó (TC / TXE), no cuando el buffer de transmisión quedó libre (TXE-buffer).
+//
+//  DE ──┐                                            ┌──────
+//       └────────────────────────────────────────────┘
+//       ▲                                            ▲
+//       │  último bit de STOP sale del shift register│
+//       │                                            └─ aquí, ni antes ni después
+//       └─ subir DE al menos 1 tiempo de bit antes del START
+
+void rs485_enviar(const uint8_t *buf, size_t n) {
+    uart_limpiar_flag_tc();
+    DE_alto();
+    delay_bit_times(1);                  // el transceptor necesita t_EN (~50-100 ns)
+                                         // y el bus tiene que estabilizarse
+    for (size_t i = 0; i &lt; n; i++) {
+        while (!uart_txe()) { }          // buffer libre
+        uart_escribir(buf[i]);
+    }
+    while (!uart_tc()) { }               // ← CLAVE: el SHIFT REGISTER se vació
+    DE_bajo();                           // recién ahora soltamos el bus
+}
+
+// En un RTOS: nunca hagas ese while() bloqueante en una tarea de prioridad alta.
+// Usá la interrupción de TC para bajar DE, o el modo RS-485 por hardware que
+// traen muchos UART modernos (STM32: USART_CR3_DEM, con DEAT/DEDT programables
+// en cuartos de tiempo de bit). Si tu micro lo tiene, usalo: elimina esta clase
+// entera de bugs porque el silicio maneja DE con precisión de sub-bit.</code></pre>
+
+<h3>Longitud y velocidad: no son independientes</h3>
+
+<table>
+<thead><tr><th>Velocidad</th><th>Longitud máxima orientativa</th><th>Contexto</th></tr></thead>
+<tbody>
+<tr><td>9600 bps</td><td>1200 m</td><td>El clásico de Modbus RTU en planta</td></tr>
+<tr><td>19200 bps</td><td>1200 m</td><td>Todavía dentro del límite de atenuación</td></tr>
+<tr><td>115200 bps</td><td>~800 m</td><td>Empieza a mandar la distorsión del cable</td></tr>
+<tr><td>1 Mbps</td><td>~100 m</td><td>Regla práctica: velocidad × longitud ≈ 10<sup>8</sup></td></tr>
+<tr><td>10 Mbps</td><td>~10 m</td><td>Fuera del terreno de "bus de planta"</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  La cantidad de nodos también tiene tope: la norma define una <strong>carga unitaria</strong> (UL) y permite 32 en un segmento. Los transceptores modernos declaran 1/8 UL o 1/10 UL, lo que permite <strong>hasta 256 nodos</strong> en un mismo segmento. Pero cada nodo agrega capacitancia y cada conector agrega una discontinuidad de impedancia: pasar de 32 nodos reales sin repetidores es posible y raramente prudente.
+</div>
+
+<h2>CF4.8 CAN: arbitraje no destructivo y confinamiento de nodos</h2>
+
+<p>CAN nació en Bosch en 1986 para el automóvil, un ambiente con requisitos brutales: temperatura de −40 a 125 °C, ruido de bujías e inyectores, y la exigencia de que <strong>una falla en un nodo no pueda tumbar la red</strong>. El resultado es el bus de campo mejor diseñado que existe, y su mecanismo central —el arbitraje— es una idea preciosa.</p>
+
+<h3>El arbitraje, explicado bien</h3>
+
+<p>CAN también es una AND cableada: el estado <strong>dominante</strong> (0 lógico) gana sobre el <strong>recesivo</strong> (1 lógico). Cuando dos nodos empiezan a transmitir simultáneamente, ambos van comparando bit a bit lo que <em>transmiten</em> contra lo que <em>leen</em> en el bus. Mientras coincidan, siguen. En el instante en que un nodo transmite recesivo y lee dominante, sabe que otro nodo con un identificador de menor valor está transmitiendo, y <strong>se retira en silencio</strong>.</p>
+
+<pre><code class="lang-c">// Arbitraje CAN: dos nodos arrancan a la vez. Identificadores de 11 bits.
+//
+//  bit nº           10  9  8  7  6  5  4  3  2  1  0
+//  nodo A (0x0C3)    0  0  0  0  1  1  0  0  0  1  1
+//  nodo B (0x0C7)    0  0  0  0  1  1  0  0  1  1  1
+//  ──────────────────────────────────────────────────
+//  bus (AND)         0  0  0  0  1  1  0  0  0  1  1
+//                                         ▲
+//                     bit 2: B transmite recesivo (1) y LEE dominante (0)
+//                     →  B pierde, se calla y reintenta después
+//                     →  A ni se entera: su trama sale ENTERA, sin retardo
+//
+// Propiedades que se deducen:
+//   · ID menor  = prioridad mayor  (más ceros al principio = más dominante)
+//   · NO destructivo: no se pierde ancho de banda, no hay colisión ni backoff
+//   · La latencia de la trama de máxima prioridad es DETERMINISTA y calculable
+//   · Cada nodo debe poder leer el bus DENTRO del mismo tiempo de bit, y de ahí
+//     sale el límite velocidad-distancia: 1 Mbit/s con 40 m, 125 kbit/s con 500 m</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué esto importa tanto.</strong> Ethernet clásico resolvía las colisiones destruyendo las dos tramas y reintentando con retardo aleatorio (CSMA/CD): eso desperdicia ancho de banda y hace que la latencia del peor caso sea impredecible. CAN resuelve la colisión <strong>sin destruir nada</strong>: la trama más urgente sale completa y a tiempo, siempre. Por eso un auto usa CAN para el ABS: podés <em>demostrar</em> que el mensaje de frenado nunca va a esperar más de X microsegundos, y eso es lo que exige una certificación de seguridad funcional.
+</div>
+
+<h3>Detección de errores en cinco capas</h3>
+
+<table>
+<thead><tr><th>Mecanismo</th><th>Qué detecta</th></tr></thead>
+<tbody>
+<tr><td><strong>CRC de 15 bits</strong> (17 o 21 en CAN FD)</td><td>Corrupción del contenido. Distancia de Hamming 6: detecta hasta 5 bits erróneos en cualquier posición</td></tr>
+<tr><td><strong>Monitoreo de bit</strong></td><td>Cada transmisor relee lo que transmite; si no coincide (fuera de la fase de arbitraje), es un error de bit</td></tr>
+<tr><td><strong>Bit stuffing</strong></td><td>Tras 5 bits iguales se inserta uno del valor opuesto: mantiene la sincronización y detecta violaciones de codificación</td></tr>
+<tr><td><strong>Verificación de forma</strong></td><td>Campos con valor fijo (delimitadores CRC, ACK, fin de trama) que llegan mal</td></tr>
+<tr><td><strong>Ranura de ACK</strong></td><td><strong>Cualquier</strong> nodo que reciba la trama correctamente pone un dominante ahí. El transmisor sabe que al menos uno la recibió bien</td></tr>
+</tbody>
+</table>
+
+<h3>Confinamiento de errores: cómo un nodo enfermo se autoexcluye</h3>
+
+<p>Esta es la parte que ningún otro bus de campo tiene, y es la respuesta a la pregunta "¿qué pasa cuando un nodo se vuelve loco?". Cada nodo mantiene dos contadores: TEC (errores como transmisor) y REC (errores como receptor). Suben 8 por error y bajan 1 por trama exitosa —asimetría deliberada: cuesta ocho aciertos compensar un fallo.</p>
+
+<pre><code class="lang-c">// Máquina de estados del confinamiento de errores (ISO 11898-1)
+//
+//   ┌──────────────────┐  TEC o REC ≥ 128   ┌───────────────────┐
+//   │  ERROR ACTIVE    │ ─────────────────▶ │  ERROR PASSIVE    │
+//   │                  │ ◀───────────────── │                   │
+//   │ Señaliza errores │  ambos ≤ 127       │ Señaliza con flag │
+//   │ con flag ACTIVO  │                    │ PASIVO: 6 bits    │
+//   │ (6 dominantes):  │                    │ RECESIVOS, que no │
+//   │ interrumpe el    │                    │ molestan a nadie  │
+//   │ tráfico de todos │                    │ + espera extra    │
+//   └──────────────────┘                    └─────────┬─────────┘
+//            ▲                                        │ TEC ≥ 256
+//            │  128 × 11 bits recesivos seguidos      ▼
+//            │  (recuperación automática, opcional)  ┌───────────────┐
+//            └────────────────────────────────────── │   BUS OFF     │
+//                                                    │ desconectado  │
+//                                                    │ del bus       │
+//                                                    └───────────────┘
+//
+// La consecuencia de diseño: un nodo con el transceptor roto, que ensucia
+// el bus con errores, PRIMERO deja de poder molestar (error passive) y
+// DESPUÉS se desconecta solo (bus off). La red sigue funcionando sin él.
+// Ningún nodo defectuoso puede tumbar la red entera.</code></pre>
+
+<div class="rule">
+  <strong>📌 En tu firmware, "bus off" es un evento que hay que atender explícitamente.</strong> Muchos controladores CAN permiten la recuperación automática, y muchos ingenieros la dejan activada sin pensarlo. Es una decisión con consecuencias: un nodo que entra y sale de bus off en bucle está inyectando ráfagas de error periódicas. Lo correcto es <strong>contar los eventos de bus off, registrarlos, y aplicar un retardo creciente</strong>; si se repiten, el nodo debe reportar su propia falla por otro canal y quedarse afuera. El silencio no es una estrategia de recuperación.
+</div>
+
+<pre><code class="lang-bash"># Diagnóstico de CAN en Linux con SocketCAN: la caja de herramientas estándar
+sudo ip link set can0 type can bitrate 500000 restart-ms 100
+sudo ip link set can0 up
+
+candump can0                     # todo el tráfico, en vivo
+candump -e any,0:0,#FFFFFFFF     # SOLO tramas de error: lo primero que mirás
+candump can0 -td                 # con delta de tiempo entre tramas
+cansend can0 0C3#DEADBEEF        # inyectar una trama
+
+ip -details -statistics link show can0
+#   ... state ERROR-PASSIVE (berr-counter tx 132 rx 0)
+#   ... bus-error 47  restarts 3
+# Esos contadores son la verdad del bus. Si "bus-error" crece, hay un problema
+# FÍSICO: terminación, cable, masa o velocidad mal configurada en algún nodo.</code></pre>
+
+<div class="mistake">
+  <strong>El error de configuración más común en CAN:</strong> un nodo con la velocidad mal puesta. No produce "no se comunica": produce <strong>que el nodo mal configurado destruya tramas ajenas</strong>, porque interpreta mal los bits y emite <em>error frames</em> sobre transmisiones perfectamente válidas. El síntoma es una red que empeora al agregar un nodo. Se confirma en segundos mirando el contador <code>bus-error</code> y desconectando nodos de a uno.
+</div>
+
+<h2>CF4.9 El paisaje en 2026: CAN FD, CAN XL y 10BASE-T1S</h2>
+
+<p>El CAN clásico tiene dos limitaciones que la industria terminó por sentir: <strong>8 bytes de carga útil</strong> y <strong>1 Mbit/s</strong>. Las respuestas llegaron en dos oleadas.</p>
+
+<table>
+<thead><tr><th></th><th>CAN clásico</th><th>CAN FD</th><th>CAN XL</th></tr></thead>
+<tbody>
+<tr><td>Carga útil</td><td>0–8 bytes</td><td>0–64 bytes</td><td>1–2048 bytes</td></tr>
+<tr><td>Velocidad de la fase de datos</td><td>1 Mbit/s</td><td>2–8 Mbit/s</td><td>Hasta 20 Mbit/s con transceptor SIC XL</td></tr>
+<tr><td>Norma</td><td>ISO 11898-1</td><td>ISO 11898-1:2015</td><td><strong>ISO 11898-1:2024 / -2:2024</strong>, CiA 610-1 y 610-3</td></tr>
+<tr><td>CRC</td><td>15 bits</td><td>17 bits (≤16 B) / 21 bits</td><td>32 bits, más un campo de seguridad</td></tr>
+<tr><td>Arbitraje</td><td colspan="3">Idéntico en los tres: la fase de arbitraje sigue siendo a velocidad baja y no destructiva</td></tr>
+<tr><td>Estado en 2026</td><td>Enorme parque instalado</td><td>Mayoritario en vehículos nuevos</td><td>Silicio disponible (Bosch, NXP, Infineon, Renesas, ST, TI); despliegue todavía incipiente</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La idea de CAN FD y CAN XL en una línea:</strong> el arbitraje se hace a velocidad baja —porque necesita que la señal recorra el bus dentro de un tiempo de bit— y una vez que un nodo <em>ganó</em> el bus, ya nadie más transmite, así que la fase de datos puede acelerar. Ese es el bit BRS (<em>Bit Rate Switch</em>): cambia de marcha en el medio de la trama. Se conserva el arbitraje determinista y se multiplica el caudal.
+</div>
+
+<h3>10BASE-T1S: Ethernet sobre un par, y qué desplaza realmente</h3>
+
+<p>La otra novedad —y la que más ruido hace— es <strong>Single Pair Ethernet</strong>. Bajo IEEE 802.3cg (2019) hay en realidad dos cosas distintas que conviene no confundir:</p>
+
+<table>
+<thead><tr><th></th><th>10BASE-T1S</th><th>10BASE-T1L</th></tr></thead>
+<tbody>
+<tr><td>Topología</td><td>Multipunto (multidrop) sobre un mismo par</td><td>Punto a punto</td></tr>
+<tr><td>Nodos y alcance</td><td>Hasta 8 nodos en ~25 m (segmento mixto)</td><td>2 nodos, hasta 1000 m</td></tr>
+<tr><td>Acceso al medio</td><td><strong>PLCA</strong>: turnos por ronda, sin colisiones, latencia acotada</td><td>No aplica: es punto a punto</td></tr>
+<tr><td>Destino</td><td>Arquitecturas zonales de automóvil; redes de sensores baratas</td><td>Industria de proceso, Ethernet-APL, áreas con requisitos de seguridad intrínseca</td></tr>
+<tr><td>Ventaja estructural</td><td colspan="2">Es <strong>Ethernet de verdad</strong>: pila IP, TLS, herramientas estándar, sin pasarelas de protocolo en el medio</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Estado real a 2026.</strong> El ecosistema ya es comercial, no de laboratorio: NXP puso en el mercado transceptores PMD 10BASE-T1S a comienzos de 2026 —el TJA1410 para automóvil, con cumplimiento ISO 26262 hasta ASIL B y detección de topología OPEN Alliance TC14, y el TJF1410 orientado a industria, que el propio fabricante posiciona explícitamente como <strong>camino de migración desde Modbus y RS-485</strong>—. Es una señal fuerte de hacia dónde va el diseño nuevo.
+</div>
+
+<div class="warn">
+  <strong>Pero "camino de migración" no es "reemplazo".</strong> A 2026, RS-485, Modbus y CAN siguen dominando el parque instalado por un margen abrumador, y ese parque tiene una vida útil de 15 a 30 años. Un actuador instalado en 2012 va a seguir hablando Modbus RTU en 2035. Lo que cambia es <strong>dónde conviene invertir en un diseño nuevo</strong>: si estás arrancando de cero, con requisitos de caudal o de seguridad, Single Pair Ethernet es una opción legítima que hace cinco años no existía. Si estás integrando con lo que ya está en la planta, vas a hablar Modbus, y el módulo sigue en CF4.10.
+</div>
+
+<h2>CF4.10 Modbus: el protocolo que no se muere (y no tiene seguridad)</h2>
+
+<p>Modbus lo publicó Modicon en 1979 para sus PLC. Es un protocolo de aplicación primitivo, sin tipos, sin descubrimiento, sin autenticación. Y en 2026 sigue siendo <strong>el idioma común de la automatización industrial</strong>. Entender por qué es entender algo importante sobre la ingeniería en el mundo real.</p>
+
+<h3>El modelo de datos: cuatro espacios de direcciones y ningún tipo</h3>
+
+<table>
+<thead><tr><th>Espacio</th><th>Tamaño</th><th>Acceso</th><th>Uso típico</th><th>Códigos de función</th></tr></thead>
+<tbody>
+<tr><td><em>Coils</em></td><td>1 bit</td><td>Lectura/escritura</td><td>Salidas digitales: relés, válvulas</td><td>01 leer · 05 escribir uno · 15 escribir varios</td></tr>
+<tr><td><em>Discrete inputs</em></td><td>1 bit</td><td>Solo lectura</td><td>Entradas digitales: finales de carrera</td><td>02</td></tr>
+<tr><td><em>Input registers</em></td><td>16 bits</td><td>Solo lectura</td><td>Medidas: temperatura, presión, corriente</td><td>04</td></tr>
+<tr><td><em>Holding registers</em></td><td>16 bits</td><td>Lectura/escritura</td><td>Consignas y parámetros de configuración</td><td>03 leer · 06 escribir uno · 16 escribir varios</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-c">// Trama Modbus RTU: sobre RS-485, delimitada por SILENCIO
+//
+//  ┌──────┬──────┬───────────────────────┬──────────┐
+//  │ addr │ func │        datos          │  CRC-16  │
+//  │  1 B │  1 B │      0 a 252 B        │   2 B    │
+//  └──────┴──────┴───────────────────────┴──────────┘
+//   ▲                                                ▲
+//   └── silencio de 3,5 caracteres ──────────────────┘  silencio de 3,5 caracteres
+//
+//  · ADU máxima: 256 bytes. PDU máxima: 253 bytes
+//  · Direcciones 1 a 247. La 0 es difusión (nadie responde)
+//  · Por encima de 19200 baudios el silencio se fija en 1,750 ms (no se escala)
+//  · CRC-16 con polinomio 0x8005 reflejado (0xA001), valor inicial 0xFFFF
+//
+// Trama Modbus TCP: la MISMA PDU, con cabecera MBAP y SIN CRC (lo hace TCP)
+//
+//  ┌────────────┬────────────┬──────────┬──────┬──────┬─────────┐
+//  │ trans. ID  │ proto ID=0 │ longitud │ unit │ func │  datos  │
+//  │    2 B     │    2 B     │   2 B    │ 1 B  │ 1 B  │         │
+//  └────────────┴────────────┴──────────┴──────┴──────┴─────────┘
+//   puerto 502</code></pre>
+
+<pre><code class="lang-c">// CRC-16 de Modbus RTU. Versión sin tabla: 20 líneas, cabe en cualquier micro.
+uint16_t modbus_crc16(const uint8_t *buf, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i &lt; len; i++) {
+        crc ^= (uint16_t)buf[i];
+        for (int b = 0; b &lt; 8; b++) {
+            if (crc &amp; 1) crc = (uint16_t)((crc &gt;&gt; 1) ^ 0xA001);
+            else         crc = (uint16_t)(crc &gt;&gt; 1);
+        }
+    }
+    return crc;               // se transmite en little-endian: primero el byte bajo
+}
+
+// Verificación: modbus_crc16("\x01\x03\x00\x00\x00\x0A", 6) == 0xCDC5
+// Guardá ese vector de prueba como test unitario. Un CRC mal implementado
+// "funciona" con la mayoría de las tramas y falla con unas pocas: es el peor
+// tipo de bug, porque parece un problema de cableado.</code></pre>
+
+<div class="mistake">
+  <strong>El problema de los 32 bits.</strong> Modbus solo conoce registros de 16 bits. Un <code>float</code> o un <code>int32</code> ocupan dos registros consecutivos, y <strong>la norma no dice en qué orden</strong>. Cada fabricante eligió el suyo: big-endian, little-endian, y las dos variantes con las palabras intercambiadas ("word swap"). Son cuatro combinaciones y vas a encontrar las cuatro en la misma planta. La solución práctica es hacer el orden <strong>configurable por dispositivo</strong> y validarlo contra un valor conocido durante la puesta en marcha. No hay forma de deducirlo del protocolo.
+</div>
+
+<h3>Por qué sigue vivo</h3>
+
+<div class="step"><strong>1. Es trivial de implementar.</strong> Un esclavo Modbus RTU completo entra en 2 KB de flash. Cualquier micro de 8 bits lo corre. Eso lo puso en absolutamente todos lados.</div>
+<div class="step"><strong>2. No tiene licencia ni consorcio.</strong> La especificación es pública y gratuita. Profibus, DeviceNet y EtherCAT tienen organizaciones, cuotas y certificaciones detrás.</div>
+<div class="step"><strong>3. El efecto de red del parque instalado.</strong> Un fabricante de variadores que no hable Modbus no se puede integrar con lo que sus clientes ya tienen. La compatibilidad se autoperpetúa.</div>
+<div class="step"><strong>4. Resuelve el 90% de los casos.</strong> Leer veinte medidas y escribir cinco consignas cada segundo. Para eso, un protocolo de 1979 alcanza y sobra.</div>
+
+<div class="danger">
+  <strong>⚠️ Modbus no tiene seguridad. Ninguna.</strong> Sin autenticación, sin cifrado, sin control de integridad más allá de un CRC que solo protege contra ruido —no contra un atacante, que simplemente lo recalcula—. Cualquiera con acceso al medio puede leer todo el proceso y escribir cualquier registro: abrir una válvula, cambiar una consigna, parar una línea. Existe <strong>Modbus/TCP Security</strong> (TLS con certificados X.509 sobre el puerto 802, especificado en 2018) pero su adopción sigue siendo marginal. Y el dato duro de 2026 es que <strong>Modbus/TCP es el servicio de tecnología operativa más frecuentemente expuesto a internet</strong>. La defensa no está en el protocolo: está en la arquitectura de red —segmentación, zonas y conductos, diodos de datos, monitoreo pasivo—. Eso se trabaja en el <strong>track senior de Ciberseguridad</strong>; acá quedate con que <em>Modbus asume un medio confiable y ese supuesto ya no es cierto</em>.
+</div>
+
+<h2>CF4.11 Tu protocolo de aplicación: framing, CRC, timeouts, idempotencia</h2>
+
+<p>Tarde o temprano vas a necesitar mandar tus propios datos por RS-485 o por un UART largo. Escribir un protocolo binario propio es perfectamente razonable —Modbus no siempre encaja—, pero tiene cuatro problemas obligatorios que resolver. Saltear cualquiera produce un sistema que anda en el banco de pruebas y falla en la planta.</p>
+
+<h3>1. Framing: dónde empieza y dónde termina una trama</h3>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Cómo funciona</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><strong>Silencio</strong> (Modbus RTU)</td><td>Un hueco de 3,5 caracteres delimita</td><td>Exige medir tiempos con precisión; incompatible con enlaces que agrupan datos (USB, TCP)</td></tr>
+<tr><td><strong>Byte de inicio + longitud</strong></td><td>0xAA, luego N, luego N bytes</td><td>Un byte de longitud corrupto desincroniza toda la sesión hasta el próximo timeout</td></tr>
+<tr><td><strong>Byte-stuffing / COBS</strong></td><td>Se reserva 0x00 como delimitador y se codifica el resto para que no aparezca</td><td>~0,4% de sobrecarga; <strong>resincronización garantizada</strong> en el próximo delimitador</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Para un enlace serie propio, COBS es casi siempre la respuesta correcta.</strong> Su propiedad clave es que ante <em>cualquier</em> corrupción perdés como máximo una trama: el próximo byte 0x00 vuelve a sincronizar sin ambigüedad. Con "inicio + longitud", un solo byte corrupto puede hacer que el receptor consuma la trama siguiente como si fuera datos, y la falla se propaga. La sobrecarga de COBS es de un byte cada 254, y su implementación entra en 30 líneas.
+</div>
+
+<h3>2. CRC, no suma de verificación</h3>
+
+<pre><code class="lang-python"># Por qué CRC y no una suma: el caso que lo demuestra
+def suma8(bs):  return sum(bs) &amp; 0xFF
+def xor8(bs):
+    r = 0
+    for b in bs: r ^= b
+    return r
+
+original  = bytes([0x10, 0x20, 0x30, 0x40])
+permutado = bytes([0x40, 0x30, 0x20, 0x10])   # bytes reordenados
+compensa  = bytes([0x11, 0x1F, 0x30, 0x40])   # un byte +1 y otro −1
+
+print(suma8(original) == suma8(permutado))    # True  → la suma NO lo detecta
+print(suma8(original) == suma8(compensa))     # True  → tampoco esto
+print(xor8(original)  == xor8(permutado))     # True  → el XOR es aún peor
+
+# Un CRC-16 detecta los tres casos, y además, garantizado por construcción:
+#   · TODOS los errores de 1 y 2 bits
+#   · TODOS los números impares de bits erróneos (si el polinomio tiene el factor x+1)
+#   · TODAS las ráfagas de hasta 16 bits contiguos  ←── el caso REAL: el ruido
+#     industrial llega en ráfagas, no en bits sueltos
+#   · El 99,998% de las ráfagas más largas (1 − 2⁻¹⁶)</code></pre>
+
+<div class="info">
+  Elegí el ancho según el tamaño de la trama: <strong>CRC-8</strong> para tramas de hasta ~15 bytes (es lo que usan SMBus y varios sensores), <strong>CRC-16</strong> hasta unos pocos cientos de bytes —el caso normal en un bus de campo—, <strong>CRC-32</strong> para bloques grandes o actualizaciones de firmware. Y usá un polinomio conocido y publicado (CRC-16/MODBUS, CRC-16/CCITT-FALSE, CRC-32/ISO-HDLC): sus propiedades de detección están demostradas matemáticamente. Un polinomio inventado por vos puede tener una distancia de Hamming pésima sin que se note hasta que algo importante pase inadvertido.
+</div>
+
+<h3>3. Timeouts: el nodo que desaparece</h3>
+
+<pre><code class="lang-c">// Un maestro sin timeout se cuelga con el primer nodo que se apaga.
+// El timeout no es "un número grande": se CALCULA.
+//
+//   T_timeout = T_transmisión + T_propagación + T_proceso_esclavo + T_respuesta + margen
+//
+// Ejemplo: 12 nodos, 19200 baudios, 200 m, trama de petición 8 B, respuesta 25 B
+//   T_transmisión  = (8 + 25) × 10 bits / 19200      = 17,2 ms
+//   T_propagación  = 200 m × 5 ns/m × 2              ≈  0,002 ms   (despreciable)
+//   T_proceso      = según hoja de datos del esclavo ≈  5 ms
+//   margen ×2                                        → T_timeout ≈ 45 ms
+//
+// Y con 12 nodos consultados en secuencia, el peor caso del ciclo completo es
+// 12 × 45 ms = 540 ms. Ese número es el que hay que comparar contra el plazo
+// de tu lazo de control (CF1). Si el lazo necesita 100 ms, este bus NO SIRVE:
+// hay que subir la velocidad, partir la red en dos, o cambiar de arquitectura.
+
+typedef enum { NODO_OK, NODO_DUDOSO, NODO_CAIDO } estado_nodo_t;
+
+typedef struct {
+    uint8_t         fallos_seguidos;
+    uint32_t        t_ultimo_ok;
+    estado_nodo_t   estado;
+} salud_nodo_t;
+
+void nodo_actualizar(salud_nodo_t *s, bool ok, uint32_t ahora) {
+    if (ok) {
+        s-&gt;fallos_seguidos = 0;
+        s-&gt;t_ultimo_ok = ahora;
+        s-&gt;estado = NODO_OK;
+    } else if (++s-&gt;fallos_seguidos &gt;= 3) {   // 3 fallos: no es ruido, es ausencia
+        s-&gt;estado = NODO_CAIDO;               // el proceso debe DECIDIR qué hacer
+    } else {
+        s-&gt;estado = NODO_DUDOSO;              // un fallo aislado es normal en un bus
+    }
+}</code></pre>
+
+<div class="warn">
+  <strong>La pregunta que casi nadie contesta: ¿qué hace el sistema cuando un nodo se cae?</strong> No es una pregunta de comunicaciones, es una pregunta de proceso, y la respuesta es distinta para cada dato. Un sensor de temperatura ambiente que desaparece: se sigue con el último valor y se avisa. Un sensor de nivel en un tanque que se llena: se para la bomba. La regla de ingeniería es que <strong>cada dato que llega por el bus necesita una política explícita de "valor ausente"</strong>, escrita antes de que ocurra. Sin eso, el comportamiento por defecto es "seguir usando un valor viejo para siempre", que es exactamente el peor comportamiento posible.
+</div>
+
+<h3>4. Reintentos idempotentes</h3>
+
+<div class="concept">
+  <strong>💡 El reintento inseguro.</strong> Mandás "incrementá el contador", no llega la respuesta y reintentás. ¿El esclavo ejecutó el comando y se perdió la respuesta, o nunca lo recibió? No podés saberlo. Si ejecutó, tu reintento incrementa dos veces. La solución es diseñar los comandos para que <strong>repetirlos no cambie el resultado</strong>: en vez de "incrementá", "poné el contador en 42". En vez de "avanzá 10 mm", "andá a la posición 150 mm". Y cuando el comando es inevitablemente acumulativo, se le agrega un <strong>número de secuencia</strong> que el esclavo recuerda y descarta si se repite.
+</div>
+
+<h2>CF4.12 Depurar un bus: analizador lógico vs osciloscopio</h2>
+
+<p>Las dos herramientas contestan preguntas distintas, y usar la equivocada te hace perder horas.</p>
+
+<table>
+<thead><tr><th></th><th>Analizador lógico</th><th>Osciloscopio</th></tr></thead>
+<tbody>
+<tr><td>Qué muestra</td><td>Unos y ceros según <em>su</em> umbral</td><td>La forma de onda real: amplitud, flancos, ruido, sobrepico</td></tr>
+<tr><td>Canales</td><td>8 a 32, todos a la vez</td><td>2 o 4</td></tr>
+<tr><td>Memoria</td><td>Millones de muestras: capturás segundos enteros</td><td>Escasa: capturás microsegundos</td></tr>
+<tr><td>Decodificación de protocolo</td><td>Excelente: I2C, SPI, UART, CAN, Modbus con las tramas ya interpretadas</td><td>Buena en los modernos, limitada por la memoria</td></tr>
+<tr><td>Precio</td><td>USD 10 a 400</td><td>USD 300 a 5000+</td></tr>
+<tr><td><strong>Responde</strong></td><td>"¿Qué se dijeron?" — lógica y software</td><td>"¿Por qué el bit llegó mal?" — física y eléctrica</td></tr>
+<tr><td><strong>Punto ciego</strong></td><td>Un flanco con 1 V de sobrepico y 300 ns de <em>ringing</em> se ve como un flanco limpio</td><td>No podés capturar la transacción entera: no ves el contexto</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El orden correcto: primero el analizador, después el osciloscopio.</strong> Empezá por el analizador para ver <em>qué</em> se están diciendo los nodos: nueve de cada diez problemas son de lógica (dirección equivocada, modo SPI erróneo, CRC mal calculado, timing de DE), y ahí se ven en un minuto. Pasás al osciloscopio cuando el analizador muestra basura, bits intermitentes, o cuando <strong>todo se ve perfecto y aun así falla</strong>. Ese es exactamente el síntoma de un problema eléctrico: la señal es marginal, tu analizador la interpreta bien con su umbral y el receptor real, con el suyo y con su ruido, no.
+</div>
+
+<pre><code class="lang-bash"># sigrok: analizador lógico desde la terminal, con decodificadores incluidos
+sigrok-cli --driver fx2lafw --config samplerate=4m --samples 4m \
+  --channels D0=SCL,D1=SDA \
+  --protocol-decoder i2c --protocol-decoder-annotations i2c=address-read:address-write:data-read:data-write
+
+# UART sobre RS-485, con el pin DE capturado en paralelo:
+sigrok-cli --driver fx2lafw --config samplerate=8m --samples 16m \
+  --channels D0=RX,D1=DE \
+  --protocol-decoder uart:baudrate=19200:parity=none \
+  -o captura.sr
+# Capturar DE junto con los datos es LO que resuelve los bugs de turnaround:
+# se ve directamente si DE seguía alto cuando empezó a llegar la respuesta.</code></pre>
+
+<h3>Cómo se lee una trama capturada</h3>
+
+<pre><code class="lang-c">// Captura real de un intercambio Modbus RTU, ya decodificado por el analizador
+//
+//  t=0,000 ms  TX  01 03 00 6B 00 03 74 17
+//                  ▲  ▲  ▲──▲  ▲──▲  ▲──▲
+//                  │  │   │     │     └─ CRC-16 (byte bajo primero)
+//                  │  │   │     └─────── cantidad = 3 registros
+//                  │  │   └───────────── dirección inicial = 0x006B = 107
+//                  │  └───────────────── función 03 = leer holding registers
+//                  └──────────────────── esclavo nº 1
+//
+//  t=4,300 ms  RX  01 03 06 02 2B 00 00 00 64 AF 7B
+//                  ▲  ▲  ▲  ▲──────────────▲ ▲──▲
+//                  │  │  │         │          └─ CRC-16
+//                  │  │  │         └──────────── 3 registros: 555, 0, 100
+//                  │  │  └────────────────────── 6 bytes de datos siguen
+//                  │  └───────────────────────── eco de la función: OK
+//                  └──────────────────────────── eco de la dirección: OK
+//
+// Lo que hay que mirar, EN ESTE ORDEN:
+//   1. ¿Se ve la petición completa?     No → problema del maestro o de DE
+//   2. ¿Hay respuesta?                  No → nodo apagado, dirección mala, o timeout corto
+//   3. ¿El primer byte de la respuesta es la dirección correcta?
+//        Si llega truncado o corrido → colisión: DE del maestro soltado tarde
+//   4. ¿El bit 7 de la función está puesto (0x83 en vez de 0x03)?
+//        → es una EXCEPCIÓN Modbus; el byte siguiente dice cuál (02 = dirección ilegal)
+//   5. ¿El CRC cierra?                  No → problema eléctrico: al osciloscopio
+//   6. ¿Cuánto tardó la respuesta?      Comparalo con tu timeout (CF4.11)</code></pre>
+
+<div class="mistake">
+  <strong>El error de medición que inventa problemas que no existen:</strong> usar la punta del osciloscopio con el cable de masa de 15 cm con pinza cocodrilo. Ese cable forma un lazo inductivo que resuena con la capacitancia de la punta y <strong>fabrica un <em>ringing</em> que no está en tu circuito</strong>. En flancos rápidos podés ver 800 mV de sobrepico completamente ficticio. Para cualquier medición de integridad de señal se usa el accesorio de masa de resorte, o la masa del barril de la punta. Y para RS-485 o CAN, medir A y B por separado contra la masa del osciloscopio —que está atada a tierra— es directamente incorrecto: hace falta una punta diferencial, o dos canales con la función matemática A menos B.
+</div>
+
+<h2>CF4.13 Aislamiento galvánico: cuándo hace falta</h2>
+
+<p>Aislar galvánicamente significa que <strong>no hay camino conductivo</strong> entre los dos lados: la señal cruza por acoplamiento óptico, capacitivo o magnético, y las masas quedan independientes. No es un lujo; es lo que evita que una diferencia de potencial entre dos puntos de una instalación destruya tus transceptores o, peor, cierre un lazo de corriente por el bus.</p>
+
+<table>
+<thead><tr><th>Situación</th><th>¿Aislar?</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Todo dentro de una placa</td><td>No</td><td>Una sola masa; aislar solo agrega costo y retardo</td></tr>
+<tr><td>Varias placas en el mismo gabinete, misma fuente</td><td>Generalmente no</td><td>Masa común corta y de baja impedancia</td></tr>
+<tr><td>Nodos en gabinetes distintos, mismo tablero</td><td>Conviene</td><td>Ya hay corriente circulando por la estructura</td></tr>
+<tr><td>Nodos en edificios o pisos distintos</td><td><strong>Sí</strong></td><td>Diferencias de masa de varios voltios, y transitorios de decenas durante una conmutación</td></tr>
+<tr><td>Cerca de motores, variadores o soldadura</td><td><strong>Sí</strong></td><td>Transitorios de modo común de cientos de voltios</td></tr>
+<tr><td>Instrumentación sobre red eléctrica</td><td><strong>Obligatorio</strong></td><td>Seguridad de personas; lo exige la norma, no la conveniencia</td></tr>
+<tr><td>Equipamiento médico con contacto de paciente</td><td><strong>Obligatorio</strong></td><td>Corrientes de fuga limitadas por IEC 60601</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El síntoma que delata la falta de aislamiento.</strong> El bus anda bien, y falla justo cuando arranca un motor, cuando se cierra un contactor, o cuando alguien usa la soldadora en el taller de al lado. La correlación con un evento de potencia es la firma. Y a veces el daño es acumulativo: los transceptores se van degradando durante meses hasta que uno muere, y se lo reemplaza sin entender por qué, y a los seis meses muere el siguiente.
+</div>
+
+<table>
+<thead><tr><th>Solución</th><th>Ejemplo típico</th><th>Qué te cuesta</th></tr></thead>
+<tbody>
+<tr><td>Optoacoplador + DC/DC aislado</td><td>Discreto, con 6N137 y un módulo de 1 W</td><td>Barato en componentes, caro en área y en tiempo de diseño; el óptico es lento y envejece</td></tr>
+<tr><td>Aislador digital + DC/DC</td><td>ADuM1201 + módulo aislado</td><td>Rápido y estable; dos chips y una fuente extra</td></tr>
+<tr><td>Transceptor aislado integrado</td><td>ADM2582E (RS-485 con alimentación aislada a bordo), ISO1050 (CAN), ISO1541 (I2C)</td><td>La opción limpia: un solo chip. 4–9 USD por nodo, decenas de mA de consumo, y +20 a 50 ns de retardo de propagación que hay que restar del presupuesto de tiempo de bit</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El aislamiento no reemplaza al conductor común.</strong> Es un error muy extendido pensar que porque RS-485 es diferencial "alcanza con dos hilos". La norma exige un tercer conductor de referencia entre los comunes aislados de los nodos, justamente para mantener la tensión de modo común dentro del rango de −7 a +12 V. Sin él, los comunes flotan sin control y el modo común puede irse fuera de rango incluso con transceptores aislados. Un cable de RS-485 bien hecho tiene <strong>un par trenzado, una referencia y una malla</strong>, con la malla aterrada <strong>en un solo extremo</strong> para no crear un lazo de tierra.
+</div>
+
+<h2>CF4.14 Cuándo NO usar un bus industrial</h2>
+
+<p>Todo lo anterior tiene un costo real, y el error simétrico al de usar I2C en 40 metros es meterle RS-485 a dos chips que están a 5 cm el uno del otro.</p>
+
+<div class="rule">
+  <strong>📌 Si toda la comunicación ocurre dentro de una misma placa, con una sola masa y sin conectores en el medio: I2C y SPI están perfectos.</strong> Son más baratos, más rápidos de implementar, no necesitan transceptores, no consumen corriente extra, no agregan retardo. Agregar un par de transceptores RS-485 para cruzar una pista de 5 cm suma 4 USD, 30 mA, dos huellas de encapsulado y un modo de falla nuevo, a cambio de exactamente nada.
+</div>
+
+<table>
+<thead><tr><th>Situación</th><th>Elección correcta</th></tr></thead>
+<tbody>
+<tr><td>Sensores en la misma placa que el micro</td><td>I2C o SPI, sin dudarlo</td></tr>
+<tr><td>Placa hija en el mismo gabinete, cable plano corto</td><td>SPI o UART, con pull-ups adecuados y masa robusta</td></tr>
+<tr><td>Dos placas a 3 m, ambiente tranquilo</td><td>UART a velocidad moderada, o RS-485 si querés dormir tranquilo</td></tr>
+<tr><td>De 3 a 50 m, o cualquier ambiente con motores</td><td><strong>RS-485</strong> (con Modbus o protocolo propio) o <strong>CAN</strong></td></tr>
+<tr><td>Muchos nodos, latencia acotada obligatoria, seguridad funcional</td><td><strong>CAN / CAN FD</strong>: el arbitraje y el confinamiento no los da nada más</td></tr>
+<tr><td>Diseño nuevo con requisitos de caudal, o que necesita pila IP de punta a punta</td><td><strong>10BASE-T1S / T1L</strong> (CF4.9), evaluando la madurez del ecosistema</td></tr>
+<tr><td>Ya hay equipamiento instalado en la planta</td><td>Lo que ese equipamiento hable. Casi siempre Modbus RTU</td></tr>
+</tbody>
+</table>
+
+<h2>🧑‍🎓 Worked Example — 12 sensores, 200 metros y tramas que se pierden</h2>
+
+<blockquote>Una red de 12 sensores de temperatura por RS-485, Modbus RTU a 19200 baudios, tendida en 200 m a lo largo de una nave. El maestro consulta a los 12 en rotación. Funciona, pero pierde entre el 3% y el 8% de las tramas, de forma intermitente y sin patrón evidente. El instalador ya cambió el cable y dos sensores. Sigue igual.</blockquote>
+
+<p><strong>Paso 1 — Cuantificar antes de tocar nada.</strong> "Pierde tramas" no es un dato. Se instrumenta el maestro para contar por nodo: timeouts, errores de CRC y excepciones Modbus. Tres horas de registro.</p>
+
+<pre><code class="lang-c">// Tasa de error por nodo, medida ANTES de tocar nada (10.000 peticiones por nodo)
+//
+//  nodo │ timeouts │ CRC malo │ excepción │ total error
+//  ─────┼──────────┼──────────┼───────────┼────────────
+//    1  │     4    │    18    │     0     │   0,22 %
+//    2  │     6    │    21    │     0     │   0,27 %
+//    3  │    12    │   680    │     0     │   6,92 %     ← se destaca
+//    4  │     9    │    24    │     0     │   0,33 %
+//   ...
+//   10  │    11    │   731    │     0     │   7,42 %     ← se destaca
+//   11  │   840    │   102    │     0     │   9,42 %     ← se destaca, PERO distinto
+//   12  │   856    │    97    │     0     │   9,53 %     ← igual que el 11
+//
+// Dos firmas DISTINTAS, y eso ya es medio diagnóstico:
+//   · nodos 3 y 10: CRC malo (la trama LLEGA, pero corrupta)
+//   · nodos 11 y 12: TIMEOUT (la trama no llega, o la respuesta no vuelve)
+//   · nodos 11 y 12 son, además, los dos FÍSICAMENTE MÁS LEJANOS del maestro</code></pre>
+
+<div class="rule">
+  <strong>📌 Antes de mirar una sola forma de onda: las tasas de error separadas por tipo y por nodo ya te dicen dónde mirar.</strong> Errores repartidos parejo apuntan a un problema global (terminación, polarización, velocidad). Errores concentrados en los nodos lejanos apuntan a atenuación o reflexión. Errores en nodos sueltos y salteados apuntan a un acoplamiento local. Sin esta tabla, el osciloscopio te muestra mil cosas y no sabés cuál importa.
+</div>
+
+<p><strong>Paso 2 — Al osciloscopio, con punta diferencial, en el extremo lejano.</strong> Se mide A menos B en el nodo 12, disparando por el flanco de arranque de la respuesta. Aparecen tres cosas:</p>
+
+<pre><code class="lang-c">// Lo que se ve en la pantalla, en el extremo lejano del bus
+//
+// (a) Cada flanco arrastra un escalón que tarda ~1,2 µs en estabilizar:
+//
+//        ┌──────╥─────────────      señal ideal
+//   A−B  │      ╨╥╨─╥─╨──────       lo que se ve: escalón + oscilación
+//     ───┘       ╨──╨               → REFLEXIÓN por línea sin terminar
+//
+// (b) Entre trama y trama, A−B no queda en un nivel definido, sino paseando
+//     entre −80 mV y +90 mV, con el ruido del ambiente:
+//
+//   A−B   ╌╌╌╌╌╱╲╌╱╲╌╌╱╲╌╌╌╌  ← ±200 mV es el umbral: esto es tierra de nadie
+//    0 V  ────────────────────    → SIN POLARIZACIÓN DE REPOSO
+//
+// (c) Al principio de cada respuesta del esclavo, los primeros ~104 µs
+//     aparecen aplastados, con la amplitud diferencial reducida a la mitad:
+//
+//         petición del maestro        respuesta del esclavo
+//    A−B  ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔│▁▁▁▁│▔▔▔▔▔▔▔▔▔▔▔
+//                            └────┘
+//                      dos transmisores manejando el bus a la vez
+//                      → DE DEL MAESTRO SOLTADO TARDE</code></pre>
+
+<p><strong>Paso 3 — Las tres causas, cada una con su medición.</strong></p>
+
+<table>
+<thead><tr><th>#</th><th>Causa</th><th>Evidencia</th><th>Explica</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Terminación solo en el extremo del maestro. El extremo lejano quedó sin los 120 Ω porque el instalador "no llegaba con el cable" y cortó ahí.</td><td>Reflexión visible en el extremo lejano; medida de resistencia del bus desconectado: 120 Ω en vez de 60 Ω</td><td>Los errores de CRC de los nodos 3 y 10, que están cerca de donde la onda reflejada se suma con más amplitud</td></tr>
+<tr><td>2</td><td>Sin polarización de reposo, y los transceptores instalados son de un modelo viejo con umbral simétrico, sin <em>true fail-safe</em>.</td><td>Bus flotando en ±90 mV entre tramas; hoja de datos del transceptor: umbral ±200 mV, sin desplazamiento</td><td>Caracteres fantasma antes de cada respuesta; los esclavos ven basura y descartan la petición legítima que llega pegada</td></tr>
+<tr><td>3</td><td>El firmware del maestro baja DE con el flag de "buffer libre" (TXE) más un retardo fijo de 2 ms, calibrado en el banco a 115200 baudios y nunca revisado al bajar a 19200.</td><td>Solapamiento de 104 µs = <strong>exactamente 2 tiempos de bit</strong> a 19200 baudios</td><td>Los timeouts de los nodos 11 y 12: son los que responden más rápido, así que su arranque es el que queda pisado</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 4 — Corregir de a una, midiendo entre cada corrección.</strong> Esto no es puritanismo metodológico: si aplicás las tres juntas y el problema baja al 1%, no sabés cuál de las tres importaba, ni si alguna empeoró algo.</p>
+
+<table>
+<thead><tr><th>Estado</th><th>Error medio</th><th>Nodos 11–12</th><th>Nodos 3 y 10</th></tr></thead>
+<tbody>
+<tr><td><strong>Inicial</strong></td><td>3,4 %</td><td>9,5 %</td><td>7,2 %</td></tr>
+<tr><td>+ 120 Ω en el extremo lejano</td><td>1,6 %</td><td>9,1 %</td><td>0,4 %</td></tr>
+<tr><td>+ polarización 560/560 Ω en un punto</td><td>1,3 %</td><td>8,8 %</td><td>0,3 %</td></tr>
+<tr><td>+ DE con el flag TC (registro de desplazamiento vacío)</td><td><strong>0,04 %</strong></td><td><strong>0,05 %</strong></td><td><strong>0,03 %</strong></td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Lo que enseña la tabla de resultados.</strong> Las dos primeras correcciones eran <em>correctas</em> y arreglaron un problema real —los nodos 3 y 10 pasaron de 7,2% a 0,4%—, pero no tocaron el problema dominante. El error medio bajó de 3,4% a 1,3% y ahí se estancó, porque el 8,8% de los nodos 11 y 12 seguía intacto. La corrección del firmware, que costó tres líneas de código y cero pesos en materiales, fue la que movió la aguja de verdad. <strong>La lección: "arreglé algo y mejoró" no es lo mismo que "encontré la causa".</strong> Sin la tabla de error por nodo separada por tipo, el equipo se habría quedado en el 1,3% convencido de haber resuelto el caso, y el sistema habría seguido perdiendo una de cada cien lecturas para siempre.
+</div>
+
+<div class="rule">
+  <strong>📌 Y el cierre que separa el trabajo senior:</strong> el residual de 0,04% no es cero, y está bien que no lo sea. Un bus de 200 m en una nave industrial <em>siempre</em> va a tener algún error. Lo que hay que hacer es <strong>dejarlo medido y monitoreado</strong>: el contador de errores por nodo queda expuesto como un dato más del sistema, con un umbral de alarma en, digamos, 0,5%. Así, cuando dentro de dos años alguien instale una máquina nueva al lado del tendido, el sistema avisa antes de que se pierdan datos de proceso, en vez de esperar a que alguien note que algo anda raro.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué I2C tiene un límite duro de longitud y RS-485 no, si los dos mandan bits por un cable?</summary>
+<p>Porque I2C es <em>open-drain</em>: el nivel alto no lo maneja nadie, lo produce una resistencia cargando la capacitancia del bus a través de un RC. Cada metro de cable agrega 50–100 pF, y el tiempo de subida crece proporcionalmente hasta violar la especificación del modo de velocidad. Podés compensar bajando la resistencia, pero solo hasta que el transmisor ya no pueda hundir la corriente necesaria (I<sub>OL</sub> = 3 mA): ahí la ventana entre R<sub>min</sub> y R<sub>max</sub> se cierra y no hay valor posible. Además, I2C es <em>single-ended</em>: mide contra su propia masa, así que cualquier diferencia de potencial entre extremos se lee como señal.</p>
+<p>RS-485 no tiene ninguno de los dos problemas. Sus transmisores son <em>push-pull</em> —manejan activamente los dos niveles, sin RC de por medio— y la información está en la diferencia entre dos conductores trenzados, así que el ruido de modo común y las diferencias de masa (hasta −7/+12 V) se cancelan en la resta. Lo que sí limita a RS-485 es la atenuación y la distorsión del cable, y por eso el límite es un producto velocidad × longitud (aproximadamente 10<sup>8</sup>), no una longitud fija.</p></details>
+
+<details><summary>Dos nodos CAN transmiten al mismo tiempo. Explicá qué pasa con cada trama y por qué no se pierde ancho de banda.</summary>
+<p>Ambos empiezan a transmitir su identificador y, bit a bit, releen el bus mientras escriben. El bus es una AND cableada: el estado dominante (0) gana sobre el recesivo (1). Mientras los dos identificadores coincidan, los dos siguen creyendo que van bien. En el primer bit donde uno transmite recesivo y lee dominante, ese nodo deduce que hay otro con un identificador de menor valor —o sea, de mayor prioridad— y <strong>se retira inmediatamente, pasando a modo receptor</strong>.</p>
+<p>La clave es que el que gana <strong>no se entera de nada</strong>: su trama sale entera, sin un solo bit corrompido y sin un microsegundo de retardo. No hay colisión que destruya datos ni retroceso aleatorio como en CSMA/CD; el nodo que perdió simplemente reintenta cuando el bus queda libre. Por eso el arbitraje se llama <em>no destructivo</em>, por eso no se desperdicia ancho de banda, y por eso se puede <em>calcular</em> la latencia del peor caso del mensaje más prioritario — que es la propiedad que hace a CAN certificable para seguridad funcional.</p></details>
+
+<details><summary>Un bus RS-485 pierde tramas de forma intermitente. Nombrá tres causas físicas distintas y cómo distinguís cuál es, sin cambiar hardware.</summary>
+<p><strong>(1) Terminación incorrecta</strong> —falta en un extremo, o hay de más—: se ve como reflexión y <em>ringing</em> en el osciloscopio, más pronunciada en el extremo sin terminar, y se confirma midiendo la resistencia del bus con todo apagado: debe dar ~60 Ω (dos de 120 Ω en paralelo). 120 Ω significa que falta uno; 40 Ω, que sobra.</p>
+<p><strong>(2) Falta de polarización de reposo</strong>: se ve como una tensión diferencial indefinida entre tramas, paseando dentro de la banda de ±200 mV. El síntoma lógico son caracteres fantasma y errores de <em>framing</em> en los momentos en que nadie transmite.</p>
+<p><strong>(3) Timing de DE mal ajustado</strong>: se ve capturando el pin DE en el analizador lógico junto con los datos. Si DE sigue alto cuando empieza a llegar la respuesta, hay solapamiento; si baja antes de que el último bit de stop salga del registro de desplazamiento, el último carácter sale truncado.</p>
+<p>Y antes de conectar nada: la <strong>tabla de errores por nodo y por tipo</strong> ya orienta. Errores repartidos parejo apuntan a una causa global; concentrados en los nodos lejanos apuntan a reflexión o atenuación; concentrados en los que responden más rápido apuntan al <em>turnaround</em> del maestro.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>I2C</strong> es open-drain: el pull-up y la capacitancia forman un RC que fija dos cotas duras (R<sub>min</sub> por I<sub>OL</sub> = 3 mA, R<sub>max</sub> = t<sub>r</sub> / 0,8473·C<sub>b</sub>). Con 400 pF de presupuesto y 100 pF/m de cable, es un <strong>bus de placa</strong>: 30–50 cm en la práctica, no más.</li>
+  <li>El <strong>bus colgado</strong> —esclavo reteniendo SDA tras un reset del maestro— se recupera con <strong>hasta 9 pulsos de reloj</strong> más START/STOP. Si no sale, hay que cortarle la alimentación: eso se diseña en el esquemático.</li>
+  <li><strong>SPI</strong> es rápido y ciego: sin ACK, no te enterás de que el esclavo no está. Defensa obligatoria: registro de identidad al arrancar, rango físico plausible, y detección de valor congelado.</li>
+  <li>Los <strong>cuatro modos SPI</strong> salen del cronograma: CPOL es el reposo de SCK, CPHA el flanco de captura. Un CPHA errado no da basura: da el dato <strong>corrido un bit</strong>.</li>
+  <li><strong>Señalización diferencial</strong>: el ruido se acopla igual a los dos conductores trenzados y la resta lo elimina. Eso da −7/+12 V de rango de modo común, que es lo que hace posible tender 1200 m en una planta.</li>
+  <li><strong>RS-485</strong>: 120 Ω en <strong>los dos extremos y solo ahí</strong>; polarización de reposo <strong>en un solo punto</strong> y solo si los transceptores no son <em>true fail-safe</em>; DE se baja con el flag de registro de desplazamiento vacío (TC), nunca con el de buffer libre ni con un retardo fijo.</li>
+  <li><strong>CAN</strong>: arbitraje no destructivo por identificador (AND cableada) → la trama prioritaria sale entera y con latencia calculable. Cinco capas de detección de errores y <strong>confinamiento</strong> (error passive → bus off) que garantiza que un nodo defectuoso no pueda tumbar la red.</li>
+  <li><strong>2026</strong>: CAN FD es mayoritario en vehículos nuevos; <strong>CAN XL</strong> está normalizado (ISO 11898-1:2024 / -2:2024, CiA 610) con silicio de varios fabricantes pero despliegue incipiente; <strong>10BASE-T1S</strong> tiene transceptores comerciales (NXP TJA1410/TJF1410, 2026) y se posiciona como migración desde Modbus/RS-485 — sin desplazar todavía al parque instalado.</li>
+  <li><strong>Modbus</strong> sobrevive por simplicidad, ausencia de licencia y efecto de red. No tiene seguridad: es el servicio OT más expuesto a internet. La defensa es de arquitectura de red, no de protocolo (track de Ciberseguridad).</li>
+  <li>Un protocolo propio necesita cuatro cosas <strong>sin excepción</strong>: framing resincronizable (COBS), <strong>CRC</strong> (no suma: no detecta permutaciones ni errores compensados), timeout calculado, y comandos <strong>idempotentes</strong> para que el reintento sea seguro.</li>
+  <li>Depuración: <strong>analizador lógico primero</strong> (qué se dijeron), <strong>osciloscopio después</strong> (por qué llegó mal). "Se ve perfecto y falla igual" es la firma de un problema eléctrico.</li>
+  <li><strong>Aislar</strong> cuando las masas están a distinto potencial o hay motores cerca. Cuesta 4–9 USD, decenas de mA y 20–50 ns de retardo por nodo. Y aún aislado, RS-485 <strong>necesita el conductor común</strong>.</li>
+  <li>Dentro de una placa, con una sola masa: <strong>I2C y SPI están bien</strong>. Meter transceptores para cruzar 5 cm es costo puro sin beneficio.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Calculá la ventana de pull-up (R<sub>min</sub>, R<sub>max</sub>) para tu propio montaje: contá los dispositivos, estimá la capacitancia de las pistas y del cable, y hacelo para 100 kHz y para 400 kHz. Después medí el tiempo de subida real con un osciloscopio en modo ×10 y comparalo con tu cálculo.</li>
+  <li>Implementá la rutina <code>i2c_bus_recover()</code> en tu plataforma y provocá el cuelgue a propósito: resetea el micro con el depurador en medio de una lectura de un sensor. Comprobá que sin la rutina el bus queda muerto y con ella vuelve.</li>
+  <li>Tomá un sensor SPI cualquiera y leé su registro de identidad probando los cuatro modos. Anotá qué devuelve cada uno y verificá que los modos incorrectos dan el valor desplazado un bit, no basura aleatoria.</li>
+  <li>Con un analizador lógico, capturá una transacción I2C completa e identificá manualmente, en la forma de onda cruda —sin usar el decodificador—, el START, la dirección, el bit R/W, cada ACK y el STOP.</li>
+  <li>Armá un bus RS-485 de dos nodos con al menos 10 m de cable. Medí la tasa de error con y sin terminación, y con y sin polarización de reposo. Construí la tabla de cuatro filas con tus números reales.</li>
+  <li>Instrumentá el pin DE de tu transmisor RS-485 y capturalo junto con los datos. Medí exactamente cuántos tiempos de bit tarda tu firmware en bajar DE después del último bit de stop. Después reimplementalo con el flag TC y volvé a medir.</li>
+  <li>Escribí el CRC-16 de Modbus y validalo contra el vector de prueba del módulo. Después implementá también una suma de 8 bits y construí a mano tres tramas distintas que compartan la misma suma pero tengan CRC distinto.</li>
+  <li>Con dos nodos CAN (dos placas con transceptor, o SocketCAN con <code>vcan</code>), programá ambos para transmitir simultáneamente con identificadores 0x100 y 0x101. Verificá con <code>candump -td</code> cuál gana y medí el retardo del que pierde.</li>
+  <li>Configurá deliberadamente un nodo CAN con la velocidad equivocada y observá con <code>ip -details -statistics link show</code> cómo evolucionan los contadores <code>bus-error</code> y el estado hasta llegar a <em>bus off</em>. Documentá cuántas tramas hicieron falta.</li>
+  <li>Diseñá tu propio protocolo sobre RS-485 para 8 nodos: definí el framing (COBS), el CRC, el mapa de comandos con la propiedad de idempotencia justificada comando por comando, y el cálculo del timeout con tus números de velocidad y longitud. Documentá qué hace el sistema ante la desaparición de cada tipo de nodo.</li>
+  <li>Investigá el estado actual de 10BASE-T1S: buscá dos transceptores comerciales, compará su precio y consumo con un par de transceptores RS-485 equivalentes, y escribí en un párrafo en qué escenario concreto de tu propio proyecto tendría sentido el cambio — y en cuál no.</li>
+</ol>
+
+<section class="quiz" id="quizCF_S4">
+  <style>
+    #quizCF_S4{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCF_S4 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCF_S4 .q{margin-bottom:1.5rem}
+    #quizCF_S4 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCF_S4 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCF_S4 .opt:hover{border-color:var(--accent)}
+    #quizCF_S4 .opt:disabled{cursor:default}
+    #quizCF_S4 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCF_S4 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCF_S4 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCF_S4 .exp.show{display:block}
+    #quizCF_S4 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu bus I2C tiene 12 dispositivos y 40 cm de cable plano. A 100 kHz anda; al subir a 400 kHz falla. Calculás la ventana de pull-up y te da R<sub>max</sub> = 850 Ω con R<sub>min</sub> = 967 Ω. ¿Qué significa?</p>
+    <button class="opt">Que hay que poner una resistencia entre 850 Ω y 967 Ω</button>
+    <button class="opt">Que el cálculo está mal, porque R<sub>max</sub> siempre es mayor que R<sub>min</sub></button>
+    <button class="opt">Que el bus está sobrecargado para esa velocidad y ninguna resistencia sirve: hay que reducir la capacitancia, bajar la frecuencia o usar un acelerador activo</button>
+    <div class="exp">La ventana se cerró: cualquier resistencia por debajo de 967 Ω hace que el transmisor no logre el nivel bajo válido con 3 mA, y cualquiera por encima de 850 Ω hace que el flanco de subida no complete dentro de los 300 ns que exige el modo Fast. No es un error de cálculo: es la señal de que el producto R·C ya no entra en el presupuesto de tiempo. Las salidas reales son bajar la capacitancia (menos cable, partir el bus con un TCA9548A), bajar la velocidad, o inyectar corriente en el flanco con un acelerador tipo LTC4311. Cambiar el valor del pull-up no arregla nada.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. En una red RS-485 half-duplex, los dos nodos que <em>más rápido</em> responden son los únicos que dan timeout. Los lentos andan bien. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">El maestro suelta DE tarde y su propio transmisor pisa el arranque de las respuestas que llegan primero</button>
+    <button class="opt">Falta terminación de 120 Ω, porque la reflexión afecta más a los nodos rápidos</button>
+    <button class="opt">Los nodos rápidos tienen el CRC mal implementado</button>
+    <div class="exp">La correlación con la <em>velocidad de respuesta</em> —y no con la distancia ni con el modelo— apunta directo al <em>turnaround</em>. Si el maestro mantiene DE alto unos tiempos de bit después de su último bit de stop, sigue manejando el bus; el esclavo que responde antes de que DE baje encuentra el bus ocupado y su start bit y sus primeros datos quedan destruidos. Los esclavos más lentos empiezan a responder cuando el bus ya está libre y no se ven afectados. Se confirma en un minuto capturando DE junto con los datos en el analizador lógico. La terminación produciría errores correlacionados con la distancia, no con el tiempo de respuesta.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Dos nodos CAN empiezan a transmitir en el mismo instante, con identificadores 0x0C3 y 0x0C7. ¿Qué le pasa a la trama del nodo que "pierde"?</p>
+    <button class="opt">Las dos tramas se destruyen y ambos nodos reintentan tras un retardo aleatorio</button>
+    <button class="opt">El nodo de identificador mayor se retira en silencio al detectar que transmitió recesivo y leyó dominante; la trama del otro sale entera y sin retardo</button>
+    <button class="opt">El controlador CAN encola las dos y las transmite una detrás de otra sin que ningún nodo lo note</button>
+    <div class="exp">Ese es el arbitraje no destructivo, y es lo que separa a CAN de CSMA/CD. Como el bus es una AND cableada, el estado dominante (0) gana sobre el recesivo (1); cada transmisor relee lo que escribe, y en el primer bit donde transmite 1 y lee 0 sabe que otro nodo con identificador de menor valor —mayor prioridad— está en el aire, y pasa a receptor sin corromper nada. El ganador ni se entera: su trama sale completa, sin un bit alterado y sin un microsegundo de retardo. De ahí salen las dos propiedades que hacen a CAN certificable: no se desperdicia ancho de banda en colisiones, y la latencia del peor caso del mensaje más prioritario se puede calcular y demostrar.</div>
+  </div>
+
+  <div class="score" id="scoreCF_S4"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCF_S4');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCF_S4').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CF5.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cf3-energia/lecture.html">← CF3: Energía</a>
+  <a href="../cf5-integridad-senal/lecture.html">CF5: Integridad de señal →</a>
+</nav>
+
+</div>
+</body>
+</html>

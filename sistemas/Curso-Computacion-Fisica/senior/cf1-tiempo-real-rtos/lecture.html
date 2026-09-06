@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CF1 — Tiempo real y RTOS: cuando llegar tarde es fallar · Computación Física Senior</title>
+  <meta name="description" content="Hard, firm y soft real-time; latencia y jitter medidos con osciloscopio; WCET y qué lo arruina; interrupciones a fondo; superloop vs RTOS; RMS, EDF y el 69% de Liu &amp; Layland; inversión de prioridad y el Mars Pathfinder; mutex vs semáforo; FreeRTOS y Zephyr en 2026; y cuándo NO usar un RTOS.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física Senior</a>
+  <a href="../../index.html">⚡ Curso de Computación Física</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CF1</span>
+  <span class="badge">⏱ 50–105 min</span>
+  <span class="badge">🎯 Pre-req: Computación Física E00–E09</span>
+  <span class="badge">⏲️ Tiempo real</span>
+</div>
+
+<article>
+
+<h1>CF1 — Tiempo real y RTOS: cuando llegar tarde es fallar</h1>
+
+<h2>CF1.0 Por qué este módulo</h2>
+
+<p>En <a href="../../e03-microcontroladores-1/lecture.html">E03</a> y <a href="../../e04-microcontroladores-2/lecture.html">E04</a> aprendiste a mover pines, configurar timers y escribir una rutina de interrupción. Todo eso funcionaba. Este módulo trata de la pregunta que viene después y que nadie hace hasta que un producto vuelve del campo: <strong>¿funciona siempre, o funciona casi siempre?</strong></p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> <strong>«Tiempo real» no significa rápido: significa predecible.</strong> Un sistema que responde en 1 ms el 99% de las veces y en 50 ms el 1% restante tiene un promedio excelente —1,5 ms— y puede ser completamente inservible. En un sistema de tiempo real, el número que importa no es el promedio ni la mediana: es el <em>peor caso</em>. Un sistema lento pero acotado es correcto. Un sistema rápido pero sin cota es un accidente esperando su turno.
+</div>
+
+<p>Esa idea se te va a hacer contraintuitiva porque venís de la cultura del software de escritorio y de servidores, donde optimizar significa bajar el promedio y donde la latencia p99 es una métrica de confort. Acá, la utilidad de una respuesta puede caer a cero —o a valor negativo— al cruzar un instante. Cuando eso pasa, el trabajo de ingeniería deja de ser «hacerlo rápido» y pasa a ser <strong>demostrar una cota</strong>.</p>
+
+<div class="analogy">
+  <strong>🧩 La analogía del tren.</strong> Un tren que tarda 40 minutos y llega siempre a horario sirve para ir a trabajar. Un tren que tarda 25 minutos en promedio pero una vez por semana tarda dos horas no sirve, aunque sea más rápido: no podés planificar nada alrededor de él. En tiempo real no comprás velocidad, comprás <em>certeza</em>, y la certeza siempre se paga con velocidad promedio.
+</div>
+
+<p>Este módulo cubre la disciplina completa: cómo se clasifica una deadline, cómo se mide la latencia de verdad, por qué el WCET es difícil, qué se puede y qué no se puede hacer en una interrupción, cuándo un bucle simple es la respuesta correcta, cómo se planifica un conjunto de tareas, y cuánto cuesta —en RAM, en flash, en microsegundos y en clases de bug nuevas— meter un RTOS en el proyecto.</p>
+
+<h2>CF1.1 Hard, firm y soft: la diferencia tiene consecuencias</h2>
+
+<p>La clasificación no es académica. Define cuánta plata y cuántas semanas vas a gastar, y qué normas te van a auditar.</p>
+
+<table>
+<thead><tr><th>Clase</th><th>Qué pasa al perder la deadline</th><th>Ejemplo</th><th>Utilidad del resultado tardío</th></tr></thead>
+<tbody>
+<tr><td><strong>Hard</strong></td><td>Falla del sistema. Daño físico, lesión o pérdida total</td><td>Disparo del airbag; corte de un variador ante sobrecorriente; frenado de emergencia</td><td>Cero o negativa: actuar tarde es peor que no actuar</td></tr>
+<tr><td><strong>Firm</strong></td><td>El resultado se descarta. Degradación de calidad, sin catástrofe</td><td>Muestra de un lazo de control que llegó fuera de ventana; frame de un codec</td><td>Cero, pero descartarlo es inocuo</td></tr>
+<tr><td><strong>Soft</strong></td><td>La calidad baja de forma gradual</td><td>Refrescar una pantalla; latencia de un teclado; streaming de audio con buffer</td><td>Decae con el tiempo, no se cae de golpe</td></tr>
+</tbody>
+</table>
+
+<p>El airbag es el ejemplo canónico de <em>hard</em> por una razón concreta: entre que el acelerómetro detecta el pulso de choque y el momento en que la bolsa tiene que estar inflada hay del orden de <strong>15 a 30 ms</strong>, y la bolsa tarda unos 25 ms en inflarse. Si el firmware decide a los 40 ms, la bolsa se infla contra una cabeza que ya está encima: el resultado tardío no es «menos útil», es <em>dañino</em>. Esa asimetría —tarde es peor que nunca— es lo que define <em>hard</em>.</p>
+
+<div class="rule">
+  <strong>📌 El test de una línea para clasificar.</strong> Preguntate: <em>«si esta deadline se pierde una vez cada un millón de ciclos, ¿qué pasa?»</em> Si la respuesta menciona lesión, destrucción de equipo, pérdida irreversible de datos o incumplimiento regulatorio → <strong>hard</strong>. Si menciona «se descarta esa muestra y seguimos» → <strong>firm</strong>. Si menciona «se nota un poco» → <strong>soft</strong>. La trampa está en las respuestas que empiezan con «bueno, depende»: ahí todavía no entendiste el requisito y no podés diseñar.
+</div>
+
+<div class="warn">
+  <strong>Clasificar de más también cuesta.</strong> Declarar <em>hard</em> algo que es <em>soft</em> multiplica el costo de ingeniería por entre 3 y 10: análisis de WCET, trazabilidad de requisitos, cobertura estructural del código, revisión independiente. Bajo IEC 61508 (SIL), ISO 26262 (ASIL) o DO-178C (DAL A–E), cada escalón agrega documentación y evidencia, no solo código. Subclasificar es peligroso; sobreclasificar es caro y hace que el proyecto no salga. Las dos cosas son errores de ingeniería.
+</div>
+
+<div class="info">
+  Un sistema real casi nunca es de una sola clase: es una mezcla. Un cargador de vehículo eléctrico tiene un lazo de corriente <em>hard</em> a 20 kHz, una máquina de estados de negociación <em>firm</em> a 100 Hz y una interfaz de usuario <em>soft</em>. La consecuencia de diseño es directa: <strong>lo hard va en interrupciones o en hardware; lo soft va en tareas de baja prioridad y puede perder</strong>. Mezclarlos en el mismo nivel de prioridad es el error de arquitectura más común del rubro.
+</div>
+
+<h2>CF1.2 Latencia y jitter: el promedio miente</h2>
+
+<p>Tres definiciones que hay que usar con precisión, porque la gente las mezcla y después discute sin entenderse:</p>
+
+<div class="step"><strong>Latencia:</strong> el tiempo entre que ocurre el evento y que tu sistema produjo la respuesta. Se mide en el mundo físico, del flanco del pin de entrada al flanco del pin de salida — no del <code>if</code> al <code>return</code>.</div>
+
+<div class="step"><strong>Jitter:</strong> la variación de esa latencia entre repeticiones. Un sistema con 900 µs de latencia y 3 µs de jitter es mucho mejor que uno con 100 µs de latencia y 800 µs de jitter, aunque el segundo sea «nueve veces más rápido» en promedio.</div>
+
+<div class="step"><strong>Determinismo:</strong> la propiedad de tener una cota superior conocida. No es «bajo jitter»: es «jitter acotado y demostrado». Un sistema puede tener jitter bajísimo en el banco y no ser determinista, porque nadie probó el camino que lo dispara.</div>
+
+<p>Por qué el promedio miente, con números. Supongamos que instrumentás un lazo de control y juntás diez millones de muestras:</p>
+
+<table>
+<thead><tr><th>Estadístico</th><th>Valor</th><th>Qué te dice</th></tr></thead>
+<tbody>
+<tr><td>Media</td><td>1,21 µs</td><td>Nada útil para tiempo real</td></tr>
+<tr><td>p50 (mediana)</td><td>1,19 µs</td><td>El caso típico</td></tr>
+<tr><td>p99</td><td>1,44 µs</td><td>Tranquilizador y engañoso</td></tr>
+<tr><td>p99,99</td><td>3,8 µs</td><td>Empieza a aparecer la cola</td></tr>
+<tr><td><strong>Máximo observado</strong></td><td><strong>87 µs</strong></td><td>El único número que importa</td></tr>
+</tbody>
+</table>
+
+<p>Ese 87 µs no es ruido de medición: es un camino real del código que se ejecuta cuando se alinean tres condiciones —una falla de caché, una interrupción de mayor prioridad y una sección crítica de un driver. Ocurre una vez cada varios millones de ciclos. En un lazo a 1 kHz, «una vez cada varios millones» significa <strong>una vez por hora</strong>. En el campo, con 10.000 unidades desplegadas, significa varias veces por segundo en algún cliente.</p>
+
+<div class="rule">
+  <strong>📌 Nunca reportes un promedio de latencia.</strong> Reportá <em>máximo observado</em>, <em>cantidad de muestras</em> y <em>bajo qué carga se midió</em>. «1,2 µs promedio» no es información. «Máximo 87 µs sobre 10 M de muestras con radio, SD y USB activos simultáneamente» sí lo es. Si tu informe no dice bajo qué carga se midió, no midió nada: el peor caso vive en la carga peor, no en la típica.
+</div>
+
+<h3>Cómo se mide de verdad</h3>
+
+<p>La regla es brutal y simple: <strong>si tu instrumento perturba lo que medís, no estás midiendo tu sistema</strong>. El <code>printf</code> es el ejemplo perfecto de instrumento inválido.</p>
+
+<table>
+<thead><tr><th>Método</th><th>Resolución</th><th>Intrusión</th><th>Cuándo usarlo</th></tr></thead>
+<tbody>
+<tr><td><strong>Toggle de GPIO + osciloscopio / analizador lógico</strong></td><td>Limitada por el instrumento (ns)</td><td>~2 instrucciones, 25 ns a 80 MHz</td><td><strong>Siempre.</strong> Es el patrón de oro</td></tr>
+<tr><td><code>DWT-&gt;CYCCNT</code> (contador de ciclos Cortex-M)</td><td>1 ciclo → 5,95 ns a 168 MHz</td><td>~10 ciclos por lectura</td><td>Medir tramos de software desde adentro</td></tr>
+<tr><td>Trace SWO / ITM</td><td>~1 µs</td><td>Baja, pero pierde eventos si saturás</td><td>Ver el perfil de ejecución sin parar</td></tr>
+<tr><td>Trace de hardware (ETM + sonda)</td><td>Ciclo a ciclo, no intrusivo</td><td>Cero</td><td>Cuando el bug desaparece al instrumentar</td></tr>
+<tr><td><code>printf</code> por UART</td><td>Inútil</td><td><strong>87 µs por carácter a 115200 bps</strong></td><td>Nunca en un camino con deadline</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-c">// El patrón de oro: un pin marca el tramo, el osciloscopio mide el ancho.
+// Escritura directa al registro: sin HAL, sin llamada, 1 instrucción.
+#define PROBE_HI()  (GPIOA-&gt;BSRR = (1u &lt;&lt; 5))         // set   PA5
+#define PROBE_LO()  (GPIOA-&gt;BSRR = (1u &lt;&lt; (5 + 16)))  // reset PA5
+
+void TIM2_IRQHandler(void)
+{
+    PROBE_HI();
+    TIM2-&gt;SR = ~TIM_SR_UIF;      // limpiar flag primero: evita re-entrada
+    muestrear_y_encolar();
+    PROBE_LO();
+}</code></pre>
+
+<div class="tip">
+  <strong>Cómo cazar el peor caso con el osciloscopio.</strong> Poné el osciloscopio en <strong>persistencia infinita</strong> y dejalo horas: la envolvente que se dibuja <em>es</em> la distribución de tu jitter, visible de un vistazo. Después activá el <em>trigger por ancho de pulso</em> con el umbral apenas por encima del máximo esperado: el disparo te captura el evento raro con su contexto. Un analizador lógico con medida estadística de ancho de pulso hace lo mismo y además te da el histograma. Esto encuentra en una tarde lo que un mes de <code>printf</code> no encuentra nunca.
+</div>
+
+<div class="mistake">
+  <strong>El error de instrumentación clásico.</strong> Agregás un <code>printf</code> para diagnosticar un problema de timing y el problema desaparece. No lo arreglaste: cambiaste el sistema. El <code>printf</code> a 115200 bps tarda 87 µs por carácter y suele bloquear con las interrupciones deshabilitadas, con lo cual reordenó tus prioridades y tapó la carrera que buscabas. Si un bug de timing se esconde al instrumentar, cambiá de instrumento: GPIO, o un buffer circular en RAM que volcás después.
+</div>
+
+<h2>CF1.3 WCET: el número que nadie quiere calcular</h2>
+
+<p>El <strong>WCET</strong> (<em>worst-case execution time</em>) es el tiempo máximo que puede tardar un tramo de código en ejecutarse, para cualquier entrada y cualquier estado del hardware. Es el insumo de todo análisis de planificabilidad: sin WCET no hay garantía, hay esperanza.</p>
+
+<p>Es difícil por dos motivos distintos. El primero es teórico: en el caso general, determinar el camino más largo de un programa arbitrario es indecidible (se reduce al problema de la parada). El segundo, que es el que te va a arruinar el día, es mucho más terrenal: <strong>el mismo código tarda distinto según el estado del hardware</strong>.</p>
+
+<table>
+<thead><tr><th>Qué arruina el WCET</th><th>Costo típico</th><th>Por qué es impredecible</th></tr></thead>
+<tbody>
+<tr><td><strong>Falla de caché de instrucciones</strong></td><td>1 ciclo (acierto) vs 20–100 ciclos (fallo)</td><td>Depende de qué corrió antes, no de tu función</td></tr>
+<tr><td><strong>Predicción de salto errónea</strong></td><td>+8 a 20 ciclos en Cortex-M7</td><td>Depende del historial de datos</td></tr>
+<tr><td><strong>Estados de espera de flash</strong></td><td>5 wait states a 168 MHz en STM32F4</td><td>El acelerador (ART/prefetch) ayuda… hasta que hay un salto</td></tr>
+<tr><td><strong>DMA robando ciclos de bus</strong></td><td>Hasta ~50% del ancho de banda a SRAM</td><td>Depende del tráfico de otros periféricos</td></tr>
+<tr><td><strong>Refresco de SDRAM externa</strong></td><td>Decenas de ciclos, periódico</td><td>Asíncrono respecto de tu código</td></tr>
+<tr><td><strong>DVFS / cambio de frecuencia</strong></td><td>Cientos de µs de resincronización de PLL</td><td>Lo dispara la gestión de energía, no vos</td></tr>
+<tr><td><code>printf("%f")</code> y aritmética de bibliotecas</td><td>1.500–15.000 ciclos según el valor</td><td>El camino depende del dato, no del código</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El caso que más sorprende: el DMA.</strong> Tu ISR mide 2,1 µs cuando la corrés sola. Con el DMA de SPI moviendo un frame de pantalla al mismo tiempo, la misma ISR mide 3,4 µs, porque el DMA y el núcleo se pelean por el mismo bus hacia SRAM. No cambiaste una línea de tu código. Si tu WCET lo mediste con el sistema en reposo, <strong>no mediste el WCET</strong>: mediste el mejor caso con buena iluminación.
+</div>
+
+<h3>Cómo se acota en la práctica</h3>
+
+<p>Hay tres enfoques y solo uno es realista para el 95% de los proyectos:</p>
+
+<div class="step"><strong>1. Análisis estático (aiT, Bound-T, Heptane).</strong> Modela el pipeline y la caché del núcleo y devuelve una cota <em>segura</em>: garantiza que el tiempo real nunca la supera. El costo es doble: sobreestima entre un 30% y un 300% —te obliga a comprar un micro más grande del necesario— y las licencias comerciales están en el orden de decenas de miles de dólares, además de semanas de anotar el código con cotas de loops. Se justifica en DO-178C nivel A y en ASIL D; casi en ningún otro lado.</div>
+
+<div class="step"><strong>2. Medición end-to-end.</strong> Instrumentás y corrés. Barato, directo, y <em>optimista por construcción</em>: solo ves los caminos que ejercitaste. Si el camino peor requiere que coincidan tres eventos raros, tu campaña de medición probablemente no lo vio.</div>
+
+<div class="step"><strong>3. Híbrido, que es lo que se hace.</strong> Medir el máximo observado bajo una <strong>carga de estrés diseñada a propósito</strong> —todos los periféricos activos, todas las interrupciones disparando, la SD haciendo su recolección interna, el radio transmitiendo— y aplicar un margen explícito. La convención de la industria: <code>WCET_asumido = 2 × max_observado</code>, y no ocupar más del 50–70% de CPU.</div>
+
+<div class="rule">
+  <strong>📌 Acotar por diseño vale más que medir mejor.</strong> Las reglas que hacen el WCET tratable: sin recursión; sin <code>malloc</code> en caminos con deadline (su tiempo depende de la fragmentación, es decir, de la historia entera del proceso); todo loop con cota estática y visible; nada de bibliotecas con caminos dependientes de datos; y el código y los datos más críticos en <strong>TCM</strong> (memoria fuertemente acoplada: cero wait states, sin caché de por medio, tiempo constante). Con esas reglas, medir alcanza. Sin ellas, ni el análisis estático te salva.
+</div>
+
+<pre><code class="lang-c">// Medición de WCET desde adentro, con el contador de ciclos del Cortex-M.
+#include &lt;stdint.h&gt;
+
+static inline void ciclos_init(void)
+{
+    CoreDebug-&gt;DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT-&gt;CYCCNT = 0;
+    DWT-&gt;CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+static uint32_t peor_ciclos = 0;   // no es un promedio: es el máximo
+
+void tarea_critica(void)
+{
+    uint32_t t0 = DWT-&gt;CYCCNT;
+
+    lazo_de_control();
+
+    uint32_t dt = DWT-&gt;CYCCNT - t0;   // resta sin signo: sobrevive al wrap
+    if (dt &gt; peor_ciclos) {
+        peor_ciclos = dt;             // se lee después, nunca se imprime acá
+    }
+}
+// A 168 MHz: microsegundos = peor_ciclos / 168.0
+// Guardá también CUÁNTAS veces corrió: un máximo sin N no significa nada.</code></pre>
+
+<h2>CF1.4 Interrupciones a fondo</h2>
+
+<p>En E03 usaste interrupciones para no perder un flanco. Acá importan por otro motivo: <strong>la interrupción es el único mecanismo con latencia acotada por hardware</strong>, y por lo tanto es donde vive todo lo que sea verdaderamente <em>hard</em>.</p>
+
+<h3>Anatomía de la latencia de una ISR</h3>
+
+<table>
+<thead><tr><th>Etapa</th><th>Costo en Cortex-M4</th><th>Nota</th></tr></thead>
+<tbody>
+<tr><td>Detección y sincronización del pedido</td><td>1–2 ciclos</td><td>Hardware</td></tr>
+<tr><td><em>Stacking</em> de 8 registros</td><td>~8–12 ciclos</td><td>26 si hay FPU sin <em>lazy stacking</em></td></tr>
+<tr><td>Búsqueda del vector</td><td>Solapada con el stacking</td><td>El NVIC lo hace en paralelo</td></tr>
+<tr><td><strong>Total típico entrada a ISR</strong></td><td><strong>12 ciclos → 71 ns a 168 MHz</strong></td><td>15 en Cortex-M0+</td></tr>
+<tr><td><em>Tail-chaining</em> (ISR seguida de ISR)</td><td>6 ciclos, no 24</td><td>Se saltea unstack + stack</td></tr>
+<tr><td>Salida de ISR (<em>unstacking</em>)</td><td>~10–12 ciclos</td><td>Menos si encadena</td></tr>
+<tr><td><strong>Bloqueo por sección crítica ajena</strong></td><td><strong>Lo que dure la más larga</strong></td><td>Este es el término que te mata</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La métrica que define tu sistema.</strong> La latencia de interrupción del peor caso no la fija el núcleo: la fija <strong>la sección crítica más larga de todo el firmware, drivers y bibliotecas de terceros incluidos</strong>. Setenta y un nanosegundos de hardware no sirven de nada si un driver de flash deshabilita las interrupciones durante 800 µs para hacer un borrado. Auditar las secciones críticas —propias y ajenas— es una tarea concreta de este trabajo, no una formalidad.
+</div>
+
+<h3>Qué NO se hace adentro de una ISR</h3>
+
+<div class="mistake">
+  <strong>Prohibido en una ISR:</strong> bloquearse (esperar un mutex, dormir, hacer <em>polling</em> de un flag lento); <code>printf</code> o cualquier E/S con buffer; <code>malloc</code>/<code>free</code>; llamar a APIs del RTOS que no sean las variantes <code>...FromISR</code> (FreeRTOS) o las marcadas ISR-safe (Zephyr); tomar un <strong>mutex</strong> —una ISR no es una tarea, no puede ser «dueña» de nada ni heredar prioridad—; y usar la FPU si el port no configuró el guardado del contexto de punto flotante. Cada una de estas produce, en el mejor caso, un cuelgue reproducible; en el peor, corrupción silenciosa cada varios días.
+</div>
+
+<p>La regla positiva que reemplaza a esa lista es el patrón fundamental de toda arquitectura de tiempo real:</p>
+
+<div class="rule">
+  <strong>📌 ISR corta + tarea diferida.</strong> La ISR hace <em>lo mínimo que tiene deadline</em>: leer el registro del periférico antes de que se sobrescriba, limpiar el flag, y señalizar. Todo lo demás —parsear, filtrar, escribir, loguear— se hace en una tarea que puede ser desalojada. Costo del patrón: el despacho a la tarea suma entre 2 y 5 µs en un Cortex-M4 con FreeRTOS. Beneficio: el tramo con deadline dura microsegundos en vez de milisegundos, y todo lo demás deja de estar en el camino crítico.
+</div>
+
+<pre><code class="lang-c">// ISR corta: lee, señaliza, sale. Nada más.
+void ADC_IRQHandler(void)
+{
+    BaseType_t despertar = pdFALSE;
+
+    uint16_t muestra = (uint16_t)(ADC1-&gt;DR);   // leer BORRA el flag EOC
+    xQueueSendFromISR(cola_muestras, &amp;muestra, &amp;despertar);
+
+    // Si la tarea que despertamos tiene más prioridad que la interrumpida,
+    // el cambio de contexto ocurre AL SALIR de la ISR, no dentro.
+    portYIELD_FROM_ISR(despertar);
+}</code></pre>
+
+<h3>Secciones críticas y prioridades anidadas</h3>
+
+<p>Una sección crítica protege datos compartidos entre una ISR y una tarea. En Cortex-M hay dos formas y la diferencia importa:</p>
+
+<pre><code class="lang-c">// (a) PRIMASK: apaga TODAS las interrupciones enmascarables. Martillo.
+__disable_irq();
+contador_compartido++;
+__enable_irq();
+
+// (b) BASEPRI: enmascara solo por debajo de un umbral de prioridad.
+//     Las interrupciones de prioridad más alta que el umbral SIGUEN corriendo:
+//     son las "zero-latency interrupts", que a cambio NO pueden llamar
+//     a ninguna API del RTOS.
+taskENTER_CRITICAL();       // en FreeRTOS Cortex-M esto escribe BASEPRI
+contador_compartido++;
+taskEXIT_CRITICAL();</code></pre>
+
+<div class="warn">
+  <strong>El presupuesto de la sección crítica.</strong> Mientras estás adentro, la latencia de <em>todas</em> las interrupciones enmascaradas crece por ese mismo tiempo. Presupuestá menos de 10 µs y aspirá a menos de 2 µs. Si una sección crítica necesita más, el problema no es la sección: es el diseño de los datos. Un buffer circular con un solo productor y un solo consumidor, con índices de una sola palabra, no necesita sección crítica en absoluto.
+</div>
+
+<div class="danger">
+  <strong>⚠️ La trampa de <code>configMAX_SYSCALL_INTERRUPT_PRIORITY</code>.</strong> En FreeRTOS sobre Cortex-M, una ISR de prioridad <em>más urgente</em> que ese umbral <strong>no puede llamar a ninguna API del kernel</strong>, ni siquiera a las <code>FromISR</code>: el BASEPRI no la enmascara, así que puede corromper las estructuras del kernel en medio de una operación. Y recordá que en ARM la numeración va al revés de la intuición: <strong>número más bajo = prioridad más urgente</strong>. Confundir el sentido es el bug clásico del primer proyecto con RTOS, y se manifiesta como cuelgues aleatorios cada varias horas. Activá <code>configASSERT</code>: el port lo verifica y te lo dice.
+</div>
+
+<div class="mistake">
+  <strong>Y la trampa de <code>volatile</code>.</strong> Una variable compartida entre ISR y tarea necesita <code>volatile</code> para que el compilador no la cachee en un registro. Pero <code>volatile</code> <strong>no da atomicidad</strong>: un <code>contador++</code> son tres instrucciones (leer, sumar, escribir) y una interrupción puede caer en el medio. En un núcleo de 8 o 16 bits, hasta <em>leer</em> una variable de 32 bits es no atómico y podés obtener una lectura rasgada —mitad vieja, mitad nueva—. Usá <code>&lt;stdatomic.h&gt;</code>, o una sección crítica, o rediseñá para que solo un lado escriba.
+</div>
+
+<h2>CF1.5 Superloop vs RTOS</h2>
+
+<p>La reacción refleja de mucha gente al oír «tiempo real» es «entonces necesito un RTOS». Es falso, y es una de las decisiones que más proyectos complica sin necesidad.</p>
+
+<pre><code class="lang-c">// El superloop, también llamado ejecutivo cíclico o "bare metal".
+int main(void)
+{
+    hw_init();
+    for (;;) {
+        leer_sensores();      //  120 µs
+        actualizar_control();  //  340 µs
+        atender_uart();        //   80 µs
+        refrescar_pantalla();  // 4200 µs   &lt;-- acá está el problema
+    }
+}</code></pre>
+
+<p>La propiedad clave del superloop es aritmética: <strong>la latencia peor caso de cualquier actividad es la suma de todas las demás</strong>. En el ejemplo, <code>leer_sensores</code> puede esperar 4,6 ms para volver a correr. Si su deadline es 1 ms, este diseño no cumple, y ninguna optimización de <code>leer_sensores</code> lo arregla.</p>
+
+<div class="tip">
+  <strong>Pero el superloop tiene virtudes enormes, y se subestiman.</strong> Cero bytes de kernel. Cero cambios de contexto. Un solo stack, así que no hay que dimensionar ocho. <strong>Ninguna condición de carrera posible</strong>, porque no hay concurrencia: solo interrupciones, que son un problema mucho más chico y acotado. Y el comportamiento temporal es analizable con una suma. En aviónica certificada el <em>cyclic executive</em> sigue siendo la arquitectura preferida justamente por eso: es la que más fácil se demuestra correcta.
+</div>
+
+<p>El superloop escala mucho más de lo que parece si aplicás dos técnicas: <strong>máquinas de estados no bloqueantes</strong> (cada actividad hace un paso corto y vuelve, nunca espera adentro) y <strong>despacho por tiempo</strong> (cada actividad tiene su período y se llama cuando le toca).</p>
+
+<pre><code class="lang-c">// Superloop con despacho temporal: sigue sin RTOS, ya no es ingenuo.
+typedef struct {
+    uint32_t periodo_ms;
+    uint32_t proxima_ms;
+    void   (*paso)(void);      // NO bloquea: hace un paso y vuelve
+} tarea_t;
+
+static tarea_t tareas[] = {
+    { 1,    0, paso_control  },
+    { 10,   0, paso_sensores },
+    { 100,  0, paso_pantalla },   // dibuja UNA franja por llamada
+};
+
+int main(void)
+{
+    hw_init();
+    for (;;) {
+        uint32_t ahora = millis();
+        for (unsigned i = 0; i &lt; sizeof tareas / sizeof tareas[0]; i++) {
+            if ((int32_t)(ahora - tareas[i].proxima_ms) &gt;= 0) {
+                tareas[i].proxima_ms = ahora + tareas[i].periodo_ms;
+                tareas[i].paso();
+            }
+        }
+    }
+}</code></pre>
+
+<table>
+<thead><tr><th>Criterio</th><th>Superloop</th><th>RTOS</th></tr></thead>
+<tbody>
+<tr><td>Flash del kernel</td><td>0</td><td>6–12 kB (FreeRTOS)</td></tr>
+<tr><td>RAM</td><td>1 stack (~512 B–2 kB)</td><td>1 stack por tarea + ~100 B de TCB c/u</td></tr>
+<tr><td>Cambio de contexto</td><td>No existe</td><td>1–3 µs en Cortex-M4</td></tr>
+<tr><td>Latencia peor caso de una actividad</td><td>Suma de todas las demás</td><td>Suma de las de <em>mayor</em> prioridad + bloqueos</td></tr>
+<tr><td>Clases de bug posibles</td><td>Reentrancia con ISR</td><td>+ carreras, deadlock, inversión, desborde de stack</td></tr>
+<tr><td>Operaciones bloqueantes de terceros</td><td>Te rompen el diseño</td><td>Se absorben en una tarea de baja prioridad</td></tr>
+<tr><td>Esfuerzo de análisis temporal</td><td>Una suma</td><td>Análisis de planificabilidad</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Cuándo el RTOS deja de ser opcional.</strong> (1) Hay actividades con deadlines que difieren en órdenes de magnitud —1 ms y 1 s conviviendo—. (2) Alguna operación <em>bloquea inevitablemente</em> por decenas de milisegundos y no la controlás: escritura a SD, handshake TLS, respuesta de un módem celular, borrado de flash. (3) Usás un stack de terceros que asume hilos: BLE, LwIP, mbedTLS, un cliente MQTT. (4) El equipo es grande y necesitás que los módulos no se pisen. Fuera de esos cuatro casos, la respuesta honesta suele ser el superloop.
+</div>
+
+<h2>CF1.6 Planificación: round-robin, prioridades fijas, RMS y EDF</h2>
+
+<p>Un planificador decide qué tarea corre. Las políticas se diferencian por una sola pregunta: <strong>¿qué garantiza?</strong></p>
+
+<table>
+<thead><tr><th>Política</th><th>Qué garantiza</th><th>Qué cuesta</th></tr></thead>
+<tbody>
+<tr><td><strong>Round-robin</strong> (rodaja de tiempo)</td><td>Reparto equitativo de CPU</td><td>No garantiza <em>ninguna</em> deadline. Sirve para desempatar iguales, no para tiempo real</td></tr>
+<tr><td><strong>Prioridad fija con desalojo</strong></td><td>La tarea más prioritaria lista corre siempre</td><td>Las de baja prioridad pueden morir de hambre. Es el estándar de facto (FreeRTOS, Zephyr)</td></tr>
+<tr><td><strong>RMS</strong> (rate-monotonic)</td><td>Óptimo entre los de prioridad fija, con un test analítico</td><td>Exige tareas periódicas e independientes; el bound deja CPU sin usar</td></tr>
+<tr><td><strong>EDF</strong> (earliest deadline first)</td><td>Óptimo absoluto: planificable hasta el 100% de CPU</td><td>Overhead de reordenar; <strong>colapso en dominó</strong> ante sobrecarga</td></tr>
+</tbody>
+</table>
+
+<h3>RMS y el famoso 69%</h3>
+
+<p><strong>Rate-monotonic scheduling</strong> asigna prioridades por una regla mecánica: <em>a mayor frecuencia, mayor prioridad</em>. La tarea de 1 ms tiene más prioridad que la de 10 ms, que tiene más que la de 100 ms. Liu y Layland demostraron en 1973 que si un conjunto de tareas periódicas independientes es planificable con <em>alguna</em> asignación de prioridades fijas, entonces es planificable con esta. Y dieron un test:</p>
+
+<pre><code class="lang-c">/*  Utilización:   U = suma( Ci / Ti )
+    Test de Liu &amp; Layland (suficiente, NO necesario):
+
+        U &lt;= n * ( 2^(1/n) - 1 )
+
+    n = 1    -&gt;  100,0 %
+    n = 2    -&gt;   82,8 %
+    n = 3    -&gt;   77,9 %
+    n = 4    -&gt;   75,7 %
+    n -&gt; inf -&gt;   69,3 %   (ln 2)
+*/</code></pre>
+
+<p>Un ejemplo con números reales. Tres tareas periódicas:</p>
+
+<table>
+<thead><tr><th>Tarea</th><th>Período T</th><th>WCET C</th><th>Prioridad RMS</th><th>Utilización C/T</th></tr></thead>
+<tbody>
+<tr><td>Lazo de control</td><td>1 ms</td><td>0,20 ms</td><td>Alta</td><td>20,0%</td></tr>
+<tr><td>Lectura de sensores</td><td>10 ms</td><td>2,00 ms</td><td>Media</td><td>20,0%</td></tr>
+<tr><td>Registro a memoria</td><td>100 ms</td><td>30,00 ms</td><td>Baja</td><td>30,0%</td></tr>
+<tr><td colspan="4"><strong>Utilización total</strong></td><td><strong>70,0%</strong></td></tr>
+</tbody>
+</table>
+
+<p>El bound para n = 3 es 77,9%. Como 70% ≤ 77,9%, el conjunto <strong>es planificable</strong> con RMS: garantizado, sin simular. Ahora subamos el registro a C = 40 ms: U pasa a 80%, que supera el bound. ¿Falla? <strong>No necesariamente</strong>, y acá está el matiz que casi nadie entiende:</p>
+
+<div class="concept">
+  <strong>💡 El test de Liu &amp; Layland es suficiente, no necesario.</strong> Si <code>U</code> queda por debajo del bound, tenés garantía sin hacer más cuentas. Si queda por encima, <em>el test no dice nada</em>: puede fallar o puede andar perfecto. Un conjunto con períodos armónicos (1, 10, 100 ms) es planificable hasta el <strong>100%</strong> de utilización. Para el veredicto exacto se usa el <strong>análisis de tiempo de respuesta</strong> (Joseph &amp; Pandya): se resuelve iterativamente <code>Ri = Ci + Σ techo(Ri/Tj)·Cj</code> sobre las tareas de mayor prioridad, y se compara <code>Ri</code> con la deadline. Ese es el test exacto; el 69% es la regla de bolsillo.
+</div>
+
+<h3>EDF: óptimo en el papel, peligroso en el campo</h3>
+
+<p><strong>Earliest deadline first</strong> es dinámico: en cada instante corre la tarea cuya deadline está más cerca. Es óptimo —si existe alguna planificación factible, EDF la encuentra— y su condición es simplemente <code>U ≤ 1</code>. Es decir, aprovecha el 100% de la CPU donde RMS te obliga a dejar 30% sin usar. Y sin embargo, casi nadie lo usa en producción. Los motivos:</p>
+
+<div class="step"><strong>1. Colapso en dominó.</strong> Bajo sobrecarga transitoria —una tarea que tarda más de lo previsto una sola vez— EDF empieza a priorizar tareas que ya no llegan, y arrastra al fracaso a todas las demás. Puede perder <em>todas</em> las deadlines. Con prioridad fija, la sobrecarga la absorben las tareas de baja prioridad y las críticas siguen cumpliendo: <strong>degradación predecible</strong> en vez de colapso.</div>
+
+<div class="step"><strong>2. Overhead.</strong> Mantener la cola ordenada por deadline absoluta cuesta más que un simple mapa de bits de prioridades, que es lo que hace FreeRTOS en tiempo constante.</div>
+
+<div class="step"><strong>3. Soporte.</strong> FreeRTOS no lo trae. Zephyr tiene EDF opcional (<code>CONFIG_SCHED_DEADLINE</code>). Linux lo ofrece con <code>SCHED_DEADLINE</code>. Fuera de eso, lo tenés que construir.</div>
+
+<div class="rule">
+  <strong>📌 La regla del 70%.</strong> Nadie corre un sistema con deadlines duras al 95% de CPU, aunque la teoría lo permita. Se apunta a 60–70% de utilización en la carga peor, y el resto es margen para lo que no modelaste: interrupciones no contabilizadas, bloqueos por secciones críticas, ese driver del fabricante que tarda el doble los martes. El margen no es cobardía: es el reconocimiento de que tu modelo es incompleto.
+</div>
+
+<h2>CF1.7 Inversión de prioridad: el bug que casi mata una misión a Marte</h2>
+
+<p>Este es el mecanismo de falla más elegante y más traicionero del tiempo real, porque el código de cada una de las tres tareas involucradas es <em>perfectamente correcto</em>. Falla la interacción.</p>
+
+<div class="concept">
+  <strong>💡 El mecanismo, paso a paso.</strong> Tres tareas: <strong>H</strong> (alta), <strong>M</strong> (media), <strong>L</strong> (baja). <strong>(1)</strong> L toma el mutex del recurso R. <strong>(2)</strong> H se despierta, desaloja a L, y pide R: se bloquea, porque lo tiene L. Hasta acá todo está bien: H espera lo que dure la sección crítica de L, que es corta. <strong>(3)</strong> Pero antes de que L termine, se despierta <strong>M</strong>, que no usa R para nada. M tiene más prioridad que L, así que desaloja a L. <strong>(4)</strong> Ahora M corre. Mientras M corra, L no avanza; mientras L no avance, no suelta R; mientras no suelte R, <strong>H sigue bloqueada por una tarea de prioridad media con la que no comparte absolutamente nada</strong>. La espera de H ya no está acotada por la sección crítica: está acotada por cuánto quiera correr M. Eso es <em>inversión de prioridad ilimitada</em>.
+</div>
+
+<div class="analogy">
+  <strong>🧩 La analogía de la fotocopiadora.</strong> El director (H) necesita la fotocopiadora que está usando el cadete (L). Espera, porque el cadete tarda treinta segundos. Pero llega un gerente (M) que necesita al cadete para otra cosa y se lo lleva. El cadete sigue teniendo la llave de la fotocopiadora en el bolsillo. El director espera —no al cadete, sino al gerente— por un recurso que el gerente ni siquiera usa. Y si van llegando más gerentes, el director espera para siempre.
+</div>
+
+<h3>El caso Mars Pathfinder (julio de 1997)</h3>
+
+<p>El rover Sojourner ya estaba en Marte, funcionando, cuando empezó a resetearse solo cada varias horas, perdiendo datos científicos en cada reinicio. VxWorks, el RTOS de a bordo, tenía un bus de datos compartido protegido por un mutex. Una tarea de alta prioridad gestionaba el bus; una tarea meteorológica de baja prioridad también lo usaba; y una tarea de comunicaciones de prioridad media, larga y frecuente, no lo usaba pero desalojaba a la meteorológica. El resultado exacto del cuadro de arriba: la tarea del bus se quedaba esperando más allá de su deadline, el <em>watchdog</em> concluía que el sistema estaba colgado y reiniciaba todo.</p>
+
+<p>En el JPL reprodujeron el fallo en la nave gemela de laboratorio —con trazas activadas, después de horas de ejecución— y encontraron la causa. La corrección fue de una línea: VxWorks ya tenía <strong>herencia de prioridad</strong> en sus mutexes, pero venía deshabilitada por defecto y nadie la había activado. Se subió el parche por radio a unos 190 millones de kilómetros y la misión siguió.</p>
+
+<div class="warn">
+  <strong>La moraleja verdadera no es «activá la herencia».</strong> Es que <strong>el fallo no apareció en meses de pruebas en tierra</strong>: dependía de una coincidencia temporal de tres tareas que solo se dio con la carga real. Los bugs de tiempo real son así — no fallan cuando los buscás, fallan cuando el sistema está lejos. Por eso la defensa es el análisis y la instrumentación permanente, no la cantidad de horas de banco.
+</div>
+
+<h3>Las dos soluciones, con su costo</h3>
+
+<table>
+<thead><tr><th></th><th>Herencia de prioridad</th><th>Techo de prioridad (ICPP)</th></tr></thead>
+<tbody>
+<tr><td><strong>Cómo funciona</strong></td><td>El dueño del mutex <em>hereda</em> temporalmente la prioridad de la tarea bloqueada más alta</td><td>Cada mutex tiene un «techo» = la prioridad máxima de cualquier tarea que lo pueda tomar. Al tomarlo, la tarea sube <em>inmediatamente</em> a ese techo</td></tr>
+<tr><td><strong>Cota del bloqueo</strong></td><td>La suma de las secciones críticas anidadas</td><td><strong>Una sola</strong> sección crítica, la más larga</td></tr>
+<tr><td><strong>¿Previene deadlock?</strong></td><td>No</td><td><strong>Sí</strong>, por construcción</td></tr>
+<tr><td><strong>Costo</strong></td><td>Recalcular prioridades al tomar y soltar; el análisis con anidamiento se vuelve complicado</td><td>Hay que declarar y <em>mantener</em> el techo a mano: si agregás una tarea de más prioridad y no actualizás el techo, la protección desaparece en silencio</td></tr>
+<tr><td><strong>Efecto secundario</strong></td><td>Ninguno si nadie compite</td><td>La tarea sube de prioridad <em>siempre</em>, aunque no haya competencia: penaliza a terceros que no tienen nada que ver</td></tr>
+<tr><td><strong>Dónde está</strong></td><td>FreeRTOS <code>xSemaphoreCreateMutex()</code>; Zephyr <code>k_mutex</code>; POSIX <code>PTHREAD_PRIO_INHERIT</code></td><td>POSIX <code>PTHREAD_PRIO_PROTECT</code>; VxWorks; AUTOSAR OS lo exige</td></tr>
+</tbody>
+</table>
+
+<h2>CF1.8 Primitivas de sincronización: elegir mal es un bug latente</h2>
+
+<p>Un RTOS te da media docena de primitivas y todas «funcionan» para casi todo. Esa es exactamente la trampa: usar la equivocada compila, pasa las pruebas y falla en producción.</p>
+
+<table>
+<thead><tr><th>Primitiva</th><th>Para qué es</th><th>¿Desde ISR?</th><th>¿Herencia?</th><th>RAM en FreeRTOS</th></tr></thead>
+<tbody>
+<tr><td><strong>Mutex</strong></td><td>Exclusión mutua sobre un recurso. Tiene <em>dueño</em></td><td>❌ Nunca</td><td>✅ Sí</td><td>~80 B</td></tr>
+<tr><td><strong>Semáforo binario</strong></td><td>Señalizar un evento (ISR → tarea)</td><td>✅ <code>...FromISR</code></td><td>❌ No</td><td>~80 B</td></tr>
+<tr><td><strong>Semáforo contador</strong></td><td>Contar recursos o eventos pendientes</td><td>✅</td><td>❌ No</td><td>~80 B</td></tr>
+<tr><td><strong>Cola</strong></td><td>Pasar datos <em>y</em> sincronizar en un solo paso</td><td>✅</td><td>❌ No</td><td>~80 B + N × tamaño</td></tr>
+<tr><td><strong>Event group / flags</strong></td><td>Esperar combinaciones de eventos (AND / OR)</td><td>✅ (diferido al timer task)</td><td>❌ No</td><td>~28 B (24 bits usables)</td></tr>
+<tr><td><strong>Stream / message buffer</strong></td><td>Flujo de bytes o mensajes, 1 productor → 1 consumidor</td><td>✅</td><td>—</td><td>~40 B + buffer</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error clásico: usar un semáforo binario como mutex.</strong> Funciona —da exclusión mutua— y por eso se hace. Pero un semáforo no tiene <em>dueño</em>, y sin dueño <strong>no puede haber herencia de prioridad</strong>: acabás de reinstalar el bug del Mars Pathfinder. Además, cualquier tarea puede «liberarlo» aunque nunca lo haya tomado, así que un error en un módulo lejano rompe la exclusión de otro sin dejar rastro. La regla es literal: <strong>proteger un recurso → mutex. Señalizar un evento → semáforo.</strong> No son intercambiables aunque el compilador te deje.
+</div>
+
+<pre><code class="lang-c">// ❌ MAL: exclusión mutua con semáforo binario. Sin dueño, sin herencia.
+SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+xSemaphoreGive(sem);                       // hay que "cebarlo" a mano
+xSemaphoreTake(sem, portMAX_DELAY);
+usar_recurso();
+xSemaphoreGive(sem);
+
+// ✅ BIEN: mutex. Tiene dueño y hereda prioridad.
+SemaphoreHandle_t mtx = xSemaphoreCreateMutex();
+if (xSemaphoreTake(mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+    usar_recurso();
+    xSemaphoreGive(mtx);                   // solo el dueño puede soltarlo
+} else {
+    // El timeout NO es decoración: es el punto donde detectás
+    // contención imprevista. Contalo y reportalo.
+    contador_timeouts_mutex++;
+}</code></pre>
+
+<h3>Deadlock: se evita por diseño, no por suerte</h3>
+
+<p>Un deadlock necesita las cuatro condiciones de Coffman simultáneamente: exclusión mutua, retener-y-esperar, no desalojo, y espera circular. Romper <em>cualquiera</em> lo elimina, y la única que se rompe barato en un embebido es la última.</p>
+
+<div class="rule">
+  <strong>📌 Orden global de adquisición.</strong> Numerá todos los mutexes del sistema y establecé por norma que <strong>siempre se toman en orden creciente</strong>. Si la tarea A toma (1, 2) y la tarea B toma (2, 1), tenés deadlock latente; si ambas toman (1, 2), es imposible por construcción. Documentá el orden en un comentario en la cabecera donde se declaran los mutexes, y revisalo en cada <em>code review</em>. Cuesta cinco minutos y elimina una clase entera de bugs.
+</div>
+
+<div class="warn">
+  <strong>Los timeouts no evitan el deadlock.</strong> Un <code>xSemaphoreTake(mtx, pdMS_TO_TICKS(50))</code> convierte un cuelgue permanente en un fallo detectable, que es una mejora enorme — pero el deadlock sigue existiendo, ahora en forma de degradación intermitente. Usá timeouts <em>siempre</em>, como red de seguridad e instrumento de medición, y arreglá igual la causa. Un timeout que salta es evidencia, no solución.
+</div>
+
+<div class="tip">
+  <strong>La mejor primitiva es la que no usás.</strong> La arquitectura que menos bugs de concurrencia produce es <strong>un solo dueño por recurso, con cola de pedidos</strong>: nadie toca el hardware de la SD salvo la tarea SD; los demás le mandan mensajes. Sin estado compartido no hay carrera, no hay mutex, no hay inversión y no hay deadlock. Además el análisis temporal se simplifica: el bloqueo se convierte en tiempo de encolado, que se mide directamente con la ocupación de la cola.
+</div>
+
+<h2>CF1.9 FreeRTOS y Zephyr en 2026</h2>
+
+<p>Los dos RTOS abiertos que vas a encontrar en la industria resuelven problemas distintos, y confundir cuál necesitás es una decisión de arquitectura que se paga durante todo el proyecto.</p>
+
+<table>
+<thead><tr><th></th><th>FreeRTOS</th><th>Zephyr</th></tr></thead>
+<tbody>
+<tr><td><strong>Qué es</strong></td><td>Un <em>kernel</em>: planificador + primitivas</td><td>Un <em>sistema operativo</em> embebido completo</td></tr>
+<tr><td><strong>Licencia y gobernanza</strong></td><td>MIT desde la v10 (2017); mantenido por AWS</td><td>Apache 2.0; proyecto de la Linux Foundation</td></tr>
+<tr><td><strong>Estado en 2026</strong></td><td>Kernel V11.3.0 (marzo 2026): nuevos ports ARM, endurecimiento y MPU que reclama menos regiones. Distribución <strong>FreeRTOS 202604 LTS</strong> (abril 2026) con 2 años de parches y MQTT v5.0</td><td><strong>4.4.0</strong> (14 de abril de 2026) es la estable; 4.5 prevista para octubre de 2026. Cadencia semestral (abril / octubre)</td></tr>
+<tr><td><strong>LTS vigente</strong></td><td>202604 LTS — 2 años</td><td><strong>3.7 (LTS3, julio 2024)</strong>, con soporte hasta 2029. La siguiente LTS está prevista para fines de 2027</td></tr>
+<tr><td><strong>Footprint del kernel</strong></td><td>~6–12 kB de ROM</td><td>Menos de 8 kB de flash y menos de 5 kB de RAM en config mínima</td></tr>
+<tr><td><strong>Qué traés vos</strong></td><td>Drivers (HAL del fabricante), build system, configuración, integración</td><td>Casi nada: devicetree, Kconfig, drivers unificados, BLE, IPv6, USB, filesystem, logging, shell, settings, MCUboot/OTA, <code>west</code></td></tr>
+<tr><td><strong>Curva de aprendizaje</strong></td><td>Un día para ser productivo</td><td>Semanas: devicetree y Kconfig son un mundo aparte</td></tr>
+<tr><td><strong>Multinúcleo</strong></td><td>SMP en el kernel principal desde V11 (<code>configUSE_CORE_AFFINITY</code>, <code>vTaskCoreAffinitySet</code>)</td><td>SMP soportado; además EDF opcional con <code>CONFIG_SCHED_DEADLINE</code></td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>El dato de footprint que hay que leer bien.</strong> A nivel <em>kernel</em>, Zephyr usa aproximadamente el doble de flash y RAM que FreeRTOS. Pero a nivel <em>sistema</em> —kernel más pila de red, criptografía y actualización OTA— la diferencia se achica a un 10–15%, porque lo que en Zephyr ya viene integrado, con FreeRTOS lo armás vos juntando piezas de tres proveedores. Comparar solo el kernel es comparar el motor sin el auto. La decisión real no es de bytes: es <strong>cuánta integración querés escribir y mantener vos</strong>.
+</div>
+
+<div class="tip">
+  <strong>Y el dato de adopción, porque también decide.</strong> Una investigación de la Linux Foundation publicada en marzo de 2026 reportó que el <strong>70%</strong> de las organizaciones norteamericanas encuestadas ya usa Zephyr en productos y el 69% planea aumentar su uso; en 2026 Renesas y Wind River subieron a membresía Platinum. Traducido a decisión de proyecto: es cada vez más probable que el silicio que elijas ya venga con soporte Zephyr mantenido por el fabricante, y eso pesa más en el cronograma que cualquier microbenchmark.
+</div>
+
+<h3>Dimensionar un stack (y detectar el desborde antes de perder una semana)</h3>
+
+<p>Cada tarea tiene su propio stack, y vos elegís su tamaño con un número que, si es chico, produce el bug más caro del rubro: corrupción de memoria que se manifiesta minutos después, en otro módulo, sin relación aparente.</p>
+
+<p>Lo que consume el stack de una tarea: la profundidad máxima de llamadas por el tamaño de cada marco; los registros que apila una interrupción que caiga mientras esa tarea corre (8 palabras en Cortex-M, o 26 con FPU sin <em>lazy stacking</em>); las variables locales grandes —un buffer de 512 bytes en el stack es un error frecuente—; y las bibliotecas, con <code>printf</code> de punto flotante a la cabeza, que puede consumir de 512 a 1.500 bytes de una sola vez.</p>
+
+<pre><code class="lang-c">// FreeRTOS: medir el "high water mark" bajo la carga PEOR, no la típica.
+// Devuelve el mínimo histórico de palabras libres (no bytes).
+void tarea_diagnostico(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        UBaseType_t libres = uxTaskGetStackHighWaterMark(h_tarea_sd);
+        if (libres &lt; 64) {                     // menos de 256 bytes: alarma
+            registrar_evento(EV_STACK_BAJO, (uint32_t)libres);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// Se llama desde el kernel cuando detecta el desborde. NO es opcional:
+// requiere configCHECK_FOR_STACK_OVERFLOW = 2 en FreeRTOSConfig.h
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *nombre)
+{
+    (void)xTask;
+    guardar_en_flash_y_reiniciar(nombre);   // dejá rastro ANTES de resetear
+}</code></pre>
+
+<pre><code class="lang-c">// Zephyr: el stack se declara con macro (alineación y guarda las pone el SO).
+#include &lt;zephyr/kernel.h&gt;
+
+#define STACK_SD  2048
+K_THREAD_STACK_DEFINE(pila_sd, STACK_SD);
+static struct k_thread hilo_sd;
+
+void arrancar(void)
+{
+    k_thread_create(&amp;hilo_sd, pila_sd, K_THREAD_STACK_SIZEOF(pila_sd),
+                    tarea_sd, NULL, NULL, NULL,
+                    K_PRIO_PREEMPT(10), 0, K_NO_WAIT);
+}
+
+/*  En prj.conf, las tres líneas que ahorran una semana de depuración:
+      CONFIG_HW_STACK_PROTECTION=y     -&gt; guarda por MPU: falla EN EL ACTO
+      CONFIG_THREAD_ANALYZER=y         -&gt; reporte de uso por hilo
+      CONFIG_THREAD_ANALYZER_AUTO=y    -&gt; lo imprime solo, periódicamente   */</code></pre>
+
+<p>Y el footprint no se estima leyendo tablas ajenas —incluida la de más arriba—: se mide sobre <em>tu</em> binario, con <em>tu</em> configuración y <em>tu</em> nivel de optimización.</p>
+
+<pre><code class="lang-bash"># Zephyr: compilar y ver a dónde se fue cada byte
+west build -b nucleo_f411re samples/basic/blinky
+west build -t ram_report      # RAM desglosada por símbolo y por módulo
+west build -t rom_report      # idem para flash
+
+# Cualquier proyecto ARM: el desglose crudo del binario
+arm-none-eabi-size -A -d build/zephyr/zephyr.elf
+#   .text  -&gt; flash (código + constantes)
+#   .data  -&gt; RAM inicializada (y ocupa flash tambien, para la copia)
+#   .bss   -&gt; RAM a cero (acá viven los stacks estáticos)
+
+# Los 10 símbolos más pesados: casi siempre hay una sorpresa
+arm-none-eabi-nm --print-size --size-sort --radix=d build/zephyr/zephyr.elf | tail -10</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Centinela contra guarda de MPU: la diferencia es cuándo te enterás.</strong> El <em>patrón centinela</em> (<code>configCHECK_FOR_STACK_OVERFLOW = 2</code>) llena el final del stack con un valor conocido y lo verifica en cada cambio de contexto: cuesta unos 20 ciclos por cambio y detecta el desborde <em>después</em> de que ocurrió — con suerte antes de que la corrupción se propague. La <strong>guarda por MPU</strong> marca la página siguiente como no accesible y produce una excepción <em>en la instrucción exacta</em> que se pasó, con el PC apuntando al culpable. Cuesta una región de MPU por hilo y algo de alineación. Si tu micro tiene MPU, usala: es la diferencia entre depurar diez minutos y depurar una semana.
+</div>
+
+<div class="rule">
+  <strong>📌 La receta de dimensionado.</strong> Arrancá generoso (2 kB), corré la carga peor durante horas, leé el <em>high water mark</em>, y fijá el tamaño en <code>usado_máximo × 1,4</code> redondeado hacia arriba, nunca dejando menos de 64 palabras libres. Repetí la medición después de cada cambio que agregue llamadas o buffers. Y prohibí <code>printf</code> de punto flotante en cualquier tarea con stack ajustado: es la causa número uno de desbordes en firmware.
+</div>
+
+<h2>CF1.10 Cuándo NO usar un RTOS</h2>
+
+<p>Terminamos el recorrido por lo que un RTOS te da; ahora la parte que casi nunca se dice en voz alta. <strong>Meter un RTOS no hace que tu sistema sea de tiempo real.</strong> Lo que lo hace de tiempo real es el análisis: conocer los WCET, asignar prioridades con criterio y demostrar que las deadlines se cumplen. El RTOS es una herramienta para <em>implementar</em> ese diseño, y si no hiciste el diseño, lo único que agregaste es una fuente nueva de bugs.</p>
+
+<p>Comparación concreta sobre un termostato con pantalla, sensor y relé — un producto real y modesto:</p>
+
+<table>
+<thead><tr><th>Recurso</th><th>Máquina de estados + timer</th><th>RTOS con 3 tareas</th></tr></thead>
+<tbody>
+<tr><td>Flash del kernel</td><td>0 B</td><td>~8.400 B</td></tr>
+<tr><td>RAM de stacks</td><td>512 B (uno solo)</td><td>3 × 1.024 B = 3.072 B</td></tr>
+<tr><td>RAM de objetos del kernel</td><td>0 B</td><td>~460 B (TCB + colas)</td></tr>
+<tr><td>Cambios de contexto por segundo</td><td>0</td><td>~200 (1,8 µs c/u ≈ 0,04% CPU)</td></tr>
+<tr><td>Carreras posibles</td><td>Solo con ISR</td><td>Entre las tres tareas y con ISR</td></tr>
+<tr><td>Testeable sin hardware</td><td>Sí: la FSM es una función pura</td><td>Necesita simulador o placa</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El test para decidir.</strong> Si podés escribir <em>todas</em> tus actividades con la forma «hacé un paso corto y volvé», no necesitás un RTOS: necesitás máquinas de estados y un despachador temporal, y vas a terminar con un sistema más chico, más predecible y más fácil de demostrar correcto. Necesitás RTOS cuando al menos una actividad <strong>no puede</strong> escribirse así: porque bloquea decenas de milisegundos y no controlás ese código, o porque un stack de terceros exige un hilo propio.
+</div>
+
+<div class="mistake">
+  <strong>La falacia del «RTOS porque es profesional».</strong> Se ve seguido: un proyecto de tres actividades simples con FreeRTOS, ocho tareas, cinco mutexes y un bug de concurrencia por mes. La complejidad accidental que agregaste es real y la pagás en cada cambio. Al revés también existe: forzar un superloop en un sistema con un módem LTE que bloquea 8 segundos en el registro a red, y terminar con una máquina de estados de cuarenta estados que nadie entiende. Las dos son la misma falla: elegir la arquitectura por gusto y no por el requisito.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el datalogger que perdía muestras</h2>
+
+<blockquote>Requisito: muestrear un sensor a <strong>1 kHz</strong> (una muestra cada 1 ms, sin excepciones) y guardar todo en una tarjeta SD con sistema de archivos FAT32. Hardware: Cortex-M4 a 80 MHz, SD por SPI a 12 MHz. Sin muestras perdidas.</blockquote>
+
+<h3>Versión 1: superloop. Falla.</h3>
+
+<pre><code class="lang-c">static uint16_t buf[512];
+static volatile uint8_t tick_1ms;      // la pone la ISR del SysTick
+static unsigned n = 0;
+
+int main(void)
+{
+    hw_init();
+    for (;;) {
+        if (tick_1ms) {
+            tick_1ms = 0;
+            buf[n++] = adc_leer();
+        }
+        if (n == 512) {
+            UINT bw;
+            f_write(&amp;fil, buf, sizeof buf, &amp;bw);   // &lt;-- bloquea
+            n = 0;
+        }
+    }
+}</code></pre>
+
+<p><strong>Paso 1 — Medir, no suponer.</strong> Un pin en alto durante <code>f_write</code>, osciloscopio en persistencia infinita, dos horas de captura. Resultado: la escritura de 1 KiB tarda <strong>4,2 ms típicos</strong>, pero cada 30 segundos aproximadamente aparece un pulso de <strong>41,3 ms</strong>. No es un bug del código: es la tarjeta haciendo su recolección de basura y borrado de bloques internos, un comportamiento del firmware de la SD sobre el que no tenés ningún control.</p>
+
+<p><strong>Paso 2 — Leer la consecuencia.</strong> Durante esos 41,3 ms el bucle no vuelve a la rama del muestreo, así que se pierden unas 41 muestras de golpe. Un segundo pin que hace <em>toggle</em> en cada muestra deja los huecos visibles en la pantalla del osciloscopio: no hay que discutirlo, se ve.</p>
+
+<table>
+<thead><tr><th>Métrica (60 minutos de corrida)</th><th>v1 superloop</th></tr></thead>
+<tbody>
+<tr><td>Muestras esperadas</td><td>3.600.000</td></tr>
+<tr><td>Muestras perdidas</td><td><strong>46.900 (1,30%)</strong></td></tr>
+<tr><td>Jitter de muestreo, máximo</td><td><strong>41,3 ms</strong> (deadline: 1 ms)</td></tr>
+<tr><td>Detección del fallo por el propio sistema</td><td>Ninguna: pierde en silencio</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Por qué «optimizar la escritura» no puede funcionar.</strong> El peor caso lo pone el firmware de la tarjeta, no tu código. Podés subir el SPI a 25 MHz, usar DMA, alinear los buffers a bloque, cambiar de biblioteca FAT — nada de eso mueve los 41 ms de la recolección interna. <strong>Cuando el peor caso vive fuera de tu código, la única salida es sacarlo del camino crítico.</strong> Eso es una decisión de arquitectura, no de optimización.
+</div>
+
+<h3>Versión 2: rediseño con RTOS</h3>
+
+<div class="step"><strong>1. El muestreo se va a una ISR de timer.</strong> TIM2 a 1 kHz dispara la conversión del ADC por hardware; la ISR solo lee el resultado ya listo. Prioridad más urgente que cualquier tarea, pero numéricamente por debajo de <code>configMAX_SYSCALL_INTERRUPT_PRIORITY</code> para poder usar las APIs <code>FromISR</code>. WCET medido con el pin de prueba: <strong>2,1 µs</strong> — el 0,21% de la CPU a 1 kHz.</div>
+
+<div class="step"><strong>2. Doble buffer (ping-pong).</strong> Dos bloques de 512 muestras × 2 bytes = 1 KiB cada uno. Mientras la tarea escribe el bloque A, la ISR llena el B. Costo: 2 KiB de RAM. Dimensionado: con 43,7 ms de peor caso de escritura y 1 kHz de muestreo hacen falta al menos 44 muestras de colchón; 512 deja un margen de 11×.</div>
+
+<div class="step"><strong>3. Tarea de escritura, prioridad baja.</strong> Se bloquea en <code>xQueueReceive</code> con espera indefinida —consume 0% de CPU mientras espera— y al recibir un puntero llama a <code>f_write</code>. Que tarde 41 ms dejó de importar: una ISR desaloja a cualquier tarea, siempre.</div>
+
+<div class="step"><strong>4. Cola de 4 punteros</strong> (4 × 4 B + ~80 B de estructura ≈ 96 B) para absorber la ráfaga de dos bloques consecutivos si una escritura larga se solapa con el llenado del siguiente.</div>
+
+<pre><code class="lang-c">#define N_MUESTRAS  512
+
+static uint16_t bloque[2][N_MUESTRAS];   // ping-pong: 2 KiB
+static QueueHandle_t cola_bloques;       // guarda punteros, no datos
+static volatile uint32_t bloques_perdidos = 0;
+
+// ---- ISR de 1 kHz: 2,1 µs de WCET medido ----------------------------
+void TIM2_IRQHandler(void)
+{
+    static unsigned idx = 0, cual = 0;
+    BaseType_t despertar = pdFALSE;
+
+    TIM2-&gt;SR = ~TIM_SR_UIF;
+    bloque[cual][idx++] = (uint16_t)(ADC1-&gt;DR);
+
+    if (idx == N_MUESTRAS) {
+        uint16_t *lleno = bloque[cual];
+        idx  = 0;
+        cual ^= 1u;                        // la ISR pasa a llenar el otro
+
+        if (xQueueSendFromISR(cola_bloques, &amp;lleno, &amp;despertar) != pdTRUE) {
+            bloques_perdidos++;            // el fallo se CUENTA, no se ignora
+        }
+    }
+    portYIELD_FROM_ISR(despertar);
+}
+
+// ---- Tarea de escritura: prioridad baja, puede tardar 40 ms ---------
+static void tarea_sd(void *arg)
+{
+    (void)arg;
+    uint16_t *listo;
+    for (;;) {
+        if (xQueueReceive(cola_bloques, &amp;listo, portMAX_DELAY) == pdTRUE) {
+            UINT bw;
+            f_write(&amp;fil, listo, N_MUESTRAS * sizeof(uint16_t), &amp;bw);
+        }
+    }
+}</code></pre>
+
+<h3>Resultado medido, y el análisis de por qué ahora cumple</h3>
+
+<table>
+<thead><tr><th>Métrica (60 minutos)</th><th>v1 superloop</th><th>v2 RTOS</th></tr></thead>
+<tbody>
+<tr><td>Muestras perdidas</td><td>46.900 (1,30%)</td><td><strong>0</strong></td></tr>
+<tr><td>Jitter de muestreo, máximo</td><td>41,3 ms</td><td><strong>1,9 µs</strong></td></tr>
+<tr><td>Peor caso de <code>f_write</code></td><td>41,3 ms</td><td>43,7 ms <em>(empeoró, y no importa)</em></td></tr>
+<tr><td>CPU consumida por la ISR</td><td>—</td><td>0,21%</td></tr>
+<tr><td>Ocupación máxima de la cola</td><td>—</td><td>2 de 4</td></tr>
+<tr><td>RAM adicional</td><td>1 KiB</td><td>2 KiB buffers + 1,5 KiB stack + ~0,2 kB kernel</td></tr>
+<tr><td>Flash adicional</td><td>0</td><td>8,4 kB de kernel</td></tr>
+<tr><td>¿Detecta su propio fallo?</td><td>No</td><td>Sí: <code>bloques_perdidos</code></td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Por qué cumple ahora, en tres frases.</strong> <strong>(1)</strong> La deadline de 1 ms ahora la cumple <em>solamente</em> la ISR, cuyo WCET es 2,1 µs: hay un margen de 470×. Todo lo demás salió del camino crítico. <strong>(2)</strong> El requisito «no perder muestras» dejó de depender del peor caso de la SD y pasó a depender del <em>tamaño del buffer</em>, que es un parámetro que vos elegís: alcanza con <code>buffer ≥ WCET_escritura × frecuencia</code> = 43,7 ms × 1 kHz ≈ 44 muestras. <strong>(3)</strong> La condición de fallo se volvió explícita y medible: si la cola se llena, se perdió un bloque y el contador lo dice. El sistema dejó de fallar en silencio.
+</div>
+
+<div class="rule">
+  <strong>📌 La lección, que no es «usá RTOS».</strong> El rediseño <strong>no hizo el sistema más rápido</strong>: la escritura a SD hasta empeoró un poco por el cambio de contexto. Lo que hizo fue volver el peor caso <em>irrelevante para la deadline que importa</em>, y convertir un requisito temporal difícil de garantizar («la SD tiene que responder rápido») en un requisito de memoria trivial de verificar («el buffer tiene que ser mayor que 44 muestras»). Eso —mover el problema a una dimensión donde tenés control— es en qué consiste diseñar para tiempo real.
+</div>
+
+<div class="warn">
+  <strong>El costo que aceptaste, dicho en voz alta.</strong> 2 KiB más de RAM, 8,4 kB de flash, y una clase de bug nueva: si alguien escribe en el bloque que la ISR está llenando, corrupción silenciosa. Se mitiga con una regla de propiedad estricta —<em>la ISR es la única que toca <code>idx</code> y <code>cual</code>; la tarea solo recibe punteros a bloques ya cerrados</em>— escrita en un comentario junto a la declaración. Toda decisión de arquitectura tiene una factura; el trabajo senior es enunciarla, no esconderla.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu sistema responde en 200 µs en promedio y la deadline es 1 ms. ¿Alcanza?</summary>
+<p>No se sabe, y esa es la respuesta correcta. El promedio no dice nada sobre el peor caso: podrías tener p50 en 200 µs y un máximo de 3 ms cuando coinciden una falla de caché, una interrupción de mayor prioridad y una sección crítica de un driver. Lo que hay que responder es: máximo observado, sobre cuántas muestras, y bajo qué carga. Si el máximo sobre diez millones de muestras con todos los periféricos activos es 340 µs, tenés un margen de 3× y una respuesta defendible. Si solo tenés el promedio, no tenés un sistema de tiempo real: tenés un sistema que suele andar.</p></details>
+
+<details><summary>¿Por qué usar un semáforo binario como mutex es un bug latente y no un atajo válido?</summary>
+<p>Porque un semáforo no tiene dueño, y sin dueño el kernel no puede aplicar herencia de prioridad. Eso reabre exactamente la inversión de prioridad ilimitada del Mars Pathfinder: una tarea de prioridad media que ni siquiera usa el recurso puede bloquear indefinidamente a una de alta. Hay un segundo problema, más silencioso: cualquier tarea puede hacer <code>give</code> del semáforo aunque nunca lo haya tomado, así que un error en un módulo lejano rompe la exclusión mutua de otro sin dejar rastro. El mutex verifica la propiedad y hereda prioridad; el semáforo binario está para señalizar eventos, típicamente de ISR a tarea.</p></details>
+
+<details><summary>Tu tarea de 1 kHz corre perfecta en el banco y falla en el campo cada varias horas. ¿Por dónde empezás?</summary>
+<p>Por asumir que el banco no reproduce la carga real, porque casi nunca lo hace. Primero, instrumentación permanente que sobreviva al campo: máximo observado de latencia guardado en RAM no inicializada o en flash, contadores de eventos perdidos, ocupación máxima de cada cola y <em>high water mark</em> de cada stack — todo leíble después del fallo. Segundo, las tres sospechas habituales en ese orden: una sección crítica larga de un driver o biblioteca de terceros que dispara la latencia de todas las interrupciones; una inversión de prioridad que solo se da cuando tres tareas coinciden; y un desborde de stack marginal que corrompe memoria a metros del síntoma —activá la guarda por MPU y te enterás en el acto—. Tercero, diseñá una carga de estrés que ejercite los tres simultáneamente y dejala corriendo. Un bug de timing que aparece «cada varias horas» es un bug de coincidencia: no lo vas a encontrar mirando el código, lo vas a encontrar midiendo.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Tiempo real es predecible, no rápido.</strong> El único número que importa es el peor caso; el promedio y hasta el p99 pueden esconder la cola que te rompe el sistema.</li>
+  <li><strong>Hard / firm / soft</strong> no es taxonomía: define el presupuesto, la arquitectura y la norma que te va a auditar. Sobreclasificar es tan mal ingeniería como subclasificar.</li>
+  <li><strong>Se mide con GPIO y osciloscopio</strong>, o con el contador de ciclos, nunca con <code>printf</code> — que a 115200 bps cuesta 87 µs por carácter y destruye lo que intenta medir.</li>
+  <li><strong>El WCET</strong> lo arruinan la caché, la predicción de saltos, los wait states de flash y el DMA robando bus. Se acota más por diseño —sin recursión, sin <code>malloc</code>, loops con cota, código crítico en TCM— que por herramientas.</li>
+  <li><strong>ISR corta + tarea diferida</strong> es el patrón fundamental. En la ISR no se bloquea, no se hace E/S, no se toma un mutex. La sección crítica más larga del firmware define la latencia peor caso de todo el sistema.</li>
+  <li><strong>El superloop es la respuesta correcta más seguido de lo que parece</strong>: cero kernel, un stack, ninguna carrera. El RTOS se justifica cuando algo bloquea decenas de milisegundos y no controlás ese código.</li>
+  <li><strong>RMS</strong> asigna prioridad por frecuencia y su test —<code>U ≤ n(2^(1/n)−1)</code>, que tiende al 69,3%— es <em>suficiente pero no necesario</em>: por encima del bound se usa el análisis de tiempo de respuesta. <strong>EDF</strong> llega al 100% de utilización pero colapsa en dominó bajo sobrecarga; por eso la industria prefiere prioridades fijas, que degradan de forma predecible.</li>
+  <li><strong>La inversión de prioridad</strong> ocurre entre tres tareas cuyo código es correcto por separado. Se acota con herencia de prioridad (FreeRTOS y Zephyr la traen en el mutex) o con techo de prioridad, que además previene deadlock pero hay que mantener a mano.</li>
+  <li><strong>Mutex para proteger, semáforo para señalizar.</strong> Usar un semáforo binario como mutex reinstala el bug del Pathfinder. El deadlock se evita con un orden global de adquisición; los timeouts lo detectan, no lo previenen.</li>
+  <li><strong>2026:</strong> FreeRTOS kernel V11.3.0 (marzo 2026) y distribución 202604 LTS con 2 años de soporte, MIT, bajo AWS; SMP en el kernel principal desde V11. Zephyr 4.4.0 (abril 2026), Apache 2.0 bajo la Linux Foundation, con <strong>3.7 todavía como LTS vigente</strong> hasta 2029, y adopción reportada del 70% entre las organizaciones norteamericanas encuestadas.</li>
+  <li><strong>Los stacks se miden, no se adivinan</strong>: <em>high water mark</em> bajo la carga peor por 1,4. Y si tu micro tiene MPU, activá la guarda por hardware: es la diferencia entre diez minutos y una semana de depuración.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá cualquier proyecto tuyo con una interrupción periódica y medí su latencia con el patrón de la sección CF1.2: un pin al entrar, otro al salir, osciloscopio en persistencia infinita durante al menos una hora. Reportá máximo observado, cantidad de muestras y carga aplicada. Después agregá un <code>printf</code> adentro de la ISR y volvé a medir: documentá cuánto cambió.</li>
+  <li>Escribí la misma función dos veces —una con un <code>switch</code> de ocho casos, otra con una tabla de punteros a función— y medí ambas con <code>DWT-&gt;CYCCNT</code> sobre 100.000 llamadas con entradas aleatorias. Compará el mínimo, el promedio y el <strong>máximo</strong>. ¿Cuál tiene menos jitter y por qué?</li>
+  <li>Dado el conjunto de tareas T1(T=2 ms, C=0,5 ms), T2(T=5 ms, C=1,0 ms), T3(T=20 ms, C=6,0 ms): calculá la utilización, aplicá el test de Liu &amp; Layland para n=3 y decidí si es planificable con RMS. Después subí C3 a 9 ms y explicá por qué el test dejar de concluir <em>no</em> significa que el sistema falle.</li>
+  <li>Reproducí una inversión de prioridad en tu placa: tres tareas, un semáforo <em>binario</em> compartido entre la de alta y la de baja, y una de prioridad media que corre en ráfagas largas. Medí con GPIO cuánto espera la tarea de alta. Después cambiá el semáforo por un mutex y volvé a medir. Presentá los dos máximos.</li>
+  <li>Implementá el datalogger del <em>worked example</em> en sus dos versiones y reproducí la tabla comparativa con <em>tus</em> números: muestras perdidas, jitter máximo, ocupación máxima de la cola. Después reducí el buffer a 32 muestras y mostrá exactamente a partir de qué tamaño empieza a perder.</li>
+  <li>Auditá las secciones críticas de tu proyecto: buscá todos los <code>__disable_irq()</code>, <code>taskENTER_CRITICAL()</code> y equivalentes, incluyendo los que estén dentro de bibliotecas del fabricante. Medí la más larga con un pin. ¿Supera los 10 µs? ¿Qué interrupción es la primera perjudicada?</li>
+  <li>Dimensioná los stacks de un proyecto con RTOS usando <code>uxTaskGetStackHighWaterMark</code> (o <code>CONFIG_THREAD_ANALYZER</code> en Zephyr) bajo carga de estrés. Después provocá un desborde a propósito con un <code>printf("%f", x)</code> en la tarea de stack más ajustado, con y sin la guarda de MPU activada, y compará qué información te da cada caso.</li>
+  <li>Tomá un sistema tuyo que hoy usa RTOS y escribí en una página cómo sería con superloop y máquinas de estados: qué actividades se convierten fácil, cuál es la que bloquea y no se deja convertir, y cuánta RAM y flash ahorrarías. Si no encontrás ninguna actividad realmente bloqueante, tenés la respuesta a si el RTOS estaba justificado.</li>
+</ol>
+
+<section class="quiz" id="quizCF_S1">
+  <style>
+    #quizCF_S1{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCF_S1 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCF_S1 .q{margin-bottom:1.5rem}
+    #quizCF_S1 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCF_S1 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCF_S1 .opt:hover{border-color:var(--accent)}
+    #quizCF_S1 .opt:disabled{cursor:default}
+    #quizCF_S1 .opt.ok{background:rgba(63,185,80,.16);border-color:var(--success, #3fb950)}
+    #quizCF_S1 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCF_S1 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCF_S1 .exp.show{display:block}
+    #quizCF_S1 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu lazo de control tiene una deadline de 1 ms. Medís 10 millones de ciclos: media 1,2 µs, p99 1,4 µs, máximo observado 87 µs. ¿Qué concluís?</p>
+    <button class="opt">Que sobra margen: el p99 está 700 veces por debajo de la deadline</button>
+    <button class="opt">Que el máximo de 87 µs es ruido de medición y hay que descartarlo como <em>outlier</em></button>
+    <button class="opt">Que el número relevante es el máximo, y que falta saber bajo qué carga se midió antes de afirmar nada</button>
+    <div class="exp">En tiempo real el peor caso es el único número que garantiza algo, y 87 µs no es un <em>outlier</em>: es un camino real del código que se ejecuta cuando coinciden una falla de caché, una interrupción de mayor prioridad y una sección crítica. Además falta el dato decisivo: si esos 10 millones de muestras se tomaron con el sistema en reposo, el verdadero peor caso todavía no apareció. Un máximo sin la carga bajo la que se midió no es evidencia.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Un datalogger a 1 kHz pierde muestras porque la escritura a SD bloquea hasta 41 ms por la recolección de basura interna de la tarjeta. ¿Cuál es el enfoque correcto?</p>
+    <button class="opt">Sacar la escritura del camino crítico: muestrear en una ISR corta, encolar bloques y escribir desde una tarea de baja prioridad con doble buffer</button>
+    <button class="opt">Subir el reloj del SPI y usar DMA para que <code>f_write</code> baje de 41 ms a menos de 1 ms</button>
+    <button class="opt">Bajar la frecuencia de muestreo a 20 Hz para que ninguna muestra caiga durante la escritura</button>
+    <div class="exp">El peor caso de 41 ms lo pone el firmware de la tarjeta, no tu código: ni el SPI más rápido ni el DMA lo mueven, porque no es tiempo de transferencia sino de borrado interno de bloques. Y bajar el muestreo destruye el requisito en vez de cumplirlo. La solución de arquitectura es volver ese peor caso irrelevante para la deadline: la ISR de 2,1 µs es la única que tiene deadline, y el buffer se dimensiona con <code>WCET_escritura × frecuencia</code> ≈ 44 muestras. El problema temporal se convirtió en un problema de memoria, que sí controlás.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tres tareas periódicas con utilización total del 80% y prioridades asignadas por RMS. El bound de Liu &amp; Layland para n=3 es 77,9%. ¿Qué se puede afirmar?</p>
+    <button class="opt">Que el sistema no es planificable: 80% supera el bound, así que va a perder deadlines</button>
+    <button class="opt">Que el test no concluye nada; hay que hacer el análisis de tiempo de respuesta, y con períodos armónicos podría ser planificable incluso al 100%</button>
+    <button class="opt">Que conviene pasar a EDF, que es óptimo y por lo tanto la opción segura en cualquier sistema con deadlines duras</button>
+    <div class="exp">El test de Liu &amp; Layland es <strong>suficiente pero no necesario</strong>: por debajo del bound hay garantía, por encima simplemente no hay veredicto. El test exacto es el análisis de tiempo de respuesta de Joseph &amp; Pandya, resolviendo iterativamente <code>Ri = Ci + Σ techo(Ri/Tj)·Cj</code>. Y EDF no es «la opción segura»: alcanza el 100% de utilización en el papel, pero ante una sobrecarga transitoria colapsa en dominó y puede perder todas las deadlines, mientras que con prioridades fijas la sobrecarga la absorben las tareas de baja prioridad y las críticas siguen cumpliendo.</div>
+  </div>
+
+  <div class="score" id="scoreCF_S1"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCF_S1');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCF_S1').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CF2.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../index.html">← Computación Física Senior</a>
+  <a href="../cf2-arquitectura-firmware/lecture.html">CF2: Arquitectura de firmware →</a>
+</nav>
+
+</div>
+</body>
+</html>

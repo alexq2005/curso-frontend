@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CF8 — De prototipo a producto: las 1.000 unidades · Computación Física Senior</title>
+  <meta name="description" content="Qué separa un prototipo que anda de un producto que se fabrica 1.000 veces: DFM, BOM y segundas fuentes, testing en producción, calibración y trazabilidad, certificación FCC/CE/ENACOM, versionado de hardware, costeo real y soporte de campo.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física Senior</a>
+  <a href="../../index.html">⚡ Curso de Computación Física</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CF8</span>
+  <span class="badge">⏱ 55–105 min</span>
+  <span class="badge">🎯 Pre-req: CF1–CF7</span>
+  <span class="badge">🏭 Manufactura</span>
+</div>
+
+<article>
+
+<h1>CF8 — De prototipo a producto: las 1.000 unidades</h1>
+
+<h2>CF8.0 Por qué este módulo</h2>
+
+<p>Tenés el prototipo andando. Está sobre el escritorio, con un cable USB, tres jumpers de colores y una placa de desarrollo. Hace exactamente lo que tenía que hacer. Lo mostrás y todo el mundo dice "listo, ya está".</p>
+
+<p>No está. Está aproximadamente al <strong>10%</strong> del camino.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> "Que funcione una vez, en tu escritorio, operado por vos" es la parte fácil y es la que ya resolviste. El 90% restante es todo lo otro: que funcione <em>mil veces seguidas</em>, con componentes que vienen de <em>lotes distintos</em>, ensamblado por <em>gente que no sos vos</em>, a <em>−5 °C y a 55 °C</em>, usado por alguien que lo va a golpear, mojar y enchufar al revés, aprobado por <em>tres reguladores</em>, y todo eso a un costo que todavía deje margen. Ahí es donde muere la mayoría de los proyectos de hardware — y casi nunca mueren por un problema técnico interesante.
+</div>
+
+<p>Este módulo es distinto de los siete anteriores. CF1 a CF7 te enseñaron a hacer que <em>el dispositivo</em> sea bueno: que cumpla plazos (<a href="../cf1-tiempo-real-rtos/lecture.html">CF1</a>), que el firmware sobreviva cinco años de cambios (<a href="../cf2-arquitectura-firmware/lecture.html">CF2</a>), que la batería dure (<a href="../cf3-energia/lecture.html">CF3</a>), que hable con la planta (<a href="../cf4-buses-industriales/lecture.html">CF4</a>), que la placa se comporte a la frecuencia real (<a href="../cf5-integridad-senal/lecture.html">CF5</a>), que nadie te lo clone (<a href="../cf6-seguridad-embebida/lecture.html">CF6</a>) y que decida sin nube (<a href="../cf7-tinyml-edge/lecture.html">CF7</a>). CF8 es sobre hacer que <em>el proyecto</em> sea bueno: que ese dispositivo llegue a mil manos sin fundirte en el intento.</p>
+
+<div class="warn">
+  <strong>Nota de contexto — 2026.</strong> Este módulo lleva números en dólares y semanas. Son órdenes de magnitud de <strong>septiembre de 2026</strong> para un producto electrónico chico (una placa de 4 capas, un módulo de radio precertificado, un gabinete). Cotizá lo tuyo antes de comprometerte con nadie: los precios de los pasivos y las colas de los laboratorios cambian trimestre a trimestre, y 2026 es un año particularmente feo en ese sentido — lo vemos en CF8.3.
+</div>
+
+<h2>CF8.1 La brecha protoboard → producto</h2>
+
+<p>La forma más útil de entender la brecha es enumerar exactamente qué <strong>supuestos</strong> del prototipo dejan de ser ciertos cuando hacés mil.</p>
+
+<table>
+<thead><tr><th>En el prototipo asumís…</th><th>…y a 1.000 unidades pasa que</th><th>Dónde te muerde</th></tr></thead>
+<tbody>
+<tr><td>El componente que compraste es "el" componente</td><td>Cada lote tiene su propia dispersión: una resistencia ±1% real varía, un sensor tiene offset propio, un cristal tiene ppm distintos</td><td>Calibración (CF8.5)</td></tr>
+<tr><td>El componente existe</td><td>El que usaste puede estar en NRND, con 30 semanas de plazo, o directamente sin stock</td><td>BOM y suministro (CF8.3)</td></tr>
+<tr><td>Los valores nominales alcanzan</td><td>Tolerancias que se apilan: 5% del divisor + 2% de la referencia + 3% del ADC = 10% de error en el peor caso</td><td>DFM y márgenes (CF8.2)</td></tr>
+<tr><td>Funciona a temperatura ambiente</td><td>El LCD se congela a −10 °C, la batería no carga arriba de 45 °C y el electrolítico pierde capacidad</td><td>Ambiente (CF8.7)</td></tr>
+<tr><td>Vos lo armás</td><td>Lo arma un operario con 40 segundos por unidad, sin contexto, siguiendo una instrucción escrita</td><td>DFM y producción (CF8.2, CF8.9)</td></tr>
+<tr><td>Vos lo usás</td><td>Lo usa alguien que lo va a enchufar al revés, dejarlo bajo la lluvia y llamarte enojado</td><td>Confiabilidad y soporte (CF8.7, CF8.11)</td></tr>
+<tr><td>Si algo falla, lo arreglás</td><td>Si algo falla, hay que encontrar cuáles de las 1.000 tienen el problema</td><td>Trazabilidad (CF8.5)</td></tr>
+<tr><td>Nadie te pide permiso</td><td>Vender un producto con radio requiere FCC, CE y ENACOM antes de la primera venta</td><td>Certificación (CF8.6)</td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>🔗 El paralelo con software.</strong> Es la misma distancia que hay entre <em>"corre en mi máquina"</em> y <em>"corre en producción"</em>. En software esa distancia se llama entorno reproducible, CI, observabilidad y rollback. En hardware se llama DFM, test en línea, trazabilidad y revisión de placa. La diferencia brutal: en software un rollback tarda dos minutos y cuesta cero; en hardware, "revertir" significa recolectar mil cajas físicas que ya están en casas ajenas.
+</div>
+
+<div class="mistake">
+  <strong>El error de estimación más caro que existe.</strong> Alguien mira el prototipo funcionando y estima "tres meses y sale". Después descubre que el 90% del trabajo restante no se parece en nada al 10% que ya hizo: no es más código ni más circuito, es logística, ensayos, papeles y proveedores. El resultado típico no es un retraso del 30%: es un factor <strong>3× a 4×</strong> en tiempo y un costo unitario que sale el <strong>doble</strong> del previsto. En el Worked Example vas a ver una de esas estimaciones al lado del resultado real.
+</div>
+
+<h2>CF8.2 Diseño para fabricación (DFM)</h2>
+
+<p><strong>DFM</strong> es diseñar pensando en quién lo va a fabricar, no solo en que el circuito ande. Es una restricción que se agrega al diseño, igual que el presupuesto de energía de <a href="../cf3-energia/lecture.html">CF3</a> o las reglas de retorno de <a href="../cf5-integridad-senal/lecture.html">CF5</a>. Y como esas, es infinitamente más barata de aplicar en el esquemático que en la revisión C.</p>
+
+<div class="rule">
+  <strong>📌 Las cinco preguntas de DFM, en orden.</strong>
+  <br>1. <strong>¿Se consigue?</strong> — ¿hay stock real hoy, y hay una segunda fuente validada?
+  <br>2. <strong>¿Va a seguir existiendo?</strong> — ¿en qué estado del ciclo de vida está, y por cuánto tiempo?
+  <br>3. <strong>¿Lo puede montar la línea?</strong> — ¿el encapsulado entra en el proceso del fabricante, o le exige equipo que no tiene?
+  <br>4. <strong>¿La huella es correcta?</strong> — ¿la verificaste contra el <em>datasheet de este MPN exacto</em>, no contra una librería de internet?
+  <br>5. <strong>¿Se puede testear?</strong> — ¿hay puntos de test accesibles desde una sola cara?
+</div>
+
+<h3>Componentes que se consiguen de verdad</h3>
+
+<p>El primer filtro es trivial y casi nadie lo aplica: antes de poner un componente en el esquemático, mirá el stock <strong>a la cantidad que vas a necesitar</strong>, no a la cantidad 1. Que haya 4 unidades en un distribuidor no significa nada cuando necesitás 3.000 (mil placas × tres capacitores).</p>
+
+<p>El segundo filtro es menos obvio y es el que separa al que hizo hardware del que no: <strong>el componente más barato del BOM puede ser el que te frene la producción</strong>. El riesgo de un componente no se correlaciona con su precio; se correlaciona con su plazo de entrega, con cuántos fabricantes lo hacen y con qué tan única es su huella.</p>
+
+<table>
+<thead><tr><th>Componente</th><th>Precio unit.</th><th>Plazo</th><th>Fuentes</th><th>Huella</th><th>Riesgo de línea</th></tr></thead>
+<tbody>
+<tr><td>Módulo ESP32-S3 (WROOM-1)</td><td>$3,20</td><td>18 sem</td><td>1 fabricante, varios SKU</td><td>propia del módulo</td><td>🔴 Alto</td></tr>
+<tr><td>MLCC 22 µF 0402 X5R 6,3 V</td><td><strong>$0,038</strong></td><td><strong>30 sem</strong></td><td>3–4 fabricantes</td><td>estándar</td><td>🔴 Alto</td></tr>
+<tr><td>LDO de bajo Iq (SOT-563)</td><td>$0,41</td><td>22 sem</td><td>1 (NRND)</td><td>encapsulado raro</td><td>🔴 Alto</td></tr>
+<tr><td>Sensor BME280</td><td>$2,80</td><td>10 sem</td><td>1 fabricante</td><td>LGA 2,5×2,5</td><td>🟠 Medio</td></tr>
+<tr><td>Anemómetro con reed</td><td>$9,50</td><td>6 sem</td><td>varios OEM</td><td>N/A (cableado)</td><td>🟢 Bajo</td></tr>
+<tr><td>Resistencia 10 kΩ 0603 1%</td><td>$0,002</td><td>2 sem</td><td>decenas</td><td>estándar</td><td>🟢 Bajo</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Leé esa tabla dos veces.</strong> El componente <strong>más barato de todos los riesgosos</strong> — un capacitor de <strong>3,8 centavos</strong> — es el que tiene el plazo más largo y el que, en el Worked Example, define el camino crítico de todo el proyecto. Podés tener los mil módulos de radio en el depósito y no poder armar una sola placa por falta de un capacitor que cuesta menos que el papel de la etiqueta. Ordenar el BOM por precio para "ver qué es importante" es exactamente la forma equivocada de mirarlo.
+</div>
+
+<h3>Encapsulados que la línea puede montar</h3>
+
+<p>Cada proceso extra que le exigís al fabricante es dinero y es riesgo de rendimiento (<em>yield</em>). Antes de elegir un encapsulado, preguntate si el ensamblador ya lo hace todos los días.</p>
+
+<table>
+<thead><tr><th>Elección de diseño</th><th>Qué le exige a la línea</th><th>Impacto</th></tr></thead>
+<tbody>
+<tr><td>Todo SMD en una sola cara</td><td>Un pase de pasta + horno</td><td>Baseline — el más barato</td></tr>
+<tr><td>SMD en las dos caras</td><td>Dos pases de horno, pegamento en la cara inferior</td><td>+25–40% de ensamblado</td></tr>
+<tr><td>Componentes THT (conectores, borneras)</td><td>Soldadura por ola selectiva o mano de obra</td><td>+$0,10 a $0,60 por punto</td></tr>
+<tr><td>BGA de paso fino / QFN de fondo</td><td>Inspección por rayos X obligatoria</td><td>+$0,30–1,20/placa, y equipo que no todo CM tiene</td></tr>
+<tr><td>Pasivos 0201 o menores</td><td>Boquillas y precisión de colocación superiores</td><td>Rendimiento más bajo; no todos los CM lo aceptan</td></tr>
+<tr><td>Paso menor a 0,4 mm en BGA</td><td>Vías en pad rellenas, clase IPC-3 en el PCB</td><td>PCB 2× a 3× más caro</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Regla práctica:</strong> el ensamblado en un tamaño de placa dado es aproximadamente proporcional a la <strong>cantidad de colocaciones</strong> más un cargo fijo por pase. Bajar de 180 a 120 componentes por placa reduce el costo de ensamblado más que cualquier negociación de precio. Consolidar tres capacitores de desacople en uno bien puesto (<a href="../cf5-integridad-senal/lecture.html">CF5</a>) es a la vez mejor eléctricamente y más barato.
+</div>
+
+<h3>Huellas verificadas</h3>
+
+<p>La huella equivocada es el error de DFM más caro por unidad de esfuerzo: cuesta cinco minutos evitarlo y cuesta una revisión de placa completa arreglarlo — cinco semanas y varios miles de dólares.</p>
+
+<div class="step"><strong>Cómo se verifica una huella, en serio.</strong> Abrí el <em>datasheet del MPN exacto</em> (no de la familia). Buscá el dibujo mecánico recomendado. Comparalo pad por pad con tu librería. Imprimí la capa de cobre a escala 1:1 y apoyá el componente físico encima. Este último paso parece de otra época y detecta el 90% de los errores en treinta segundos.</div>
+
+<div class="mistake">
+  <strong>Trampa típica:</strong> los encapsulados con el mismo nombre no son el mismo encapsulado. "SOT-23-5", "SOT-353" y "SC-70-5" se dibujan casi igual y no son intercambiables. "SOT-563" tiene el ancho de un SOT-23 pero la mitad de la altura y otro paso. Peor todavía: el mismo fabricante puede usar el mismo nombre comercial para dos dimensiones distintas en dos familias distintas. La única fuente de verdad es el dibujo del datasheet de <em>ese</em> MPN.
+</div>
+
+<h2>CF8.3 BOM y cadena de suministro</h2>
+
+<p>El BOM (<em>Bill of Materials</em>) es el documento más importante del proyecto y casi siempre es el peor cuidado. Suele vivir como una planilla en la carpeta de alguien, sin versionar, sin segundas fuentes y sin estado de ciclo de vida. Eso funciona para el prototipo y falla para la producción.</p>
+
+<div class="analogy">
+  <strong>🔗 El BOM es el <code>package.json</code> del hardware — pero sin <code>npm install</code>.</strong> Las semejanzas son reales: lista de dependencias, versiones exactas, transitivas (el módulo de radio trae su propio silicio adentro), y algo equivalente a un <em>lockfile</em> — el MPN completo, no "un capacitor de 22 µF". Las diferencias son las que duelen: no hay resolución automática, no hay <em>fallback</em>, un paquete puede desaparecer para siempre sin aviso, y cuando reemplazás una dependencia el "rebuild" tarda <strong>30 semanas</strong> y hay que rediseñar la placa. Si en software te da miedo una dependencia sin mantenimiento, en hardware un componente <em>single-source</em> debería darte pánico.
+</div>
+
+<h3>El BOM como artefacto versionado</h3>
+
+<p>Sacá el BOM de la planilla y ponelo en el repositorio, al lado del firmware, en un formato que una máquina pueda leer. Eso habilita todo lo demás: revisión por diff, chequeos automáticos y generación del SBOM que vas a necesitar por normativa (CF8.6).</p>
+
+<pre><code class="lang-yaml"># bom.yaml — versionado junto al firmware, revisado por diff en cada PR
+- ref: [C14, C15, C16]
+  descripcion: MLCC 22 uF 0402 X5R 6.3V
+  mpn: GRM155R60J226ME15D          # Murata — fuente primaria
+  lifecycle: Active
+  lead_time_semanas: 30            # el mas largo de todo el BOM en 2026
+  criticidad: alta                 # sin esto no arranca el convertidor buck
+  segundas_fuentes:
+    - mpn: CL05A226MQ5NUNC         # Samsung — misma huella 0402
+      huella_compatible: true
+      validado_en: rev_B           # medido, no supuesto
+    - mpn: GRM188R60J106ME47D      # plan C: 2x 10 uF en 0603
+      huella_compatible: false
+      requiere: rev_C
+      nota: sube ESR; revalidar el rizado del buck
+
+- ref: [U3]
+  descripcion: LDO 3V3 bajo Iq
+  mpn: TPS7A0233PDBVR
+  lifecycle: NRND                  # no recomendado para disenios nuevos
+  ultima_compra: 2027-03-31        # fecha de LTB publicada por el fabricante
+  criticidad: alta
+  segundas_fuentes:
+    - mpn: MAX38902AATA+
+      huella_compatible: false     # SOT-23-5 vs SOT-563: cambia la huella
+      requiere: rev_B
+</code></pre>
+
+<h3>Ciclo de vida: los estados que hay que mirar</h3>
+
+<table>
+<thead><tr><th>Estado</th><th>Qué significa</th><th>Qué hacés</th></tr></thead>
+<tbody>
+<tr><td><strong>Active</strong></td><td>En producción, sin planes de discontinuar</td><td>Nada. Igual chequeás cada trimestre</td></tr>
+<tr><td><strong>NRND</strong> <em>(Not Recommended for New Designs)</em></td><td>Se sigue fabricando, pero el fabricante te avisa que no lo uses en algo nuevo</td><td>🟠 Buscá reemplazo ya. Tenés tiempo, no tenés eternidad</td></tr>
+<tr><td><strong>PCN</strong> <em>(Product Change Notification)</em></td><td>Cambia algo: material, fábrica, marcado, a veces parámetros</td><td>Leerla. Un cambio de fábrica puede correr un parámetro que te importaba</td></tr>
+<tr><td><strong>EOL / LTB</strong> <em>(End of Life / Last Time Buy)</em></td><td>Fecha límite para comprar. Después no existe más</td><td>🔴 Decidís: compra final (y stock inmovilizado) o rediseño. Ambas cuestan</td></tr>
+<tr><td><strong>Obsolete</strong></td><td>Ya no existe. Lo que hay es de brokers</td><td>🔴 Rediseño obligado. El mercado gris trae falsificaciones</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>La escasez no es una excepción: es un escenario de diseño.</strong> En 2026, los MLCC de alta capacitancia en encapsulados chicos (0402 y 0201, de unidades de microfaradio) están con plazos de <strong>26 a 40 semanas</strong>, empujados por la demanda de infraestructura de IA que compite por exactamente la misma capacidad de fábrica que usa la electrónica de consumo. Los MCU de gama media están en 16–19 semanas y algunos fabricantes piden <strong>26 semanas de visibilidad</strong> de pedidos. Las líneas de pasivos tardan 12 a 24 meses en ponerse en marcha desde la decisión de inversión, así que la oferta no puede reaccionar rápido: la prensa del sector proyecta tensión al menos hasta mediados de 2027. Diseñar hoy asumiendo disponibilidad inmediata es diseñar para un mundo que no existe.
+</div>
+
+<h3>Monitoreo automático de obsolescencia</h3>
+
+<p>Nadie revisa un BOM de 90 líneas a mano cada mes. Se automatiza: un script contra la API de un distribuidor, corriendo en el CI una vez por mes, que falla si algo cambió de estado o si el plazo se pasó de un umbral.</p>
+
+<pre><code class="lang-python">#!/usr/bin/env python3
+"""Chequeo de salud del BOM. Corre mensual en CI; falla si algo se degrado."""
+import sys, yaml, requests
+
+UMBRAL_SEMANAS = 20
+ESTADOS_MALOS  = {"NRND", "EOL", "Last Time Buy", "Obsolete"}
+
+def lifecycle(mpn: str) -&gt; dict:
+    """Consulta el estado y el stock del MPN en el distribuidor."""
+    r = requests.get(API, params={"mpn": mpn}, headers=AUTH, timeout=15)
+    r.raise_for_status()
+    d = r.json()["parts"][0]
+    return {"estado": d["lifecycle_status"],
+            "stock":  d["quantity_available"],
+            "plazo":  d["lead_time_weeks"]}
+
+def revisar(bom_path: str, unidades: int) -&gt; int:
+    problemas = 0
+    for item in yaml.safe_load(open(bom_path, encoding="utf-8")):
+        need = len(item["ref"]) * unidades          # piezas totales, no placas
+        info = lifecycle(item["mpn"])
+
+        if info["estado"] in ESTADOS_MALOS:
+            print(f"[EOL ] {item['mpn']}: {info['estado']}")
+            problemas += 1
+        if info["plazo"] &gt;= UMBRAL_SEMANAS:
+            print(f"[LEAD] {item['mpn']}: {info['plazo']} semanas")
+            problemas += 1
+        if info["stock"] &lt; need:
+            print(f"[STCK] {item['mpn']}: hay {info['stock']}, necesito {need}")
+            problemas += 1
+
+        # el chequeo que casi nadie hace: la segunda fuente tambien envejece
+        criticos = [f for f in item.get("segundas_fuentes", [])
+                    if f.get("huella_compatible")]
+        if item["criticidad"] == "alta" and not criticos:
+            print(f"[2ND ] {item['mpn']}: critico y sin alternativa drop-in")
+            problemas += 1
+    return problemas
+
+if __name__ == "__main__":
+    sys.exit(1 if revisar("bom.yaml", unidades=1000) else 0)
+</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla de la segunda fuente.</strong> Para cada componente marcado como crítico, tiene que existir una alternativa <strong>compatible con la huella</strong> que hayas <strong>medido</strong> en una placa real, no solo leído en un datasheet. Una segunda fuente que nunca armaste no es una segunda fuente: es una esperanza. Y "compatible con la huella" no alcanza sola — un reemplazo de MLCC puede tener otro dieléctrico, perder la mitad de la capacitancia bajo tensión de polarización y arruinarte el lazo de control del convertidor.
+</div>
+
+<h2>CF8.4 Testing en producción</h2>
+
+<p>Pregunta que define si entendiste el módulo: <strong>¿cuántas de las mil placas se prueban?</strong></p>
+
+<p>La respuesta es <strong>todas</strong>. No una muestra. Todas, una por una, con un procedimiento fijo y un registro guardado.</p>
+
+<div class="danger">
+  <strong>⚠️ La cuenta que cierra la discusión.</strong> Lote de 500 unidades con un 3% de defectos de ensamblado — soldadura fría, componente girado, valor equivocado en un carrete: son <strong>15 placas malas</strong>. Si probás el 5% "de muestra", detectás menos de una y se van al campo <strong>14 unidades defectuosas</strong>. Cada RMA cuesta ~$140 entre flete ida y vuelta, diagnóstico, repuesto y administración: <strong>$1.960</strong>, más el cliente enojado y la reseña de una estrella. Probar las 500 al 100% son 500 × 42 s = <strong>5,8 horas</strong> de un operario a $18/h cargados: <strong>$105</strong>. El test al 100% se paga <strong>18 veces</strong> solo en fletes, y eso ignorando el daño a la marca.
+</div>
+
+<h3>El test jig (cama de clavos)</h3>
+
+<p>Un <em>test jig</em> es un accesorio mecánico con pines con resorte (<em>pogo pins</em>) que contactan los puntos de test de la placa cuando bajás una palanca. Adentro tiene un microcontrolador o una PC chica que ejecuta la secuencia y escribe el resultado en una base de datos.</p>
+
+<table>
+<thead><tr><th>Parte del jig</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td>Pogo pins ×24 + placa de test de 4 capas</td><td>$340</td></tr>
+<tr><td>Fixture mecánico (aluminio mecanizado + palanca + guías)</td><td>$1.150</td></tr>
+<tr><td>Electrónica de control (MCU, fuente programable, carga electrónica, relés)</td><td>$910</td></tr>
+<tr><td>Ingeniería: firmware de test + software de host + base de datos (40 h × $45)</td><td>$1.800</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>$4.200</strong></td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  Para que exista el jig, la placa tiene que estar diseñada para él: <strong>puntos de test de 1 mm en una sola cara</strong>, dos <em>fiduciales</em> y dos agujeros de posicionamiento, la interfaz de programación accesible sin desarmar nada, y ninguna pieza alta cerca de los pines. Eso se decide en el <em>layout</em>, no después. Si te acordás del jig cuando la placa ya está fabricada, el jig sale el doble y prueba la mitad.
+</div>
+
+<h3>Qué se mide en 30 segundos</h3>
+
+<p>El presupuesto de tiempo es real: a 30 segundos de ciclo más 12 de manipulación, un operario hace <strong>85 unidades por hora</strong>. Cada segundo que agregás lo pagás mil veces.</p>
+
+<table>
+<thead><tr><th>#</th><th>Prueba</th><th>Criterio de aprobación</th><th>t</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Cortos en los rieles antes de energizar</td><td>3V3–GND y 1V8–GND por encima de 1 kΩ</td><td>2 s</td></tr>
+<tr><td>2</td><td>Rieles y consumo en tres estados</td><td>3V3 ±3%; sueño profundo bajo 15 µA; idle 42±6 mA; TX 240±30 mA</td><td>6 s</td></tr>
+<tr><td>3</td><td>Flasheo del firmware de test</td><td>Escritura y verificación a 921.600 bd</td><td>7 s</td></tr>
+<tr><td>4</td><td>Barrido I²C, ID del chip y MAC</td><td>Sensor en 0x76, RTC en 0x68; MAC única, no repetida en la base</td><td>2 s</td></tr>
+<tr><td>5</td><td>Sensores contra la referencia del jig</td><td>Temperatura dentro de ±0,5 °C del patrón del fixture</td><td>4 s</td></tr>
+<tr><td>6</td><td>RF: potencia de TX y RSSI contra el AP del jig</td><td>RSSI por encima de −45 dBm a 30 cm en tres canales</td><td>5 s</td></tr>
+<tr><td>7</td><td>Provisión: serie, coeficientes, firmware final, eFuse de arranque seguro</td><td>Relectura idéntica a lo escrito</td><td>4 s</td></tr>
+<tr><td></td><td><strong>Total del ciclo</strong></td><td></td><td><strong>30 s</strong></td></tr>
+</tbody>
+</table>
+
+<h3>Firmware de test dedicado</h3>
+
+<p>El firmware de producción no sirve para testear: hace lo que tiene que hacer el producto, no lo que necesita la línea. Se compila un binario aparte, con un protocolo de comandos por UART, que el jig maneja y que <strong>nunca</strong> se envía al cliente.</p>
+
+<pre><code class="lang-c">/* test_fw.c — binario separado; se sobrescribe con el de produccion al final */
+#include &lt;stdint.h&gt;
+#include &lt;string.h&gt;
+#include "hal.h"
+
+/* Protocolo minimo por UART: una linea de comando, una linea de respuesta.
+ * El jig parsea texto; asi el mismo script sirve para depurar a mano. */
+
+static void cmd_rieles(void)
+{
+    uint16_t v3v3 = adc_mv(ADC_RAIL_3V3);
+    uint16_t v1v8 = adc_mv(ADC_RAIL_1V8);
+    int ok = (v3v3 &gt;= 3201 &amp;&amp; v3v3 &lt;= 3399) &amp;&amp;
+             (v1v8 &gt;= 1746 &amp;&amp; v1v8 &lt;= 1854);
+    printf("RAILS %u %u %s\n", v3v3, v1v8, ok ? "PASS" : "FAIL");
+}
+
+static void cmd_sensores(void)
+{
+    bme280_t s;
+    if (bme280_leer(&amp;s) != 0) { printf("SENS ERR FAIL\n"); return; }
+    /* El jig compara contra su propio patron: el firmware solo reporta. */
+    printf("SENS %d.%02d %u.%02u %lu PASS\n",
+           s.temp_c_int, s.temp_c_frac, s.rh_int, s.rh_frac, s.pres_pa);
+}
+
+static void cmd_provision(const char *serie, const cal_t *cal)
+{
+    if (nvs_escribir_serie(serie) != 0)   { printf("PROV FAIL\n"); return; }
+    if (nvs_escribir_cal(cal) != 0)       { printf("PROV FAIL\n"); return; }
+
+    /* Verificacion de relectura: escribir sin releer no es provisionar. */
+    char leido[SERIE_LEN];
+    cal_t  chk;
+    nvs_leer_serie(leido, sizeof leido);
+    nvs_leer_cal(&amp;chk);
+    int ok = (strcmp(leido, serie) == 0) &amp;&amp;
+             (memcmp(&amp;chk, cal, sizeof chk) == 0);
+    printf("PROV %s %s\n", leido, ok ? "PASS" : "FAIL");
+}
+</code></pre>
+
+<div class="rule">
+  <strong>📌 Un resultado que no se guarda no existe.</strong> Cada corrida del jig escribe una fila: número de serie, revisión de placa, marca de tiempo, versión del firmware de test, <strong>todos los valores medidos</strong> (no solo PASS/FAIL) y el operario. Guardar los valores crudos es lo que después te deja ver que el consumo en sueño profundo viene subiendo lote a lote y llegar a la causa <em>antes</em> de que empiece a fallar. Un campo booleano no te dice nada; una serie temporal te avisa.
+</div>
+
+<h2>CF8.5 Calibración y trazabilidad</h2>
+
+<h3>Por qué dos sensores idénticos no dan lo mismo</h3>
+
+<p>Comprás dos sensores del mismo MPN, del mismo carrete, y leen distinto. No están rotos: el datasheet nunca prometió que fueran iguales. Prometió que cada uno está dentro de una banda.</p>
+
+<table>
+<thead><tr><th>Magnitud</th><th>Precisión típica del datasheet</th><th>Diferencia real entre dos unidades</th></tr></thead>
+<tbody>
+<tr><td>Humedad relativa</td><td>±3 %RH</td><td>Hasta 6 %RH entre dos que están "en spec"</td></tr>
+<tr><td>Temperatura</td><td>±1,0 °C</td><td>Hasta 2 °C</td></tr>
+<tr><td>Presión</td><td>±1 hPa</td><td>Hasta 2 hPa, y deriva con la temperatura</td></tr>
+<tr><td>Referencia interna del ADC</td><td>±1,5%</td><td>3% entre extremos, más deriva térmica</td></tr>
+<tr><td>Oscilador RC interno</td><td>±2%</td><td>4% — suficiente para romper un UART sin control de flujo</td></tr>
+</tbody>
+</table>
+
+<p>Dos unidades dentro de tolerancia pueden diferir el <strong>doble</strong> de la tolerancia. Si tu producto muestra un número al usuario, o compara contra un umbral, eso importa. La solución no es comprar sensores más caros: es <strong>calibrar cada unidad</strong> y guardar sus coeficientes adentro del equipo.</p>
+
+<pre><code class="lang-c">/* Calibracion por unidad: vive en NVS, se escribe en el jig, viaja con la placa */
+typedef struct {
+    uint16_t magia;        /* 0xCA1B: distingue "sin calibrar" de "cero valido" */
+    uint8_t  version;      /* versionar la estructura: va a cambiar */
+    uint8_t  hw_rev;       /* con que revision se calibro */
+    char     serie[12];    /* misma serie que la etiqueta y el QR */
+    uint32_t fecha_utc;
+
+    float    t_offset_c;   /* correccion de 1 punto  */
+    float    rh_gain;      /* 2 puntos: 33 %RH y 75 %RH */
+    float    rh_offset;
+    float    vref_mv;      /* referencia real del ADC, medida */
+    uint32_t crc32;        /* NVS puede corromperse; sin CRC no te enterarias */
+} cal_t;
+
+float temp_corregida(const cal_t *c, float cruda)
+{
+    /* Sin calibracion valida NO se inventa: se degrada y se avisa. */
+    if (c-&gt;magia != 0xCA1B || crc32_de(c) != c-&gt;crc32) {
+        log_warn("cal invalida: usando valores nominales");
+        return cruda;
+    }
+    return cruda + c-&gt;t_offset_c;
+}
+</code></pre>
+
+<div class="step"><strong>Cómo se calibra humedad sin un laboratorio.</strong> Con sales saturadas: cloruro de magnesio da 33 %RH y cloruro de sodio da 75 %RH, ambas estables y baratas. Se meten 40 placas en una cámara con la sal, se esperan 90 minutos a que equilibre, se leen las 40 y se calcula ganancia y offset de cada una. Para 500 unidades son 13 corridas — unas <strong>19,5 horas de cámara</strong>, cuatro días de trabajo. Ese es el costo real detrás de la línea "calibración" del costeo de CF8.10.</div>
+
+<h3>Trazabilidad: número de serie y lote</h3>
+
+<p>Trazabilidad es poder responder, tres años después, esta pregunta: <em>"¿qué unidades llevan el sensor del lote X?"</em>. Si la respuesta es "no sé", la única opción ante un problema es recolectar todo.</p>
+
+<table>
+<thead><tr><th>Se guarda…</th><th>…para poder</th></tr></thead>
+<tbody>
+<tr><td>Número de serie (en el firmware, en la etiqueta y en un DataMatrix)</td><td>Identificar la unidad sin abrirla</td></tr>
+<tr><td>Revisión de placa y de gabinete</td><td>Mandar el firmware correcto y el repuesto correcto</td></tr>
+<tr><td>Lote de cada componente crítico (sensor, batería, módulo de radio)</td><td>Acotar un recall a las unidades afectadas</td></tr>
+<tr><td>Fecha, turno y línea de ensamblado</td><td>Correlacionar fallas con un cambio de proceso</td></tr>
+<tr><td>Todos los valores medidos en el jig</td><td>Ver derivas antes de que se vuelvan fallas</td></tr>
+<tr><td>Coeficientes de calibración</td><td>Rehacer una unidad sin recalibrarla</td></tr>
+<tr><td>Versión de firmware de fábrica y hash del binario</td><td>Saber qué código salió en cada unidad (y armar el SBOM)</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>La cuenta que justifica todo lo anterior.</strong> Tres años después tenés 5.000 unidades en campo. El fabricante del sensor emite un aviso: un lote de 1.800 piezas tiene deriva fuera de spec. <strong>Con trazabilidad</strong> consultás la base y descubrís que ese lote entró en 340 unidades: recall acotado, 340 × $140 = <strong>$47.600</strong>. <strong>Sin trazabilidad</strong> no podés distinguir cuáles son: recall total, 5.000 × $140 = <strong>$700.000</strong>. La diferencia es <strong>$652.400</strong>, y el precio de tenerla era una EEPROM de $0,12, un campo más en una tabla y la disciplina de completarlo. Es probablemente el mejor retorno sobre la inversión de todo el módulo.
+</div>
+
+<h2>CF8.6 Certificación</h2>
+
+<p>Si tu producto tiene radio — y en 2026 casi todos la tienen — no lo podés vender legalmente sin aprobación. No es una formalidad que se arregla después: es un requisito previo a la primera venta, y en muchos casos <strong>obliga a rediseñar la placa</strong>.</p>
+
+<table>
+<thead><tr><th>Mercado</th><th>Régimen</th><th>Qué cubre</th><th>Costo típico</th><th>Plazo</th></tr></thead>
+<tbody>
+<tr><td>🇺🇸 EE.UU.</td><td><strong>FCC</strong> Parte 15B (radiador no intencional) + aprobación modular del radio</td><td>Emisiones conducidas y radiadas del conjunto</td><td>$4.800</td><td>4–6 sem</td></tr>
+<tr><td>🇪🇺 Europa</td><td><strong>CE</strong>: EMC (EN 55032/55035) + RED art. 3.3(d)(e)(f) según EN 18031 + LVD</td><td>EMC, seguridad eléctrica y <strong>ciberseguridad</strong></td><td>$9.800</td><td>8–12 sem</td></tr>
+<tr><td>🇦🇷 Argentina</td><td><strong>ENACOM</strong>, inscripción en RAMATEL vía la plataforma HERTZ</td><td>Homologación del equipo radioeléctrico</td><td>$3.500</td><td>8–12 sem</td></tr>
+<tr><td>—</td><td><strong>Pre-compliance</strong> (2 sesiones de cámara, medio día c/u)</td><td>Encontrar los problemas antes de pagar el ensayo formal</td><td>$6.400</td><td>2 sem</td></tr>
+<tr><td></td><td><strong>Total del programa</strong></td><td></td><td><strong>$24.500</strong></td><td><strong>~26 sem</strong></td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>El truco que ahorra la mitad:</strong> usar un <strong>módulo de radio precertificado</strong> (con su propio FCC ID / número de certificación) en vez de diseñar el RF vos. Con aprobación modular te ahorrás el ensayo de radiador intencional, que solo es de $10.000 a $25.000. Ojo con la letra chica: seguís necesitando el ensayo de radiador <em>no</em> intencional del producto completo, tenés que respetar el diseño de antena y el <em>layout</em> del módulo tal como fue certificado, y tenés que poner el FCC ID del módulo en la etiqueta con la leyenda "Contains FCC ID: …". El módulo te ahorra el ensayo del radio, no la certificación.
+</div>
+
+<h3>Pre-compliance: por qué temprano y no al final</h3>
+
+<div class="rule">
+  <strong>📌 La aritmética del pre-compliance.</strong> Invertir <strong>$3.000 a $8.000</strong> en pre-compliance baja la tasa de falla en el primer intento de aproximadamente <strong>50% a menos del 10%</strong>. Cada falla en el ensayo formal te agrega <strong>$5.000 a $30.000</strong> y <strong>4 a 12 semanas</strong>, entre rediseño, refabricación, nueva cola del laboratorio y repetición del ensayo. El pre-compliance no es un gasto opcional: es un seguro que se paga solo con evitar <em>una</em> falla, y con el que probablemente evites dos.
+</div>
+
+<p>Y hay una razón más profunda para hacerlo temprano: <strong>los arreglos de EMC son de <em>layout</em>, no de software</strong>. Si descubrís en la semana 30 que emitís de más, la solución no es un parche: es una revisión de placa. Las contramedidas típicas — un filtro de modo común en la entrada, una ferrita en el cable, un plano de guarda, mover un reloj de lugar, cambiar la velocidad de flanco — todas viven en el cobre. Es exactamente el material de <a href="../cf5-integridad-senal/lecture.html">CF5</a>, y es por eso que el módulo de integridad de señal está antes que éste: la placa que pasa EMC se diseña, no se corrige.</p>
+
+<div class="warn">
+  <strong>⚡ Lo que cambió en 2025–2026 y todavía sorprende a mucha gente.</strong>
+  <br>• <strong>Ciberseguridad en el marcado CE (desde el 1 de agosto de 2025).</strong> Los artículos 3.3(d)(e)(f) de la RED, vía el Reglamento Delegado (UE) 2022/30, son obligatorios para equipos con radio conectados a internet. Se demuestran con las normas armonizadas <strong>EN 18031-1/-2/-3</strong>: protección de la red, protección de datos personales y protección contra el fraude. En criollo: sin contraseñas por defecto, con arranque seguro, con mecanismo de actualización y con gestión de vulnerabilidades. Eso es <a href="../cf6-seguridad-embebida/lecture.html">CF6</a> convertido en requisito legal.
+  <br>• <strong>Cyber Resilience Act.</strong> Desde el <strong>11 de septiembre de 2026</strong> rige la obligación de reportar vulnerabilidades <em>activamente explotadas</em>: alerta temprana a ENISA y al CSIRT nacional en <strong>24 horas</strong>, notificación más completa a las <strong>72 horas</strong> e informe final a los <strong>14 días</strong>. El grueso del reglamento — requisitos esenciales, obligaciones del fabricante, documentación técnica y <strong>SBOM en formato legible por máquina</strong> — aplica desde el <strong>11 de diciembre de 2027</strong>, y ahí se espera que reemplace a la parte de ciberseguridad de la RED. Las multas llegan a <strong>15 millones de euros o el 2,5% de la facturación mundial</strong>, lo que sea mayor.
+  <br>• La consecuencia práctica es incómoda: <em>no podés cumplir con el reporte de 24 horas si no tenías el SBOM y el proceso de vulnerabilidades armados de antes</em>. La obligación de tener SBOM llega en 2027; la necesidad real de tenerlo llegó en septiembre de 2026.
+  <br>• <strong>Argentina.</strong> Desde 2026 ENACOM acepta certificaciones internacionales de organismos acreditados, lo que evita repetir localmente ensayos ya hechos afuera. La inscripción en el Registro de Materiales tiene una vigencia de <strong>tres años</strong>, el trámite se hace por la plataforma HERTZ y el solicitante debe ser una entidad local: un fabricante extranjero no puede presentarse solo.
+</div>
+
+<div class="analogy">
+  <strong>🔗 El SBOM es tu <code>package-lock.json</code>, ahora con fuerza de ley.</strong> Venís de mantener el BOM de componentes físicos; a partir de ahora mantenés <strong>dos</strong> listas de materiales: la de hardware y la de software (el RTOS, la pila TCP/IP, mbedTLS, el intérprete de <a href="../cf7-tinyml-edge/lecture.html">CF7</a>, cada biblioteca con su versión y su licencia). La buena noticia es que la segunda ya sabés generarla: sale del sistema de compilación, en CycloneDX o SPDX, como un artefacto más del CI. La mala es que ahora alguien la puede pedir por vía legal.
+</div>
+
+<h2>CF8.7 Ambiente y confiabilidad</h2>
+
+<p>El prototipo vive a 22 °C sobre un escritorio. El producto vive donde el cliente lo ponga. Y el rango de temperatura de tu producto no es el que vos declarás: es el del componente más limitado que tenga adentro.</p>
+
+<table>
+<thead><tr><th>Componente</th><th>Rango propio</th><th>Qué pasa afuera de ese rango</th></tr></thead>
+<tbody>
+<tr><td>MCU / módulo de radio (grado industrial)</td><td>−40 a +85 °C</td><td>Suele ser el menos problemático</td></tr>
+<tr><td>Batería Li-ion</td><td>Descarga −20 a +60 °C; <strong>carga solo 0 a +45 °C</strong></td><td>Cargar bajo cero deposita litio metálico: daño permanente y riesgo</td></tr>
+<tr><td>Display LCD</td><td>−10 a +50 °C</td><td>Se pone lento y fantasmea; arriba de rango se pone negro</td></tr>
+<tr><td>Capacitor electrolítico</td><td>−25 a +105 °C, con vida útil declarada</td><td>La vida se <strong>divide a la mitad</strong> por cada 10 °C de más</td></tr>
+<tr><td>MLCC clase 2 (X5R/X7R)</td><td>Rango amplio…</td><td>…pero pierde capacitancia con la tensión de polarización y con la temperatura: un 22 µF puede comportarse como 8 µF</td></tr>
+<tr><td>Gabinete ABS</td><td>Mecánicamente amplio</td><td>Se amarillea y se vuelve frágil con UV. Para intemperie va ASA o policarbonato estabilizado</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error clásico:</strong> declarar "−20 a +60 °C" porque es el rango del microcontrolador, cuando adentro hay una batería que no se puede cargar bajo cero y un display que se muere a −10 °C. La consecuencia se paga en garantías durante el primer invierno. La solución de firmware existe y es barata — inhibir la carga fuera de la ventana térmica, leyendo el sensor que ya tenés — pero hay que decidirla antes, no después del primer reclamo.
+</div>
+
+<h3>Ensayos acelerados: probar diez años en seis semanas</h3>
+
+<p>No podés esperar diez años para saber si el producto dura diez años. Se usa envejecimiento acelerado por temperatura: el modelo de Arrhenius dice que los mecanismos de falla se aceleran exponencialmente con la temperatura.</p>
+
+<pre><code class="lang-python">import math
+
+# Factor de aceleracion de Arrhenius
+#   AF = exp( (Ea/k) * (1/T_uso - 1/T_ensayo) )   con T en kelvin
+Ea = 0.70          # eV — energia de activacion tipica de electronica general
+k  = 8.617e-5      # eV/K — constante de Boltzmann
+
+def factor(t_uso_c: float, t_ensayo_c: float) -&gt; float:
+    return math.exp((Ea / k) * (1/(t_uso_c + 273.15) - 1/(t_ensayo_c + 273.15)))
+
+af = factor(25, 85)
+print(f"AF = {af:.1f}")                                  # AF = 96.0
+print(f"1000 h a 85 C = {1000*af:,.0f} h a 25 C "
+      f"= {1000*af/8766:.1f} anios")                     # = 11.0 anios
+
+# La cuenta inversa: que confiabilidad implica REALMENTE una garantia de 2 anios
+def mtbf_horas(prob_falla: float, anios: float = 2) -&gt; float:
+    """Modelo exponencial: R(t) = exp(-t/MTBF)."""
+    return -(anios * 8766) / math.log(1 - prob_falla)
+
+for p in (0.01, 0.02, 0.05):
+    m = mtbf_horas(p)
+    print(f"{p:5.0%} de fallas en 2 anios  =&gt;  MTBF {m:&gt;10,.0f} h "
+          f"({m/8766:&gt;3.0f} anios)")
+# 1%  =&gt;  MTBF 1.744.419 h (199 anios)
+# 2%  =&gt;  MTBF   867.804 h ( 99 anios)
+# 5%  =&gt;  MTBF   341.799 h ( 39 anios)
+</code></pre>
+
+<div class="concept">
+  <strong>💡 Qué significa realmente "dos años de garantía".</strong> Si te comprometés a dos años y querés que las devoluciones se queden en el 2%, estás prometiendo un <strong>MTBF cercano a 870.000 horas — casi cien años</strong>. Ese número suena absurdo hasta que entendés qué mide: no es que un aparato dure un siglo, es que de cada cien unidades solo dos fallan en dos años. Pero la conclusión es correcta y contraintuitiva: <strong>una garantía de dos años es una promesa de confiabilidad enorme</strong>, y si tu diseño tiene un electrolítico corriendo caliente o una soldadura mecánicamente cargada, esa promesa se rompe sola. Ponele número a la reserva de garantía en el costeo, o la vas a pagar sin haberla presupuestado.
+</div>
+
+<h3>Los otros ensayos que no son temperatura</h3>
+
+<table>
+<thead><tr><th>Ensayo</th><th>Qué encuentra</th><th>Costo típico</th></tr></thead>
+<tbody>
+<tr><td>Ciclado térmico (−20 ↔ +70 °C, 100 ciclos)</td><td>Fisuras en soldaduras por diferencia de dilatación</td><td>$900–2.200</td></tr>
+<tr><td>Humedad-calor (85 °C / 85 %RH, 500 h)</td><td>Corrosión, migración electroquímica, delaminación</td><td>$1.200–2.800</td></tr>
+<tr><td>Vibración aleatoria + choque</td><td>Componentes altos sin fijar, conectores que se aflojan en el transporte</td><td>$700–1.800</td></tr>
+<tr><td>Grado IP (chorro de agua, polvo)</td><td>Sellos, prensacables, la ventilación que alguien "no iba a usar"</td><td>$600–1.500</td></tr>
+<tr><td>Caída libre (1 m, 6 caras)</td><td>Montajes rígidos, cristales, tornillos autorroscantes en plástico</td><td>$400–900</td></tr>
+<tr><td>HALT (llevar al límite hasta romper)</td><td>El eslabón débil real, que casi nunca es el que suponías</td><td>$4.000–12.000</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Si solo podés pagar uno, pagá el HALT.</strong> Los otros verifican que cumplís una spec; el HALT te dice <em>qué se rompe primero y por qué</em>. Esa información cambia el diseño; un certificado de "pasó" no cambia nada.
+</div>
+
+<h2>CF8.8 Versionado de hardware</h2>
+
+<p>Vas a tener más de una revisión de placa en el campo al mismo tiempo. No es una posibilidad: es la única forma en que esto ocurre. La rev A fue el piloto de 25 unidades, la rev B son las 500 que vendiste, la rev C cambió el LDO porque el original entró en EOL. Las tres están en casas de clientes y las tres reciben la misma actualización de firmware por aire.</p>
+
+<div class="mistake">
+  <strong>Un firmware que asume una sola versión de hardware es una bomba de tiempo.</strong> El día que sale la rev C con el LDO nuevo — que tiene otro <em>enable</em>, otro tiempo de arranque, otra corriente de reposo — el firmware que funcionaba perfecto en rev B deja de arrancar en rev C. Peor: si ya publicaste la actualización, la rompés remotamente en unidades que estaban andando. Un dispositivo embebido inutilizado por una actualización es un <em>brick</em>, y el <em>brick</em> masivo no se arregla con un rollback: se arregla con un camión.
+</div>
+
+<h3>Cómo el firmware sabe en qué revisión corre</h3>
+
+<table>
+<thead><tr><th>Método</th><th>Costo BOM</th><th>Pines</th><th>Revisiones</th><th>Contras</th></tr></thead>
+<tbody>
+<tr><td>Resistencias de <em>strapping</em> en 2 GPIO</td><td>$0,004</td><td>2</td><td>4</td><td>Consume pines; hay que poblarlas bien</td></tr>
+<tr><td>Divisor resistivo a un ADC</td><td>$0,008</td><td>1</td><td>8–16</td><td>Tolerancias y ruido: dejá bandas amplias</td></tr>
+<tr><td>EEPROM I²C de 1 kbit</td><td>$0,12</td><td>bus compartido</td><td>ilimitadas</td><td>Hay que programarla en el jig</td></tr>
+<tr><td>eFuse / OTP del propio SoC</td><td>$0</td><td>0</td><td>ilimitadas</td><td><strong>Irreversible</strong>: si la quemás mal, la placa queda mal para siempre</td></tr>
+<tr><td>Detección por sondeo (probar si el chip responde)</td><td>$0</td><td>0</td><td>—</td><td>🔴 Frágil y ambiguo. Sirve de respaldo, nunca de fuente de verdad</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-c">/* Detección de revisión: divisor resistivo a un ADC, con bandas amplias.
+ * Bandas al 10% para tolerar resistencias del 1%, ruido y deriva termica. */
+#include &lt;stdint.h&gt;
+
+typedef enum { HW_REV_A = 0, HW_REV_B, HW_REV_C, HW_REV_DESCONOCIDA } hw_rev_t;
+
+static const struct { uint16_t min_mv, max_mv; hw_rev_t rev; } TABLA[] = {
+    {    0,  180, HW_REV_A },   /* R inferior = 0 ohm (a masa)  */
+    {  680, 1000, HW_REV_B },   /* divisor 1:4                  */
+    { 1450, 1800, HW_REV_C },   /* divisor 1:2                  */
+};
+
+hw_rev_t hw_rev_detectar(void)
+{
+    /* Promediar: una sola lectura de ADC en el arranque es ruido puro. */
+    uint32_t acum = 0;
+    for (int i = 0; i &lt; 16; i++) acum += adc_mv(ADC_HW_ID);
+    uint16_t mv = (uint16_t)(acum / 16);
+
+    for (size_t i = 0; i &lt; sizeof TABLA / sizeof TABLA[0]; i++)
+        if (mv &gt;= TABLA[i].min_mv &amp;&amp; mv &lt;= TABLA[i].max_mv)
+            return TABLA[i].rev;
+
+    /* Zona muerta entre bandas: NO adivines. Un valor fuera de tabla puede ser
+     * una revision futura que este binario no conoce todavia. */
+    log_error("hw_id fuera de tabla: %u mV", mv);
+    return HW_REV_DESCONOCIDA;
+}
+
+int app_arrancar(void)
+{
+    hw_rev_t rev = hw_rev_detectar();
+
+    if (rev == HW_REV_DESCONOCIDA) {
+        /* Modo degradado seguro: arranca lo minimo, reporta, acepta OTA.
+         * Nunca te dejes sin camino de actualizacion. */
+        return modo_seguro();
+    }
+
+    /* Los parametros dependientes de hardware van en tabla, no en #ifdef:
+     * un solo binario tiene que servir para todas las revisiones en campo. */
+    pmic_configurar(&amp;PERFIL_PMIC[rev]);
+    adc_set_vref(VREF_MV[rev]);
+    return app_normal(rev);
+}
+</code></pre>
+
+<div class="rule">
+  <strong>📌 Un binario, todas las revisiones.</strong> La tentación es compilar un firmware por revisión con <code>#ifdef</code>. Funciona hasta que alguien manda el binario equivocado por OTA — y alguien siempre lo manda. La alternativa robusta es un solo binario que detecta la revisión en tiempo de ejecución y elige parámetros de una tabla. El costo es unos cientos de bytes de flash y un poco de disciplina; el beneficio es que el sistema de actualización se vuelve <strong>imposible de usar mal</strong>. Y el servidor de OTA verifica igual la revisión antes de ofrecer un paquete: dos cinturones, porque acá no hay rollback barato.
+</div>
+
+<h2>CF8.9 Producción y el fabricante</h2>
+
+<h3>Las cuatro etapas</h3>
+
+<table>
+<thead><tr><th>Etapa</th><th>Unidades</th><th>Pregunta que responde</th><th>Qué sale de ahí</th></tr></thead>
+<tbody>
+<tr><td><strong>Prototipo</strong></td><td>3–10</td><td>¿La idea funciona?</td><td>Un aparato que anda en tu escritorio</td></tr>
+<tr><td><strong>EVT</strong> <em>(Engineering Validation)</em></td><td>10–25</td><td>¿El diseño real funciona?</td><td>Placa propia, gabinete impreso en 3D, lista de fallas</td></tr>
+<tr><td><strong>DVT</strong> <em>(Design Validation)</em></td><td>50–100</td><td>¿Cumple las specs y las normas?</td><td>Ensayos ambientales, pre-compliance, gabinete de molde</td></tr>
+<tr><td><strong>PVT</strong> <em>(Production Validation)</em></td><td>100–500</td><td>¿La <em>línea</em> puede hacerlo repetible?</td><td>Rendimiento medido, tiempo de ciclo, jig validado, FAI aprobado</td></tr>
+<tr><td><strong>MP</strong> <em>(Producción)</em></td><td>500+</td><td>—</td><td>Producto</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Saltear PVT es el atajo que más caro sale.</strong> EVT y DVT validan <em>el diseño</em>; PVT valida <em>el proceso</em>, que es otra cosa. En PVT aparecen los problemas que ningún prototipo muestra: que el operario arma la carcasa en 4 minutos y no en 40 segundos, que dos cables quedan pinchados bajo un tornillo, que el rendimiento del primer pase es 91% y no 99%, que el jig tarda 55 segundos y no 30. Descubrir eso con 25 unidades cuesta una semana; descubrirlo con 500 armadas cuesta desarmarlas.
+</div>
+
+<h3>Qué se le entrega al ensamblador</h3>
+
+<p>"Le mando los Gerbers" es la respuesta de alguien que nunca produjo. Los Gerbers describen el cobre; la fabricación necesita bastante más.</p>
+
+<pre><code class="lang-bash"># Paquete de fabricacion — generado por CI en cada tag, nunca a mano
+release/estacion-meteo-revB-2026-09/
+├── fab/
+│   ├── gerber/                 # Gerber X2 (o mejor: ODB++ / IPC-2581 en un solo archivo)
+│   ├── drill/                  # Excellon: taladros pasantes y ciegos, con tolerancias
+│   ├── stackup.pdf             # apilado, espesores, dielectricos, cobre por capa
+│   ├── impedancias.csv         # trazas controladas: capa, ancho, objetivo, tolerancia
+│   └── notas_fab.pdf           # material (Tg), acabado (ENIG), mascara, clase IPC-2
+├── assembly/
+│   ├── bom.csv                 # MPN COMPLETO + designadores + cantidad + 2da fuente
+│   ├── centroid.csv            # pick-and-place: X, Y, rotacion, cara (el famoso XYRS)
+│   ├── plano_montaje.pdf       # vistas superior e inferior, polaridades, alturas
+│   ├── stencil.txt             # aperturas especiales (QFN, terminas termicas)
+│   └── panelizacion.pdf        # array, bordes de agarre, fiduciales, v-score o mouse-bites
+├── test/
+│   ├── procedimiento_test.pdf  # los 7 pasos de CF8.4, con criterios y limites
+│   ├── jig_manual.pdf          # como se usa el fixture, que hacer ante un FAIL
+│   └── test_fw_v1.4.2.bin      # binario + sha256
+├── firmware/
+│   ├── produccion_v2.1.0.bin   # el que se graba al final del test
+│   └── sbom.cdx.json           # CycloneDX — obligatorio de hecho desde 2026
+└── calidad/
+    ├── fai_checklist.pdf       # First Article Inspection: que se mide y contra que
+    ├── muestra_patron.md       # donde esta la "golden sample" firmada
+    └── criterios_ipc.md        # clase IPC-A-610 acordada (2 para consumo, 3 para critico)
+</code></pre>
+
+<div class="step"><strong>El FAI (First Article Inspection) es innegociable.</strong> Antes de fabricar las 500, el CM arma <strong>una</strong> y la mide contra el plano: dimensiones, valores, polaridades, marcado, altura de componentes, calidad de soldadura según IPC-A-610. Vos la revisás y la aprobás por escrito. Cuesta unas horas y $100–300. Sin FAI, un error de rotación en un carrete se multiplica por 500 antes de que alguien lo mire — y ahí ya no es un error, es un lote perdido.</div>
+
+<h3>Qué preguntarle a un CM antes de comprometerte</h3>
+
+<table>
+<thead><tr><th>Pregunta</th><th>Qué estás detectando</th></tr></thead>
+<tbody>
+<tr><td>¿Cuál es el lote mínimo, y cuál el económico?</td><td>Si tu volumen les interesa. Ser el cliente más chico es ser el último de la cola</td></tr>
+<tr><td>¿Turnkey o consignación? ¿Qué margen aplican al BOM?</td><td>En turnkey compran ellos: BOM 8–15% más caro, pero te sacan el kitting de encima</td></tr>
+<tr><td>¿Qué hacen si un componente no llega?</td><td>La respuesta correcta es "te avisamos y te proponemos alternativas", no "sustituimos"</td></tr>
+<tr><td>¿Pueden sustituir sin autorización escrita?</td><td>🔴 Si la respuesta no es un no rotundo, buscá otro CM</td></tr>
+<tr><td>¿Tienen rayos X? ¿AOI? ¿ICT?</td><td>Determina qué encapsulados podés usar y qué inspección esperás</td></tr>
+<tr><td>¿Qué rendimiento típico tienen en placas como la mía?</td><td>Si no lo miden, no lo controlan</td></tr>
+<tr><td>¿Cuánto es el NRE y qué incluye?</td><td>Stencil, programación de la P&amp;P, configuración de línea, FAI</td></tr>
+<tr><td>¿Guardan trazabilidad de lotes de componentes?</td><td>Sin esto, la sección CF8.5 no se puede implementar</td></tr>
+<tr><td>¿Cuál es el plazo <em>después</em> de que llegan todos los componentes?</td><td>Separá la cola de la fábrica del plazo de los componentes: son problemas distintos</td></tr>
+<tr><td>¿Puedo ir a ver la primera corrida?</td><td>Si dicen que no, es una señal. Estar en el PVT vale cada peso del pasaje</td></tr>
+</tbody>
+</table>
+
+<h2>CF8.10 Costos reales</h2>
+
+<p>Acá está el error de estimación que hunde más proyectos que cualquier bug: <strong>el costo unitario no es el BOM</strong>. El BOM es un sumando, y en volúmenes bajos es un sumando chico.</p>
+
+<p>Costeo de una estación meteorológica conectada — la misma del Worked Example — a tres volúmenes. Todos los valores en USD por unidad.</p>
+
+<table>
+<thead><tr><th>Concepto</th><th>100 u</th><th>1.000 u</th><th>10.000 u</th></tr></thead>
+<tbody>
+<tr><td>BOM (componentes + PCB + gabinete)</td><td>$60,76</td><td>$44,00</td><td>$33,22</td></tr>
+<tr><td>Ensamblado PCBA (SMT + THT)</td><td>$14,50</td><td>$6,80</td><td>$3,90</td></tr>
+<tr><td>Ensamblado final y cableado (mano de obra)</td><td>$9,00</td><td>$5,50</td><td>$3,60</td></tr>
+<tr><td>Test funcional en el jig</td><td>$3,20</td><td>$2,00</td><td>$1,40</td></tr>
+<tr><td>Calibración por unidad</td><td>$7,50</td><td>$3,80</td><td>$2,20</td></tr>
+<tr><td>Packaging, manual y etiquetas</td><td>$4,10</td><td>$2,30</td><td>$1,60</td></tr>
+<tr><td><em>Subtotal</em></td><td><em>$99,06</em></td><td><em>$64,40</em></td><td><em>$45,92</em></td></tr>
+<tr><td>Scrap y retrabajo (8% / 4% / 2%)</td><td>$7,92</td><td>$2,58</td><td>$0,92</td></tr>
+<tr><td><strong>Costo variable por unidad</strong></td><td><strong>$106,98</strong></td><td><strong>$66,98</strong></td><td><strong>$46,84</strong></td></tr>
+<tr><td colspan="4"></td></tr>
+<tr><td>Ingeniería de DFM y revisiones B/C ($12.000)</td><td>$120,00</td><td>$12,00</td><td>$1,20</td></tr>
+<tr><td>Test jig ($4.200)</td><td>$42,00</td><td>$4,20</td><td>$0,42</td></tr>
+<tr><td>Certificación FCC + CE + ENACOM ($24.500)</td><td>$245,00</td><td>$24,50</td><td>$2,45</td></tr>
+<tr><td>Setup de PCBA ($850 por corrida)</td><td>$8,50</td><td>$0,85</td><td>$0,34</td></tr>
+<tr><td>Molde del gabinete ($18.000, solo a 10.000)</td><td>—</td><td>—</td><td>$1,80</td></tr>
+<tr><td><strong>NRE amortizado por unidad</strong></td><td><strong>$415,50</strong></td><td><strong>$41,55</strong></td><td><strong>$6,21</strong></td></tr>
+<tr><td colspan="4"></td></tr>
+<tr><td><strong>COSTO UNITARIO TOTAL</strong></td><td><strong>$522,48</strong></td><td><strong>$108,53</strong></td><td><strong>$53,05</strong></td></tr>
+<tr><td>El BOM como % del costo unitario</td><td><strong>11,6%</strong></td><td><strong>40,5%</strong></td><td><strong>62,6%</strong></td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La última fila es el módulo entero en un número.</strong> A 100 unidades, el BOM es el <strong>11,6%</strong> del costo: optimizar componentes es irrelevante, todo está dominado por costos fijos que se reparten entre pocas unidades. A 10.000 el BOM es el <strong>62,6%</strong>: ahí sí, negociar dos centavos por capacitor mueve la aguja. La consecuencia estratégica es dura y poca gente la dice en voz alta: <strong>a volúmenes bajos no hay optimización de diseño que te salve</strong>. Lo único que baja el costo unitario es vender más unidades. Si el modelo de negocio no llega a volumen, el problema no es de ingeniería.
+</div>
+
+<div class="rule">
+  <strong>📌 Lo que casi siempre falta en un costeo de principiante.</strong> Scrap y retrabajo. Certificación amortizada. Herramentales y jigs. Calibración. Packaging y manual. Flete y aduana. Reserva de garantía. Repuestos. <strong>Regla de bolsillo:</strong> tomá tu BOM, multiplicá por 2,5 y ese es tu costo variable creíble; después sumá el NRE dividido por las unidades que <em>realmente</em> vas a vender, no por las que te gustaría vender. Verificá contra la tabla: $44,00 × 2,5 = $110,00 contra un costo variable real de $66,98 más $41,55 de NRE = $108,53. La regla no es magia, pero te salva del error de un orden de magnitud.
+</div>
+
+<h2>CF8.11 Soporte de campo y fin de vida</h2>
+
+<p>El día que enviás la primera unidad, empieza una obligación que dura años. Y desde el CRA, esa obligación tiene una duración mínima que hay que <em>declarar por escrito</em>.</p>
+
+<table>
+<thead><tr><th>Capacidad</th><th>Qué te ahorra</th><th>Qué cuesta</th></tr></thead>
+<tbody>
+<tr><td><strong>Telemetría mínima</strong> (versión de firmware, revisión de hardware, uptime, últimos errores, tensión de batería, RSSI)</td><td>Diagnosticar sin pedir la unidad. Ver una deriva en la flota antes del primer reclamo</td><td>~2 KB/día por unidad; un backend chico. Consentimiento y política de privacidad</td></tr>
+<tr><td><strong>Diagnóstico remoto</strong> (volcado de estado bajo demanda, log circular en flash)</td><td>La mitad de los RMA se resuelven sin flete</td><td>Unos KB de flash y un comando autenticado — <a href="../cf6-seguridad-embebida/lecture.html">CF6</a>, no lo dejes abierto</td></tr>
+<tr><td><strong>OTA con rollback</strong></td><td>Que una actualización mala no sea un camión</td><td>Doble banco de flash: más memoria, o un MCU más caro</td></tr>
+<tr><td><strong>Repuestos (LTB del 5–8%)</strong></td><td>Poder reparar cuando el componente ya no existe</td><td>Capital inmovilizado durante años</td></tr>
+<tr><td><strong>Fecha de fin de soporte publicada</strong></td><td>Cortar la obligación de forma ordenada y legal</td><td>Decidirla antes de vender, no cuando ya no te dan los números</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El período de soporte ahora es una obligación legal en la UE.</strong> El Cyber Resilience Act exige que el fabricante determine y <strong>declare</strong> un período de soporte durante el cual entrega actualizaciones de seguridad; la referencia general es <strong>al menos cinco años</strong> (o la vida útil esperada del producto, si es menor). En la práctica eso significa que el firmware que estás escribiendo hoy tiene que ser actualizable en 2031, que la cadena de compilación tiene que seguir existiendo, y que ese costo — un desarrollador atendiendo CVEs de la pila TLS durante cinco años — es parte del costo del producto aunque no aparezca en ninguna fila del BOM. Presupuestalo.
+</div>
+
+<div class="tip">
+  <strong>Planificá la obsolescencia de tu propio producto.</strong> Antes de lanzar, escribí tres fechas: fin de venta, fin de soporte de software y fin de repuestos. Publicalas. Un producto con fechas claras es un producto que los clientes profesionales pueden comprar; uno sin fechas es un riesgo que su área de compras va a rechazar. Y del lado tuyo: es la única forma de que el soporte de un producto viejo no se coma el equipo que necesitás para el siguiente.
+</div>
+
+<h2>CF8.12 Cierre del track</h2>
+
+<p>Ocho módulos. Cada uno resuelve un problema específico que, si lo ignorás, aparece en un momento distinto del proyecto — casi siempre en el peor.</p>
+
+<table>
+<thead><tr><th>Módulo</th><th>El problema que resuelve</th><th>Cuándo te muerde si no lo hiciste</th></tr></thead>
+<tbody>
+<tr><td><a href="../cf1-tiempo-real-rtos/lecture.html"><strong>CF1</strong> — Tiempo real y RTOS</a></td><td>Que el firmware cumpla plazos, siempre, no en promedio</td><td>Cuando el sistema se cuelga una vez por semana y nadie sabe por qué</td></tr>
+<tr><td><a href="../cf2-arquitectura-firmware/lecture.html"><strong>CF2</strong> — Arquitectura de firmware</a></td><td>Que el código sobreviva cinco años de cambios y tres revisiones de placa</td><td>En la rev C, cuando tocar una cosa rompe otra</td></tr>
+<tr><td><a href="../cf3-energia/lecture.html"><strong>CF3</strong> — Energía</a></td><td>Que la batería dure lo que prometiste en el folleto</td><td>Al mes de la primera venta, con 1.000 clientes cargando el aparato</td></tr>
+<tr><td><a href="../cf4-buses-industriales/lecture.html"><strong>CF4</strong> — Buses industriales</a></td><td>Hablar con el resto de la planta sin perder tramas ni aislación</td><td>En la instalación del cliente, con un motor de 30 kW al lado</td></tr>
+<tr><td><a href="../cf5-integridad-senal/lecture.html"><strong>CF5</strong> — Integridad de señal</a></td><td>Que la placa funcione a la frecuencia real y pase EMC</td><td>En el laboratorio de certificación, a $9.800 el intento</td></tr>
+<tr><td><a href="../cf6-seguridad-embebida/lecture.html"><strong>CF6</strong> — Seguridad embebida</a></td><td>Que nadie te clone el producto ni te secuestre la flota</td><td>Cuando aparece un clon, o cuando la RED/CRA te lo exigen por ley</td></tr>
+<tr><td><a href="../cf7-tinyml-edge/lecture.html"><strong>CF7</strong> — TinyML en el edge</a></td><td>Que el dispositivo decida solo, sin nube y sin latencia</td><td>Cuando el costo del backend supera al del hardware</td></tr>
+<tr><td><strong>CF8</strong> — De prototipo a producto</td><td>Que las otras siete lleguen a mil manos sin fundirte</td><td>Todo el tiempo, desde la semana uno</td></tr>
+</tbody>
+</table>
+
+<h3>Hacia dónde seguir</h3>
+
+<div class="step"><strong>Para la parte de seguridad</strong> — <a href="../../../Curso-Ciberseguridad/senior/index.html">Ciberseguridad Senior</a>. CF6 te dio arranque seguro, almacenamiento de claves y actualización firmada. Lo que sigue: modelado de amenazas serio, criptografía aplicada, gestión de vulnerabilidades y respuesta a incidentes. Es exactamente lo que el CRA te va a exigir tener documentado a partir de 2027, y lo que las obligaciones de reporte de 24 horas presuponen que ya existe.</div>
+
+<div class="step"><strong>Para la parte del modelo</strong> — <a href="../../../../datos-ia/Curso-Datos-ML/senior/index.html">Datos y ML Senior</a>. CF7 te enseñó a ejecutar un modelo en un microcontrolador. Lo que falta es todo lo de antes y lo de después: de dónde salen los datos, cómo se etiquetan, cómo se evalúa de verdad, cómo se detecta la deriva y cómo se reentrena cuando el mundo cambia. Un modelo cuantizado a 8 bits corriendo en 200 KB no vale nada si el <em>dataset</em> estaba sesgado.</div>
+
+<div class="step"><strong>Para firmware moderno</strong> — <a href="../../../../lenguajes/Curso-Rust/senior/index.html">Rust Senior</a>. La mayor parte de este track es C, porque es lo que vas a encontrar. Pero Rust <em>embedded</em> (<code>no_std</code>, <code>embassy</code>, HAL con tipos) elimina por construcción clases enteras de bugs que en C se cazan a mano: desbordes, uso después de liberar, carreras entre una interrupción y el hilo principal. Para código nuevo que tiene que durar cinco años y recibir actualizaciones de seguridad, la conversación vale la pena.</div>
+
+<div class="step"><strong>Y lo que no está en ningún curso:</strong> hacé un producto. Uno solo, chico, completo, con las diez unidades del EVT armadas de verdad. Vas a aprender más de las cinco cosas que salgan mal que de otro track entero. Este módulo existe para que esas cinco cosas no te agarren de sorpresa — no para que no pasen.</div>
+
+<h2>🧑‍🎓 Worked Example — de la estación meteorológica que anda a 500 unidades</h2>
+
+<blockquote>Tenés el <a href="../../proyectos/estacion-meteo.html">proyecto puente del curso base</a> terminado y andando: una estación meteorológica con ESP32, sensor de temperatura, humedad y presión, anemómetro, panel solar y batería. Mide bien, publica por Wi-Fi, aguantó tres meses en el balcón. Un distribuidor agrícola te pide <strong>500 unidades</strong> para vender a $150. Vos hacés la cuenta rápida: "los componentes me salieron $98 comprando de a uno, a 500 bajan a la mitad, digamos $49, le pongo $20 de ensamblado, me quedan $80 de margen por unidad. Son $40.000. En tres meses lo tengo." Firmás.</blockquote>
+
+<p><strong>Paso 1 — DFM sobre el BOM del prototipo.</strong> Lo primero que hacés es lo del script de CF8.3: correr el BOM real contra el stock y el ciclo de vida. Salen tres problemas, ninguno visible en el prototipo.</p>
+
+<table>
+<thead><tr><th>Componente</th><th>Qué pasó</th><th>Salida</th><th>Consecuencia</th></tr></thead>
+<tbody>
+<tr><td>MLCC 22 µF 0402 (×3 por placa, 1.500 piezas)</td><td>30 semanas de plazo. Escasez global de pasivos de alta capacitancia</td><td>Pedir hoy y esperar, o pasar a 2× 10 µF en 0603</td><td>🔴 <strong>Camino crítico del proyecto entero</strong></td></tr>
+<tr><td>LDO de bajo Iq (SOT-563)</td><td>NRND. El reemplazo funcional viene en SOT-23-5</td><td>Reemplazar</td><td>Cambia la huella → <strong>obliga rev B</strong></td></tr>
+<tr><td>Módulo ESP32-S3-WROOM-1-<strong>N8R2</strong></td><td>18 semanas. La variante <strong>N8</strong> (sin PSRAM) está disponible en 4</td><td>Pasar a N8</td><td>Te quedás sin PSRAM: hay que recortar el buffer del modelo de <a href="../cf7-tinyml-edge/lecture.html">CF7</a></td></tr>
+</tbody>
+</table>
+
+<p>Dos de los tres obligan a rediseñar la placa. Ya estás en rev B en la semana 3, antes de haber fabricado nada.</p>
+
+<p><strong>Paso 2 — el sensor que hay que calibrar de a uno.</strong> Armás diez placas de rev B con componentes de broker y las ponés juntas. Los diez sensores de humedad leen entre 41 y 47 %RH en el mismo ambiente. Ninguno está roto: el datasheet dice ±3 %RH y dos unidades en spec pueden diferir 6 puntos. Pero tu cliente vende esto a productores agrícolas que deciden riego con ese número, y una diferencia de 6 puntos entre dos estaciones vecinas es un reclamo garantizado.</p>
+
+<p>La solución es la de CF8.5: calibración de dos puntos por unidad, con sales saturadas a 33 y 75 %RH, coeficientes guardados en NVS con el número de serie. <strong>Costo real:</strong> 13 corridas de 40 placas × 90 minutos = <strong>19,5 horas de cámara</strong> repartidas en cuatro días, más el tiempo de carga y descarga. Es la línea de "$4,60 por unidad" del costeo, y nadie la había presupuestado.</p>
+
+<p><strong>Paso 3 — la certificación que obliga a rediseñar otra vez.</strong> Vas a pre-compliance con la rev B. En la cámara semianecoica, emisiones radiadas en 3 puntos entre 80 y 220 MHz por encima del límite de la Clase B, con margen negativo de 6 dB. La causa no es el Wi-Fi (el módulo está certificado): es el convertidor buck conmutando a 1,2 MHz, cuyos armónicos salen conducidos por el <strong>cable del anemómetro</strong>, que mide 4 metros y funciona como una antena excelente.</p>
+
+<p>Esto es <a href="../cf5-integridad-senal/lecture.html">CF5</a> puro, y no se arregla con firmware. Rev C: filtro de modo común en la entrada del anemómetro, ferrita en el cable, plano de guarda bajo el conector, y bajar la velocidad de flanco del buck. Cinco semanas más entre rediseño, fabricación y segunda sesión de cámara — donde ahora pasa con 9 dB de margen. <strong>Sin el pre-compliance, ese descubrimiento habría ocurrido en el ensayo formal</strong>, con el laboratorio facturado, la cola perdida y las 500 placas de rev B ya fabricadas.</p>
+
+<p><strong>Paso 4 — el jig que hubo que construir.</strong> Con 500 unidades, probar a mano es imposible: son 500 veces "conectar el USB, abrir el monitor serie, mirar si los números tienen sentido", unos 4 minutos cada una. 33 horas de trabajo altamente aburrido y altamente propenso a error humano. El jig de $4.200 hace las siete pruebas en 30 segundos, no se distrae, y además <strong>guarda todos los valores</strong>. Ese registro es lo que te permite, dos meses después, ver que el consumo en sueño profundo de las últimas 60 unidades subió de 12 a 19 µA y rastrearlo hasta un carrete de resistencias de <em>pull-up</em> con el valor equivocado.</p>
+
+<p><strong>Paso 5 — el cronograma real.</strong></p>
+
+<table>
+<thead><tr><th>Semanas</th><th>Actividad</th><th>Camino crítico</th></tr></thead>
+<tbody>
+<tr><td>1–5</td><td>DFM, segundas fuentes, rediseño rev B</td><td>✅</td></tr>
+<tr><td><strong>6</strong></td><td><strong>Congelamiento del BOM y pedido de los componentes de plazo largo</strong></td><td>✅ decisión clave</td></tr>
+<tr><td>6–9</td><td>Fabricación de rev B (10 unidades con stock de broker) y bring-up</td><td>✅</td></tr>
+<tr><td>10–13</td><td>Pre-compliance: dos sesiones de cámara</td><td>✅</td></tr>
+<tr><td>14–18</td><td>Rev C: filtrado de entrada, fabricación y validación</td><td>✅</td></tr>
+<tr><td>14–20</td><td>Diseño y construcción del test jig</td><td>en paralelo</td></tr>
+<tr><td>19–26</td><td>Certificación formal FCC + CE</td><td>✅</td></tr>
+<tr><td>20–30</td><td>ENACOM: reconocimiento del informe y trámite en HERTZ</td><td>en paralelo</td></tr>
+<tr><td><strong>36</strong></td><td><strong>Llegan los MLCC pedidos en la semana 6 (30 semanas de plazo)</strong></td><td>🔴 <strong>el que manda</strong></td></tr>
+<tr><td>37–39</td><td>Piloto de 25 unidades (PVT) + FAI + ajuste del jig</td><td>✅</td></tr>
+<tr><td>40–44</td><td>Producción de 500: ensamblado, test, calibración, empaque</td><td>✅</td></tr>
+<tr><td><strong>44 semanas</strong></td><td><strong>≈ 10 meses</strong> — contra los 3 estimados</td><td><strong>3,7×</strong></td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Leé bien la fila de la semana 36.</strong> El camino crítico de todo el proyecto no fue la certificación, ni el rediseño, ni el jig: fue <strong>un capacitor de 3,8 centavos</strong>. Y lo único que evitó que fuera peor fue la decisión de la semana 6: congelar el BOM y pedir los largos <em>antes</em> de tener el diseño final validado, aceptando el riesgo de comprar componentes para una placa que todavía podía cambiar. Si hubieras esperado a terminar la rev C en la semana 18 para pedir, los capacitores llegaban en la semana 48 y el proyecto terminaba en el mes 13.
+</div>
+
+<p><strong>Paso 6 — la cuenta que no cierra.</strong> Con el costeo de CF8.10 aplicado a 500 unidades:</p>
+
+<table>
+<thead><tr><th>Concepto</th><th>Estimación ingenua</th><th>Realidad a 500 u</th></tr></thead>
+<tbody>
+<tr><td>BOM</td><td>$49,00</td><td>$49,05</td></tr>
+<tr><td>Ensamblado PCBA + final</td><td>$20,00</td><td>$15,70</td></tr>
+<tr><td>Test funcional</td><td>—</td><td>$2,40</td></tr>
+<tr><td>Calibración</td><td>—</td><td>$4,60</td></tr>
+<tr><td>Packaging y manual</td><td>—</td><td>$2,90</td></tr>
+<tr><td>Scrap y retrabajo (5%)</td><td>—</td><td>$3,73</td></tr>
+<tr><td><strong>Costo variable por unidad</strong></td><td><strong>$69,00</strong></td><td><strong>$78,38</strong></td></tr>
+<tr><td>NRE total: ingeniería $12.000 + jig $4.200 + certificación $24.500 + setup $850</td><td>$0</td><td>$41.550</td></tr>
+<tr><td><strong>NRE amortizado en 500 unidades</strong></td><td><strong>$0</strong></td><td><strong>$83,10</strong></td></tr>
+<tr><td><strong>COSTO UNITARIO REAL</strong></td><td><strong>$69,00</strong></td><td><strong>$161,48</strong></td></tr>
+<tr><td>Margen a $150 de precio de venta</td><td>+$81,00</td><td><strong>🔴 −$11,48</strong></td></tr>
+</tbody>
+</table>
+
+<p>El BOM se estimó <strong>bien</strong> — $49,00 contra $49,05 reales. Todo lo demás se estimó en cero. Y el resultado es que a $150 se pierde $11,48 por unidad: sobre las 500, <strong>$5.740 de pérdida</strong>.</p>
+
+<p>La cuenta desde el otro lado, que es la que sirve para negociar: el margen de contribución a $150 es 150 − 78,38 = <strong>$71,62</strong> por unidad. Las 500 aportan $35.810 contra $41.550 de NRE. El <strong>punto de equilibrio está en 581 unidades</strong> — 581 × $71,62 = $41.611, apenas arriba del NRE.</p>
+
+<div class="rule">
+  <strong>📌 Las tres salidas, con su número.</strong>
+  <br><strong>(a) Subir el precio.</strong> A $179 el margen de contribución sube a $100,62; las 500 aportan $50.310 y queda una ganancia de $8.760. Hay que convencer al cliente de un 19% más.
+  <br><strong>(b) Subir el volumen.</strong> A 1.000 unidades el costo unitario cae a $108,53 y a $150 ganás $41,47 por unidad: $41.470. El mismo precio, el doble de unidades, y el proyecto pasa de perder $5.740 a ganar $41.470. <strong>El volumen es la palanca dominante.</strong>
+  <br><strong>(c) Aceptar la primera corrida como inversión.</strong> Vender 500 a $150 a pérdida y recuperar en la segunda tanda, donde el NRE ya está pagado y solo se paga el setup: costo variable $78,38, margen $71,62, ganancia limpia. Es una decisión legítima <em>si la tomás a propósito</em> y con la caja para bancarla; es una catástrofe si te enterás cuando ya facturaste.
+</div>
+
+<div class="danger">
+  <strong>⚠️ Lo que este ejercicio enseña de verdad.</strong> Nadie se equivocó técnicamente: la estación funciona, pasó certificación, se calibra bien y el firmware es sólido. Lo que falló fue la <strong>estimación</strong>, y falló de la única forma en que suele fallar — no por subestimar lo que se conocía, sino por <strong>no listar lo que no se conocía</strong>. Certificación, calibración, jig, scrap, packaging y NRE no aparecieron como números malos: aparecieron como <strong>ceros implícitos</strong>. La disciplina que este módulo te deja no es saber cuánto cuesta cada cosa: es saber <em>qué cosas hay</em>, para que ninguna entre en la planilla valiendo cero.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu BOM sale $44 por unidad y vas a hacer 100. ¿Cuánto te sale el producto?</summary>
+<p>No lo podés saber con ese dato — y ese es el punto. En la tabla de CF8.10, a 100 unidades el costo unitario total es <strong>$522,48</strong> y el BOM es apenas el <strong>11,6%</strong> de eso. Lo que domina es el NRE amortizado: $415,50 por unidad, de los cuales $245 son solo certificación repartida entre 100 aparatos. Antes de dar un precio necesitás: costo variable completo (BOM + ensamblado + test + calibración + packaging + scrap) y NRE total dividido por las unidades que realmente vas a vender. La regla de bolsillo — BOM × 2,5 más NRE por unidad — te da $110 + $415,50 = $525,50 contra los $522,48 reales. Suficiente para no firmar un contrato equivocado.</p></details>
+
+<details><summary>¿Por qué se prueba el 100% de las placas y no una muestra estadística, si el muestreo funciona en otras industrias?</summary>
+<p>Porque la economía es completamente distinta. El muestreo tiene sentido cuando el costo de inspeccionar una unidad es alto respecto del costo de una unidad defectuosa que se escapa. En electrónica de producto es al revés: probar cuesta <strong>42 segundos</strong> ($0,21 de mano de obra) y una unidad defectuosa en campo cuesta <strong>$140</strong> en flete, diagnóstico, repuesto y administración — sin contar la reseña de una estrella. Con un 3% de defectos en un lote de 500, el muestreo del 5% deja pasar 14 unidades malas: $1.960, contra $105 de probarlas todas. Además, el test al 100% no es solo un filtro: es también el momento en que se provisiona el número de serie, se escriben los coeficientes de calibración, se graba el firmware final y se genera el registro de trazabilidad. Aunque el rendimiento fuera del 100%, el jig seguiría siendo necesario.</p></details>
+
+<details><summary>Sale la revisión C con un LDO distinto porque el original entró en EOL. ¿Qué tiene que pasar antes de publicar la próxima actualización de firmware por aire?</summary>
+<p>Que el firmware sepa distinguir en qué revisión está corriendo y actúe distinto en cada una — un solo binario, detección en tiempo de ejecución, parámetros en tabla. Si compilaste un binario por revisión con <code>#ifdef</code>, tarde o temprano alguien publica el equivocado y convierte en <em>bricks</em> las unidades de rev B que estaban funcionando; en hardware eso no se revierte con un botón, se revierte con un camión. El mínimo aceptable son tres cosas: (1) identificación de revisión por hardware — <em>strapping</em>, divisor a ADC, EEPROM o eFuse, nunca por sondeo adivinatorio; (2) modo degradado seguro cuando la revisión no está en la tabla, que igual acepte OTA, porque una placa futura tiene que poder recibir el firmware que la va a reconocer; y (3) verificación del lado del servidor, que compara la revisión reportada contra el paquete antes de ofrecerlo. Y en la base de datos de trazabilidad tiene que estar registrado qué revisión lleva cada número de serie, o el servidor no tiene contra qué verificar.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El prototipo que anda está al <strong>10%</strong>. El 90% restante no es más circuito ni más código: es fabricación, suministro, ensayos, papeles y soporte.</li>
+  <li><strong>DFM</strong> se aplica en el esquemático, no después. El riesgo de un componente no lo determina su precio sino su plazo, sus fuentes y su huella: el capacitor de <strong>3,8 centavos</strong> puede ser el camino crítico de todo el proyecto.</li>
+  <li>El <strong>BOM</strong> va versionado en el repositorio, con segundas fuentes <em>medidas</em> y estado de ciclo de vida chequeado por CI. En 2026 la escasez de MLCC (26–40 semanas) y de MCU (16–19) es el escenario base, no la excepción.</li>
+  <li>Se prueba el <strong>100%</strong> de las unidades, no una muestra: 42 segundos contra $140 de RMA. El jig cuesta $4.200 y se paga en el primer lote.</li>
+  <li><strong>Calibrar por unidad</strong> porque dos sensores en spec pueden diferir el doble de la tolerancia. <strong>Trazar hasta el lote</strong> porque la diferencia entre un recall acotado y uno total fueron <strong>$652.400</strong> por una EEPROM de $0,12.</li>
+  <li><strong>Certificación:</strong> $24.500 y ~26 semanas para FCC + CE + ENACOM. El <strong>pre-compliance temprano</strong> ($3.000–8.000) baja la falla en primer intento del 50% a menos del 10%, y los arreglos de EMC son de <em>layout</em> (<a href="../cf5-integridad-senal/lecture.html">CF5</a>), no de software.</li>
+  <li><strong>2026:</strong> la ciberseguridad ya está en el marcado CE desde el 1-ago-2025 (RED 3.3(d)(e)(f), EN 18031). El <strong>CRA</strong> obliga a reportar vulnerabilidades explotadas en 24 h desde el <strong>11-sep-2026</strong>, y desde el <strong>11-dic-2027</strong> exige SBOM y período de soporte declarado de al menos cinco años.</li>
+  <li>Un <strong>firmware que asume una sola revisión de hardware</strong> es una bomba de tiempo: un binario, detección en tiempo de ejecución, modo degradado seguro y verificación en el servidor de OTA.</li>
+  <li><strong>El costo unitario no es el BOM.</strong> A 100 unidades el BOM es el 11,6% del costo; a 10.000 es el 62,6%. A volúmenes bajos, lo único que baja el costo unitario es vender más.</li>
+  <li>Y lo que cierra el track: las siete disciplinas anteriores valen exactamente lo que valga tu capacidad de llegar con ellas a mil manos.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá el BOM real de cualquier proyecto tuyo y consultá, para cada componente, el estado de ciclo de vida y el plazo de entrega en un distribuidor. Ordenalo por <em>plazo</em>, no por precio. ¿Cuál es tu camino crítico? ¿Cuántos componentes críticos tienen una segunda fuente compatible con la huella?</li>
+  <li>Escribí el <code>bom.yaml</code> de ese proyecto con el formato de CF8.3 y adaptá el script de monitoreo a la API del distribuidor que uses. Corrélo. Documentá cuántas alertas te tira la primera vez.</li>
+  <li>Diseñá el procedimiento de test de 30 segundos para tu proyecto: qué siete cosas medirías, con qué criterio de aprobación y cuántos segundos le asignás a cada una. Después medí cuánto tardás realmente en verificar una unidad a mano y calculá el punto de equilibrio del jig.</li>
+  <li>Comprá tres sensores del mismo modelo, ponelos juntos y registrá sus lecturas durante 24 horas. Calculá la dispersión real entre unidades y comparala con el número del datasheet. Escribí la estructura de calibración que necesitarías y el procedimiento de dos puntos.</li>
+  <li>Rehacé la tabla de costeo de CF8.10 con los números de <em>tu</em> proyecto a 100, 1.000 y 10.000 unidades. No dejes ninguna fila en cero: si no sabés un valor, estimalo y marcalo como estimación. Calculá el porcentaje que representa el BOM en cada columna y el precio de venta que necesitás para un 55% de margen bruto.</li>
+  <li>Implementá la detección de revisión de hardware por divisor resistivo en tu placa, con la tabla de bandas y el modo degradado seguro. Simulá una revisión desconocida forzando un valor fuera de tabla y verificá que el dispositivo arranca en modo seguro y sigue aceptando OTA.</li>
+  <li>Escribí el plan de fin de vida de tu producto antes de venderlo: fecha de fin de venta, de fin de soporte de software y de fin de repuestos, con el porcentaje de compra final que necesitarías. Justificá cada fecha con un número, no con una sensación.</li>
+</ol>
+
+<section class="quiz" id="quizCF_S8">
+  <style>
+    #quizCF_S8{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCF_S8 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCF_S8 .q{margin-bottom:1.5rem}
+    #quizCF_S8 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCF_S8 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCF_S8 .opt:hover{border-color:var(--accent)}
+    #quizCF_S8 .opt:disabled{cursor:default}
+    #quizCF_S8 .opt.ok{background:rgba(63,185,80,.16);border-color:var(--success, #3fb950)}
+    #quizCF_S8 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCF_S8 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCF_S8 .exp.show{display:block}
+    #quizCF_S8 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu BOM sale $44 por unidad y vas a fabricar 100. ¿Cuál es la afirmación correcta sobre el costo unitario?</p>
+    <button class="opt">Va a rondar los $50: el BOM más un margen chico de ensamblado</button>
+    <button class="opt">Va a rondar los $88: el BOM se duplica por mano de obra y logística</button>
+    <button class="opt">Va a superar los $500, porque el NRE amortizado en 100 unidades domina todo lo demás</button>
+    <div class="exp">A 100 unidades el costo unitario del ejemplo es <strong>$522,48</strong>, del cual el BOM es apenas el <strong>11,6%</strong>. El resto lo aportan el costo variable completo ($106,98 con ensamblado, test, calibración, packaging y scrap) y sobre todo el NRE repartido entre pocas unidades: $415,50, de los cuales $245 son solo certificación. A volúmenes bajos el BOM es casi irrelevante y optimizar componentes no te salva; lo único que baja el costo unitario es vender más unidades.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Estás por elegir componentes y querés saber cuáles te van a dar problemas en producción. ¿Cómo ordenás el BOM?</p>
+    <button class="opt">Por plazo de entrega y cantidad de fuentes: el riesgo no tiene nada que ver con el precio</button>
+    <button class="opt">Por precio unitario descendente: los caros son los que hay que cuidar</button>
+    <button class="opt">Por cantidad de piezas por placa: cuantas más, más chances de que falte alguna</button>
+    <div class="exp">El componente que frena la producción en el Worked Example es un MLCC de <strong>3,8 centavos</strong> con 30 semanas de plazo — más barato que la etiqueta y dueño del camino crítico de todo el proyecto. El riesgo de línea se compone de plazo de entrega, cantidad de fabricantes que lo hacen, unicidad de la huella y estado de ciclo de vida. El precio no entra en esa cuenta: ordenar por precio para "ver qué es importante" es exactamente la forma equivocada de mirar un BOM.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. La revisión C de tu placa cambia el LDO porque el original entró en EOL. Ya hay unidades de rev B en campo. ¿Qué hacés con el firmware?</p>
+    <button class="opt">Compilo un binario por revisión con <code>#ifdef</code> y publico el que corresponda a cada grupo</button>
+    <button class="opt">Un solo binario que detecta la revisión en tiempo de ejecución, elige parámetros de una tabla y arranca en modo degradado seguro si no la reconoce</button>
+    <button class="opt">Mantengo el firmware de rev B y no actualizo las unidades viejas para no romperlas</button>
+    <div class="exp">Con binarios separados por <code>#ifdef</code>, tarde o temprano alguien publica el equivocado y convierte en <em>bricks</em> unidades que estaban funcionando; en hardware eso no se revierte con un botón, se revierte con un camión. Un solo binario con detección en tiempo de ejecución vuelve el sistema de OTA imposible de usar mal. Y congelar las unidades viejas tampoco sirve: dejarlas sin actualizaciones de seguridad choca de frente con las obligaciones de soporte del CRA y con el propio requisito de tener un camino de actualización. El modo degradado seguro es la pieza que falta en casi todas las implementaciones: si el firmware no reconoce la revisión, tiene que arrancar mínimo, reportarlo y <em>seguir aceptando OTA</em>, porque una placa futura necesita poder recibir el firmware que la va a reconocer.</div>
+  </div>
+
+  <div class="score" id="scoreCF_S8"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCF_S8');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCF_S8').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Terminaste el track de Computación Física Senior.' : '  — repasá las que fallaste; con esto cerrás el track.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cf7-tinyml-edge/lecture.html">← CF7: TinyML en el edge</a>
+  <a href="../index.html">Volver al track →</a>
+</nav>
+
+</div>
+</body>
+</html>

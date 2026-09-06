@@ -1,0 +1,916 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FS3 — Red y protocolos: la latencia es el enemigo · Frontend Senior</title>
+  <meta name="description" content="Ancho de banda vs latencia, el costo real de DNS+TCP+TLS, HTTP/2 y HTTP/3 sobre QUIC, caché HTTP e immutable, CDN y hit ratio, resource hints con criterio, brotli y zstd, imágenes modernas y el Service Worker como proxy de red.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Frontend Senior</a>
+  <a href="../../modulo-00-sillabus/lecture.html">🌐 Curso Frontend</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">FS3</span>
+  <span class="badge">⏱ 45–105 min</span>
+  <span class="badge">🎯 Pre-req: Curso Frontend M01, M09, M12</span>
+  <span class="badge">📡 Red y protocolos</span>
+</div>
+
+<article>
+
+<h1>FS3 — Red y protocolos: la latencia es el enemigo</h1>
+
+<h2>FS3.0 Por qué este módulo</h2>
+
+<p>En FS1 y FS2 miramos hacia adentro de la máquina: cómo el navegador pinta y cómo el motor ejecuta tu JavaScript. Este módulo mira hacia afuera. Y hay una razón para dedicarle un módulo entero: en la mayoría de los sitios reales, <strong>el cuello de botella no es el CPU del usuario: son los viajes de ida y vuelta</strong>.</p>
+
+<p>El síntoma clásico es este. Alguien mide un sitio, ve 4 segundos de carga, abre el profiler, encuentra 300 ms de JavaScript y concluye que "el JS está pesado". Optimiza el bundle, lo baja a 200 ms, vuelve a medir: 3,9 segundos. Los otros 3,7 segundos nunca estuvieron en el CPU. Estuvieron esperando.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El tiempo de carga de una página se aproxima bastante bien con <code>T ≈ (cantidad de viajes secuenciales × RTT) + (bytes ÷ ancho de banda) + tiempo de servidor</code>. En una conexión moderna el segundo término suele ser chico y el primero suele ser enorme. Por eso <strong>la latencia no se compra con megas</strong>: se compra eliminando viajes.
+</div>
+
+<p>La consecuencia práctica es incómoda para el marketing de las telcos y liberadora para vos: tu trabajo de performance de red no es "hacer todo más chico". Es <strong>contar viajes y borrarlos</strong>. Cada preconnect que ponés bien, cada archivo que se cachea para siempre, cada handshake que se saltea con 0-RTT es un viaje menos.</p>
+
+<div class="info">
+  Este módulo asume el M01 del Curso Frontend (qué es DNS, qué es HTTP, qué es HTTPS) y no lo repite. Acá vamos al nivel de <em>protocolo, caché y estrategia de entrega</em>. Las métricas con las que se mide todo esto —LCP, INP, CLS, TTFB— son el tema de <strong>FS4</strong>: las voy a nombrar cuando haga falta y sigo de largo.
+</div>
+
+<h2>FS3.1 Ancho de banda vs latencia: por qué más Mbps casi no te sirven</h2>
+
+<p>Hay un experimento clásico de Google (Mike Belshe, el mismo que después diseñó SPDY, el precursor de HTTP/2) que conviene tener grabado. Midieron el tiempo de carga de páginas reales variando dos cosas por separado: el ancho de banda y el RTT. El resultado es contraintuitivo y sigue siendo verdad quince años después:</p>
+
+<table>
+<thead><tr><th>Qué cambiás</th><th>Efecto en el tiempo de carga</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>De 1 Mbps a 2 Mbps</td><td>Mejora grande (~40%)</td><td>Todavía estás limitado por bytes</td></tr>
+<tr><td>De 5 Mbps a 10 Mbps</td><td>Mejora casi nula (~5%)</td><td>Ya no estás limitado por bytes</td></tr>
+<tr><td>De 10 Mbps a 100 Mbps</td><td>Prácticamente cero</td><td>El caño ya está subutilizado</td></tr>
+<tr><td>Bajar el RTT 20 ms</td><td>Mejora lineal y sostenida</td><td>Cada viaje cuesta 20 ms menos, y hay muchos viajes</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Por encima de ~5 Mbps, el ancho de banda deja de ser el factor dominante y el RTT pasa a serlo.</strong> Y no hay nada que puedas comprar para bajar el RTT por debajo de la velocidad de la luz en fibra: Buenos Aires–Virginia son unos 9.000 km, ~90 ms ida y vuelta en el mejor caso físico, y en la práctica 110–140 ms. Lo único que baja esa cifra es <strong>acercar el servidor</strong> (CDN) o <strong>hacer menos viajes</strong>.
+</div>
+
+<p>Números de referencia para calibrar la intuición. Guardalos, porque los vas a usar para estimar antes de medir:</p>
+
+<table>
+<thead><tr><th>Escenario</th><th>RTT típico</th><th>20 viajes secuenciales cuestan</th></tr></thead>
+<tbody>
+<tr><td>Localhost</td><td>&lt; 1 ms</td><td>~10 ms</td></tr>
+<tr><td>LAN de oficina</td><td>1–3 ms</td><td>~40 ms</td></tr>
+<tr><td>Fibra, misma ciudad</td><td>5–15 ms</td><td>~200 ms</td></tr>
+<tr><td>Mismo continente</td><td>30–60 ms</td><td>~900 ms</td></tr>
+<tr><td>Transatlántico / trans-pacífico</td><td>90–180 ms</td><td>~2,7 s</td></tr>
+<tr><td>4G móvil</td><td>50–120 ms</td><td>~1,7 s</td></tr>
+<tr><td>5G móvil</td><td>20–40 ms</td><td>~600 ms</td></tr>
+<tr><td>Satélite LEO (Starlink)</td><td>25–60 ms</td><td>~850 ms</td></tr>
+<tr><td>Satélite geoestacionario</td><td>550–650 ms</td><td>~12 s 😱</td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>La analogía del camión.</strong> El ancho de banda es el tamaño del camión; la latencia es el tiempo que tarda el camión en llegar. Si tenés que hacer veinte viajes a un depósito que está a dos horas, comprar un camión más grande no te ahorra nada: seguís perdiendo cuarenta horas en la ruta. Lo que te salva es <em>hacer un solo viaje</em> (multiplexar), <em>tener un depósito más cerca</em> (CDN) o <em>no tener que ir</em> (caché).
+</div>
+
+<p>Y hay un tercer factor que casi nadie mide: <strong>el slow start de TCP</strong>. Una conexión nueva no arranca a full. Empieza con una ventana de congestión de 10 segmentos —unos 14 KB— y la duplica en cada RTT hasta encontrar el límite. En una conexión fría:</p>
+
+<pre><code class="lang-bash"># Cuántos RTT necesita TCP para entregar N bytes desde cero (initcwnd = 10)
+#   RTT 1  -&gt;  ~14 KB
+#   RTT 2  -&gt;  ~42 KB acumulados
+#   RTT 3  -&gt;  ~98 KB acumulados
+#   RTT 4  -&gt;  ~210 KB acumulados
+#
+# Un CSS crítico de 12 KB llega en UN viaje.
+# Un CSS crítico de 60 KB necesita TRES. A 120 ms de RTT, eso son 240 ms extra
+# que ninguna mejora de ancho de banda te va a devolver.</code></pre>
+
+<div class="tip">
+  De acá salió la regla vieja de "mantené el HTML+CSS crítico bajo 14 KB". Hoy es menos rígida —muchos CDNs suben el <code>initcwnd</code> y BBR se comporta distinto de CUBIC— pero <strong>la forma de la curva no cambió</strong>: los primeros kilobytes son baratos y los siguientes se pagan en múltiplos de RTT. Sigue siendo una guía útil para dimensionar el CSS inline.
+</div>
+
+<h2>FS3.2 La conexión completa: DNS → TCP → TLS → primer byte</h2>
+
+<p>Antes de que el servidor vea tu <code>GET</code>, el navegador ya gastó varios viajes. Desglosarlos es lo que te permite saber a cuál apuntar:</p>
+
+<table>
+<thead><tr><th>Paso</th><th>Costo</th><th>Qué lo elimina</th></tr></thead>
+<tbody>
+<tr><td><strong>DNS</strong></td><td>1 RTT si el resolver tiene la respuesta; 2–4 si tiene que ir a los autoritativos</td><td>Caché del SO/navegador, TTL alto, <code>dns-prefetch</code></td></tr>
+<tr><td><strong>TCP handshake</strong></td><td>1 RTT (SYN → SYN-ACK → ACK)</td><td><code>preconnect</code>, conexión reutilizada, QUIC (lo fusiona con TLS)</td></tr>
+<tr><td><strong>TLS 1.3</strong></td><td>1 RTT (eran 2 en TLS 1.2)</td><td>Session resumption / PSK, <code>preconnect</code>, 0-RTT</td></tr>
+<tr><td><strong>Request + think time del servidor</strong></td><td>1 RTT + lo que tarde el backend</td><td>Caché en el edge, <code>103 Early Hints</code></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Conectarse a un origen nuevo cuesta 3 RTT antes de pedir nada.</strong> A 120 ms de RTT móvil eso son <strong>360 ms tirados</strong> por cada dominio distinto que toca tu página. Cinco orígenes de terceros son casi dos segundos de handshakes puros, aunque todos devuelvan archivos de 2 KB.
+</div>
+
+<p>Podés medir cada tramo sin abrir DevTools, y esto es lo primero que hago cuando alguien me dice "el sitio está lento":</p>
+
+<pre><code class="lang-bash">curl -sS -o /dev/null \
+  -w 'proto=%{http_version}  dns=%{time_namelookup}s  tcp=%{time_connect}s  tls=%{time_appconnect}s  ttfb=%{time_starttransfer}s  total=%{time_total}s\n' \
+  https://ejemplo.com
+
+# Salida tipica de un origen SIN CDN, desde Buenos Aires:
+# proto=2  dns=0.041s  tcp=0.171s  tls=0.318s  ttfb=0.902s  total=0.965s
+#
+# Como se lee:
+#   dns            = 41 ms
+#   tcp - dns      = 130 ms  -&gt; un RTT
+#   tls - tcp      = 147 ms  -&gt; otro RTT (TLS 1.3)
+#   ttfb - tls     = 584 ms  -&gt; un RTT + 450 ms de think time del backend
+# Diagnostico: 318 ms se van en handshakes y 450 ms en el servidor.
+# Un CDN ataca los dos: termina TLS cerca y puede cachear la respuesta.</code></pre>
+
+<h3>0-RTT: el viaje que no existe, y su precio</h3>
+
+<p>Cuando el cliente ya se conectó antes a ese servidor, TLS 1.3 le permite guardar un <em>pre-shared key</em> y mandar datos <strong>junto con</strong> el primer paquete del handshake. Cero viajes de setup. Es la optimización más potente de esta sección y la que más gente aplica mal.</p>
+
+<div class="danger">
+  <strong>⚠️ 0-RTT es vulnerable a replay.</strong> Un atacante que capture el paquete inicial puede reenviarlo, y el servidor no tiene forma criptográfica de distinguirlo del original. Por eso <strong>solo se permiten peticiones idempotentes</strong>: un <code>GET</code> de un recurso público, sí. Un <code>POST /transferir</code>, jamás. Si tu servidor acepta 0-RTT sin filtrar por método y por ruta, acabás de crear un vector de repetición de operaciones. La mayoría de los CDNs lo restringen a <code>GET</code>/<code>HEAD</code> por defecto — <strong>verificalo, no lo asumas</strong>.
+</div>
+
+<pre><code class="lang-nginx"># nginx: 0-RTT habilitado pero acotado
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_early_data on;
+
+# Reenvia la marca de "esto vino por 0-RTT" al backend, para que decida
+proxy_set_header Early-Data $ssl_early_data;
+
+# Y en el backend: si Early-Data == 1 y el metodo NO es GET/HEAD,
+# responder 425 Too Early para forzar al cliente a reintentar por el canal normal.</code></pre>
+
+<h2>FS3.3 HTTP/2: el multiplexado y las optimizaciones que mató</h2>
+
+<p>HTTP/1.1 tenía un problema estructural: una conexión servía una petición por vez. Los navegadores lo parchearon abriendo hasta 6 conexiones por origen, y los desarrolladores lo parchearon otra vez con <em>domain sharding</em> (repartir los assets en <code>static1.midominio.com</code>, <code>static2...</code>) para conseguir 12 o 18 conexiones.</p>
+
+<p>HTTP/2 borra el problema de raíz: <strong>una sola conexión TCP, muchos streams multiplexados</strong>, cada uno con su identificador, entrelazados en frames binarios. Sumale HPACK, que comprime los headers repetidos (que en una página real son decenas de kilobytes de cookies y user-agents redundantes).</p>
+
+<div class="mistake">
+  <strong>El error que sigue vivo en 2026:</strong> mantener <em>domain sharding</em> "porque siempre se hizo así". Sobre HTTP/2 es <strong>activamente contraproducente</strong>: cada dominio extra son 3 RTT de handshake nuevos, un congestion window que arranca de cero y una conexión más que pelear por el mismo ancho de banda. Sharding sobre H2 no acelera: frena.
+</div>
+
+<table>
+<thead><tr><th>Técnica de la era HTTP/1.1</th><th>Estado sobre HTTP/2 y HTTP/3</th></tr></thead>
+<tbody>
+<tr><td>Domain sharding</td><td>❌ Contraproducente. Borralo.</td></tr>
+<tr><td>Sprites de imágenes CSS</td><td>❌ Casi siempre innecesario. Además invalidás el sprite entero por un ícono.</td></tr>
+<tr><td>Inline de todo en el HTML</td><td>⚠️ Solo para el CSS crítico. Lo inline no se cachea entre navegaciones.</td></tr>
+<tr><td>Concatenar todo en un bundle gigante</td><td>⚠️ Matizado: menos archivos comprimen mejor, pero un bundle monolítico invalida toda la caché por un cambio de una línea. Buscá el punto medio con chunks estables.</td></tr>
+<tr><td>Cookie-free domains para assets</td><td>✅ Sigue teniendo sentido: HPACK comprime, pero no manda lo que no existe.</td></tr>
+</tbody>
+</table>
+
+<h3>Server push: el experimento que se abandonó</h3>
+
+<p>HTTP/2 traía <em>server push</em>: el servidor podía empujar recursos que el cliente todavía no había pedido. Sonaba perfecto. Fracasó por una razón simple y demoledora: <strong>el servidor no sabe qué tiene el cliente en caché</strong>. En la práctica se empujaban megabytes de CSS y JS a gente que ya los tenía, y el ancho de banda desperdiciado superaba lo ahorrado. Chrome lo removió en la versión 106 (octubre de 2022) y el resto lo siguió.</p>
+
+<div class="info">
+  Lo que ocupó su lugar es <strong><code>103 Early Hints</code></strong>: el servidor manda una respuesta informativa <em>antes</em> de la respuesta final, diciendo "andá preparando estos recursos". El cliente decide si los pide, y consulta su propia caché. Es la versión sensata de la misma idea. Soportado en Chrome 94+, Firefox 102+, Safari 16.4+ y Edge 94+, y solo funciona sobre HTTP/2 y HTTP/3. Volvemos a esto en FS3.7.
+</div>
+
+<h3>El límite que HTTP/2 no pudo cruzar</h3>
+
+<p>Multiplexar sobre una sola conexión resolvió el bloqueo a nivel HTTP, pero dejó intacto el de <strong>nivel TCP</strong>. TCP garantiza entrega en orden: si se pierde un segmento, el kernel retiene todo lo que llegó después hasta que la retransmisión complete el hueco. Con HTTP/2, ese hueco frena <em>todos</em> los streams, aunque pertenezcan a recursos independientes.</p>
+
+<div class="warn">
+  <strong>La consecuencia medible:</strong> en redes con pérdida de paquetes no trivial —2% o más, típico de móvil en movimiento o Wi-Fi saturado— un sitio sobre HTTP/2 puede rendir <strong>peor</strong> que el mismo sitio sobre HTTP/1.1 con seis conexiones, porque con seis conexiones una pérdida solo frena una sexta parte del tráfico. Ese es exactamente el problema que HTTP/3 fue a resolver.
+</div>
+
+<h2>FS3.4 HTTP/3 y QUIC: sacar el transporte del kernel</h2>
+
+<p>HTTP/3 no es "HTTP/2 más rápido": es HTTP/2 corriendo sobre un transporte completamente distinto. <strong>QUIC</strong> reemplaza a TCP, corre sobre UDP y vive en espacio de usuario. Cuatro consecuencias concretas:</p>
+
+<div class="step"><strong>1. Se acabó el head-of-line blocking de transporte.</strong> QUIC conoce los streams —TCP solo veía un chorro de bytes— así que un paquete perdido solo frena al stream al que pertenece. Los demás siguen entregándose.</div>
+
+<div class="step"><strong>2. Handshake fusionado.</strong> QUIC integra el establecimiento de conexión y el criptográfico (TLS 1.3) en <strong>un solo RTT</strong>, y en <strong>cero</strong> con resumption. Contra los 2 RTT de TCP+TLS 1.3, eso es medio segundo menos en un enlace transatlántico.</div>
+
+<div class="step"><strong>3. Migración de conexión.</strong> La conexión se identifica por un <em>connection ID</em>, no por la tupla IP:puerto. Cuando el celular pasa de Wi-Fi a 5G, la conexión <strong>sobrevive</strong> — con TCP se caía y había que rehacer los 3 RTT. En un móvil que se mueve, esto solo ya justifica el cambio.</div>
+
+<div class="step"><strong>4. Evolución sin esperar a los kernels.</strong> TCP tarda una década en adoptar un cambio porque vive en el kernel y en las cajas intermedias. QUIC se actualiza con el navegador y con la librería del servidor.</div>
+
+<h3>Adopción real, con números de 2026</h3>
+
+<table>
+<thead><tr><th>Métrica</th><th>Valor</th></tr></thead>
+<tbody>
+<tr><td>Usuarios con un navegador que soporta HTTP/3</td><td>~93%</td></tr>
+<tr><td>Top 10 millones de sitios que lo sirven</td><td>~34%</td></tr>
+<tr><td>Tráfico "probablemente humano" sobre H3 en la red de Cloudflare</td><td>~30%</td></tr>
+<tr><td>Porcentaje sobre <em>todas</em> las peticiones (bots incluidos), julio 2026</td><td>~20%, en leve baja interanual</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>Cuidado con esas dos últimas filas: no se contradicen, miden cosas distintas.</strong> El número "humano" es alto porque los navegadores modernos prefieren H3. El número global bajó porque el <strong>tráfico automatizado creció</strong> —muchos bots y clientes HTTP siguen hablando H1.1 o H2— y porque algunos países cayeron fuerte (en Rusia el uso de H3 se redujo a menos de la mitad interanual, por bloqueo de UDP). Moraleja de método: cuando una métrica de adopción baja, preguntá <em>qué cambió en el denominador</em> antes de sacar conclusiones sobre la tecnología.
+</div>
+
+<h3>Qué cuesta HTTP/3</h3>
+
+<table>
+<thead><tr><th>Costo</th><th>Detalle</th><th>Mitigación</th></tr></thead>
+<tbody>
+<tr><td><strong>UDP bloqueado</strong></td><td>Redes corporativas y algunos ISPs filtran o limitan UDP/443</td><td>El navegador cae a TCP automáticamente vía <code>Alt-Svc</code>; el costo es una carrera perdida, no un error</td></tr>
+<tr><td><strong>CPU</strong></td><td>Cifrado por paquete en espacio de usuario: históricamente ~2× el costo de TCP+TLS por byte</td><td>UDP GSO/GRO y offload de hardware lo achican mucho; hoy es un tema de operaciones a escala, no de sitios normales</td></tr>
+<tr><td><strong>Observabilidad</strong></td><td>Los headers de transporte van cifrados: tcpdump ya no te muestra nada útil</td><td><code>qlog</code>, <code>SSLKEYLOGFILE</code> y las herramientas del CDN</td></tr>
+<tr><td><strong>Ganancia real en redes buenas</strong></td><td>Sobre fibra con poca pérdida, la mejora suele ser marginal (decenas de ms)</td><td>Activalo igual: donde gana es en móvil, y ahí es donde está tu peor percentil</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-nginx"># nginx 1.25+: servir H3 junto con H2, y anunciarlo
+server {
+    listen 443 ssl;              # TCP: HTTP/1.1 y HTTP/2
+    listen 443 quic reuseport;   # UDP: HTTP/3
+    http2 on;
+
+    ssl_protocols TLSv1.2 TLSv1.3;   # QUIC exige TLS 1.3
+
+    # Sin este header el cliente NUNCA descubre que existe H3:
+    # llega por TCP, ve el anuncio y usa UDP en la proxima visita.
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
+}</code></pre>
+
+<pre><code class="lang-bash"># Verificar que realmente se sirve por H3 (no confiar en la config)
+curl -sI --http3 https://ejemplo.com | head -1
+# HTTP/3 200
+
+# Y desde el navegador, en la consola:
+performance.getEntriesByType('navigation')[0].nextHopProtocol
+# 'h3'  |  'h2'  |  'http/1.1'</code></pre>
+
+<div class="tip">
+  Esa última línea es la verificación que va en tu checklist de deploy. Que el bloque de nginx diga <code>quic</code> no prueba nada: entre tu config y el usuario hay un balanceador, un WAF y quizás un CDN, y cualquiera de los tres puede estar terminando en H2 sin avisar.
+</div>
+
+<h2>FS3.5 Caché HTTP en serio: la única optimización que hace cero viajes</h2>
+
+<p>Todo lo anterior mejora el costo de un viaje. La caché es la única técnica que lo elimina. Y sin embargo es donde más se improvisa, porque los nombres de las directivas son engañosos.</p>
+
+<table>
+<thead><tr><th>Directiva</th><th>Qué hace <em>de verdad</em></th></tr></thead>
+<tbody>
+<tr><td><code>max-age=N</code></td><td>Fresco durante N segundos en cualquier caché. Después, revalidación.</td></tr>
+<tr><td><code>s-maxage=N</code></td><td>Igual, pero <strong>solo para cachés compartidas</strong> (CDN, proxy). Pisa a <code>max-age</code> ahí. Te deja poner 1 hora en el CDN y 60 s en el navegador.</td></tr>
+<tr><td><code>immutable</code></td><td>"No revalides nunca mientras esté fresco, ni siquiera si el usuario recarga." Sin esto, F5 dispara un condicional por cada asset.</td></tr>
+<tr><td><code>no-cache</code></td><td><strong>Sí guarda</strong>, pero revalida en cada uso. Es <code>max-age=0, must-revalidate</code> en la práctica.</td></tr>
+<tr><td><code>no-store</code></td><td>No guarda nada, en ningún lado. Para respuestas con datos sensibles.</td></tr>
+<tr><td><code>private</code></td><td>Solo el navegador puede guardarla; el CDN no. Para HTML personalizado.</td></tr>
+<tr><td><code>stale-while-revalidate=N</code></td><td>Podés servir la copia vencida durante N segundos mientras revalidás en segundo plano. Latencia de caché con frescura de red.</td></tr>
+<tr><td><code>stale-if-error=N</code></td><td>Si el origen devuelve 5xx o no responde, seguí sirviendo lo viejo N segundos. Es un fusible de disponibilidad gratis.</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ <code>no-cache</code> NO es <code>no-store</code>.</strong> Es la confusión más cara de esta sección, y va en las dos direcciones. Poner <code>no-cache</code> creyendo que protegés datos sensibles: los estás guardando en disco. Poner <code>no-store</code> en el HTML creyendo que garantizás frescura: perdiste el <em>back/forward cache</em>, las navegaciones hacia atrás dejan de ser instantáneas, y regalaste una métrica entera.
+</div>
+
+<h3>Revalidar no es gratis</h3>
+
+<p>Cuando un recurso vence, el navegador manda un condicional con <code>If-None-Match</code> (contra el <code>ETag</code>) o <code>If-Modified-Since</code>. Si nada cambió, el servidor responde <code>304 Not Modified</code> sin cuerpo. Eso se suele describir como "no descarga nada", y es cierto — pero <strong>igual gastaste un RTT completo</strong>. A 120 ms, treinta assets revalidando en paralelo sobre una conexión ya abierta te cuestan unos 150 ms; sobre una conexión fría, medio segundo.</p>
+
+<pre><code class="lang-bash"># Ver el ciclo completo de revalidacion
+curl -sI https://ejemplo.com/app.js | grep -iE 'etag|cache-control|last-modified'
+# cache-control: public, max-age=600
+# etag: "a3f91c-4d2"
+
+# Segunda vuelta, condicional:
+curl -sI -H 'If-None-Match: "a3f91c-4d2"' https://ejemplo.com/app.js | head -1
+# HTTP/2 304
+# Cuerpo: 0 bytes. Tiempo: un RTT completo igual.</code></pre>
+
+<h3>La estrategia que resuelve el 90% de los casos</h3>
+
+<div class="rule">
+  <strong>📌 Dos niveles, y nada más.</strong><br>
+  <strong>(1) Assets con hash en el nombre</strong> (<code>app.4f2a9c.js</code>): <code>Cache-Control: public, max-age=31536000, immutable</code>. Un año, sin revalidar jamás. Es seguro porque si el contenido cambia, <em>cambia el nombre</em>: nunca vas a servir un archivo viejo bajo un nombre nuevo.<br>
+  <strong>(2) El HTML</strong>: <code>Cache-Control: no-cache</code> (o <code>max-age=0, must-revalidate</code>). El HTML es el índice que apunta a los nombres con hash: tiene que ser fresco siempre, pero cuesta un solo 304.
+</div>
+
+<pre><code class="lang-nginx"># La configuracion completa de esa estrategia
+location ~* "\.[0-9a-f]{8,}\.(js|css|woff2|avif|webp|png|svg)$" {
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    access_log off;
+}
+
+location = /index.html {
+    # se guarda, pero se revalida siempre: un 304 y listo
+    add_header Cache-Control "no-cache";
+}
+
+location /api/ {
+    # fresco 60 s; hasta 10 min podes servir viejo mientras revalidas;
+    # y si el origen se cae, seguis sirviendo viejo 1 dia
+    add_header Cache-Control "public, max-age=60, stale-while-revalidate=600, stale-if-error=86400";
+}</code></pre>
+
+<div class="mistake">
+  <strong>Cache busting con querystring (<code>app.js?v=7</code>) es la versión inferior de la misma idea.</strong> Algunos proxies e intermediarios no cachean URLs con query, la semántica de <code>immutable</code> queda rara, y los logs y métricas se te ensucian. <strong>Hasheá el nombre del archivo</strong>, que es lo que hacen Vite, Rollup, esbuild y webpack por defecto — y es exactamente por esto.
+</div>
+
+<div class="warn">
+  <strong>El asesino silencioso del hit ratio se llama <code>Vary</code>.</strong> <code>Vary: Accept-Encoding</code> es correcto y necesario. <code>Vary: User-Agent</code> multiplica tus entradas de caché por la cantidad de strings de user-agent que existen en el mundo — o sea, destruye la caché compartida. Si necesitás variar por dispositivo, usá los client hints (<code>Sec-CH-UA-Mobile</code>) y normalizá la cache key en el edge. Y revisá qué manda tu framework: más de uno agrega <code>Vary: Cookie</code> sin que se lo pidas.
+</div>
+
+<h3>Sobre <code>stale-while-revalidate</code> en 2026</h3>
+
+<div class="info">
+  Estado real del soporte: lo honran <strong>Chrome, Firefox y Edge</strong> a nivel de caché del navegador; <strong>Safari todavía no</strong>. Del lado de las cachés compartidas lo soportan Cloudflare, Fastly, Akamai, CloudFront y Vercel. En la práctica esto significa que <strong>el lugar donde SWR te rinde de verdad es el CDN</strong>: ahí beneficia a todos los visitantes sin importar el navegador, porque la lógica ocurre antes de que la respuesta salga del edge. Ponelo en los dos lados, pero no cuentes con el navegador para tu percentil de Safari.
+</div>
+
+<h2>FS3.6 CDN: qué hace de verdad (y qué no)</h2>
+
+<p>La descripción popular de un CDN —"guarda copias de tus archivos cerca del usuario"— se queda corta y hace que la gente lo use solo para imágenes. Lo que realmente hace, en orden de impacto:</p>
+
+<div class="step"><strong>1. Termina TLS cerca del usuario.</strong> Aunque el CDN no cachee <em>nada</em> y vaya al origen en cada request, los 3 RTT del handshake ahora son contra un PoP a 15 ms en vez de contra tu servidor a 140 ms. <strong>Eso solo ya suele ser la mitad de la ganancia</strong>, y explica por qué poner un CDN delante de una API dinámica mejora la latencia sin cachear una sola respuesta.</div>
+
+<div class="step"><strong>2. Mantiene conexiones tibias al origen.</strong> El tramo PoP→origen viaja por conexiones ya establecidas y con la ventana de congestión abierta. Sin CDN, cada usuario nuevo paga slow start desde cero.</div>
+
+<div class="step"><strong>3. Cachea.</strong> Lo obvio, y lo tercero en importancia.</div>
+
+<div class="step"><strong>4. Absorbe.</strong> Picos de tráfico, DDoS volumétricos, y el clásico "salimos en las noticias y el server se cayó".</div>
+
+<h3>La métrica es el cache hit ratio</h3>
+
+<p>Es <em>la</em> métrica del CDN, y hay que mirarla en dos formas: por peticiones y por bytes. Un 80% de hits por peticiones puede convivir con un 40% por bytes si lo que falla son justo los archivos grandes.</p>
+
+<table>
+<thead><tr><th>Hit ratio</th><th>Peticiones que llegan a tu origen (por cada 10.000)</th></tr></thead>
+<tbody>
+<tr><td>99%</td><td>100</td></tr>
+<tr><td>95%</td><td>500</td></tr>
+<tr><td>90%</td><td>1.000</td></tr>
+<tr><td>80%</td><td>2.000 — el doble de carga que con 90%</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Las cuatro causas de un hit ratio bajo</strong>, en orden de frecuencia: <strong>(1)</strong> querystrings que forman parte de la cache key sin necesidad (los <code>?utm_source=</code> fragmentan todo); <strong>(2)</strong> un <code>Vary</code> demasiado ancho; <strong>(3)</strong> cookies en las respuestas de assets, que hacen que el CDN las trate como privadas; <strong>(4)</strong> TTLs cortos por miedo. Las cuatro se arreglan normalizando la cache key en el edge y arreglando los headers del origen — casi nunca hace falta cambiar la aplicación.
+</div>
+
+<h3>Purga e invalidación</h3>
+
+<table>
+<thead><tr><th>Método</th><th>Cuándo usarlo</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><strong>Por URL exacta</strong></td><td>Corregiste un archivo puntual</td><td>Rápido; no escala a miles de URLs</td></tr>
+<tr><td><strong>Por tag / surrogate key</strong></td><td>Publicaste un artículo que aparece en 40 páginas</td><td>La forma correcta. Requiere que el origen emita <code>Surrogate-Key</code></td></tr>
+<tr><td><strong>Por prefijo o wildcard</strong></td><td>Cambió una sección entera</td><td>Puede tardar minutos y golpea el origen con la re-población</td></tr>
+<tr><td><strong>Purge all</strong></td><td>Emergencia</td><td>💣 El origen recibe todo el tráfico de golpe, sin caché. Es la forma clásica de convertir un bug de contenido en una caída</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Si aplicaste bien la estrategia de FS3.5, casi nunca vas a purgar.</strong> Los assets con hash no se purgan: se reemplazan por otros con nombre nuevo. Solo purgás HTML y respuestas de API. Cuando alguien te dice "purgamos todo el CDN cada deploy", lo que en realidad tenés es <em>un problema de nombres de archivo</em>.
+</div>
+
+<h2>FS3.7 Resource hints con criterio</h2>
+
+<p>Los <em>hints</em> le adelantan trabajo al navegador. Son la herramienta más fácil de usar mal de todo el módulo, porque agregar uno se siente gratis y no lo es.</p>
+
+<table>
+<thead><tr><th>Hint</th><th>Qué adelanta</th><th>Costo</th><th>Cuántos poner</th></tr></thead>
+<tbody>
+<tr><td><code>dns-prefetch</code></td><td>Solo la resolución DNS (~1 RTT)</td><td>Casi nulo</td><td>Hasta 4–6 sin culpa</td></tr>
+<tr><td><code>preconnect</code></td><td>DNS + TCP + TLS (~3 RTT)</td><td>Abre una conexión real que consume sockets y compite por ancho de banda</td><td><strong>2, como mucho 4</strong></td></tr>
+<tr><td><code>preload</code></td><td>Descarga <em>ya</em>, con prioridad alta</td><td>Bytes que le sacás a otra cosa</td><td><strong>1–3</strong>, solo para recursos críticos de descubrimiento tardío</td></tr>
+<tr><td><code>modulepreload</code></td><td>Descarga, parsea y compila el módulo ES <em>y su grafo</em></td><td>Como preload, más CPU adelantado</td><td>Los módulos de entrada del camino crítico</td></tr>
+<tr><td><code>prefetch</code></td><td>Descarga con prioridad mínima, para la <em>próxima</em> navegación</td><td>Bytes del usuario, quizás en vano</td><td>Solo cuando la navegación siguiente es muy probable</td></tr>
+<tr><td><code>fetchpriority</code></td><td>Reordena entre recursos del mismo tipo</td><td>Cero bytes extra: solo cambia el orden</td><td>Usalo — es el hint más barato que existe</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-html">&lt;!-- Bien: preconnect al origen del que sale el recurso del LCP --&gt;
+&lt;link rel="preconnect" href="https://cdn.midominio.com"&gt;
+&lt;link rel="preconnect" href="https://fonts.gstatic.com" crossorigin&gt;
+
+&lt;!-- Barato: para origenes secundarios que se usan mas tarde --&gt;
+&lt;link rel="dns-prefetch" href="https://analytics.ejemplo.com"&gt;
+
+&lt;!-- preload SOLO para lo que el parser descubre tarde.
+     La fuente esta referenciada dentro del CSS: sin esto,
+     el navegador se entera recien despues de descargar y parsear el CSS. --&gt;
+&lt;link rel="preload" href="/fuentes/inter-var.woff2" as="font"
+      type="font/woff2" crossorigin&gt;
+
+&lt;!-- La imagen del LCP: alta prioridad, y NUNCA lazy --&gt;
+&lt;img src="/hero-1440.avif" width="1440" height="810"
+     alt="Panel de control" fetchpriority="high" decoding="async"&gt;</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Tres errores de <code>preload</code> que aparecen en toda auditoría.</strong><br>
+  <strong>(1) Sin <code>as</code>:</strong> el navegador no sabe la prioridad ni el tipo, y muchas veces <strong>descarga el recurso dos veces</strong>. Duplicaste los bytes en nombre de la performance.<br>
+  <strong>(2) Fuentes sin <code>crossorigin</code>:</strong> las fuentes se piden en modo anónimo. Un preload sin <code>crossorigin</code> genera una petición distinta y la fuente <strong>se descarga dos veces</strong>.<br>
+  <strong>(3) Preload de algo que no se usa en los primeros segundos:</strong> Chrome te lo avisa por consola, y con razón: gastaste ancho de banda del camino crítico.
+</div>
+
+<h3>Por qué preloadear de más empeora las cosas</h3>
+
+<p>Este es el punto que separa "leí un artículo de performance" de "entendí el problema". El navegador tiene un planificador de prioridades bastante bueno: sabe que el CSS bloquea el render, que un script <code>async</code> no, que una imagen fuera del viewport puede esperar. <code>preload</code> pasa por encima de ese planificador y pone tu recurso adelante.</p>
+
+<div class="concept">
+  <strong>💡 El ancho de banda es un recurso de suma cero.</strong> En una conexión 4G efectiva de ~1,6 Mbps entran unos <strong>200 KB por segundo</strong>. Si preloadeás 12 recursos que suman 400 KB, esos 400 KB pasan al frente de la fila — y los 2 segundos que tardan son 2 segundos que <em>no</em> está descargando la imagen del LCP. El resultado medido es un LCP peor con más hints. Preload no crea ancho de banda: <strong>redistribuye el que hay</strong>, y redistribuir mal es más fácil que redistribuir bien.
+</div>
+
+<div class="rule">
+  <strong>📌 La regla operativa:</strong> <code>preload</code> solo si el recurso cumple las dos condiciones. <strong>(a)</strong> Es crítico para el primer render, y <strong>(b)</strong> el navegador lo descubre tarde (está referenciado desde CSS, o lo inyecta JavaScript). Si el recurso ya está como <code>&lt;img&gt;</code> o <code>&lt;script&gt;</code> en el HTML inicial, el preload scanner ya lo encontró: tu preload no adelanta nada y sí desordena prioridades. Para esos casos, <code>fetchpriority</code>.
+</div>
+
+<h3>Lo que reemplazó a <code>prefetch</code> para navegaciones</h3>
+
+<p>La <strong>Speculation Rules API</strong> hace lo que <code>&lt;link rel="prefetch"&gt;</code> nunca terminó de hacer bien: precargar o incluso <em>prerenderizar</em> la próxima página, con patrones de URL y niveles de "ansiedad" configurables. Está en Chrome y Edge; Firefox y Safari todavía no la implementaron.</p>
+
+<pre><code class="lang-html">&lt;script type="speculationrules"&gt;
+{
+  "prerender": [{
+    "where": { "href_matches": "/producto/*" },
+    "eagerness": "moderate"
+  }],
+  "prefetch": [{
+    "where": { "href_matches": "/*" },
+    "eagerness": "conservative"
+  }]
+}
+&lt;/script&gt;</code></pre>
+
+<table>
+<thead><tr><th><code>eagerness</code></th><th>Cuándo dispara</th><th>Riesgo de desperdicio</th></tr></thead>
+<tbody>
+<tr><td><code>immediate</code></td><td>Apenas se parsea la regla</td><td>Alto — puede bajar páginas que nadie visita</td></tr>
+<tr><td><code>eager</code></td><td>Casi enseguida, con algo de filtro</td><td>Alto</td></tr>
+<tr><td><code>moderate</code></td><td>Al pasar el mouse ~200 ms sobre el link</td><td>Bajo. <strong>El default sensato.</strong></td></tr>
+<tr><td><code>conservative</code></td><td>Al apretar el botón del mouse</td><td>Mínimo, y aun así gana ~100 ms</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El costo del prerender es que la página se ejecuta de verdad.</strong> Corre tu JavaScript, dispara tus analytics y puede ejecutar efectos secundarios en páginas que el usuario nunca va a ver. Hay que blindarlo con la <code>Prerender2</code> API (<code>document.prerendering</code> y el evento <code>prerenderingchange</code>) para no contar visitas fantasma ni disparar mutaciones. En Chrome 144 (enero de 2026) apareció <em>prerender until script</em>, que baja el HTML y precarga CSS, imágenes y fuentes pero <strong>frena en el primer script bloqueante</strong>: te da casi toda la ganancia sin los efectos secundarios. Si prerenderizás, esa es hoy la opción por defecto.
+</div>
+
+<div class="info">
+  <strong><code>fetchpriority</code> en 2026:</strong> soportado en Chrome/Edge desde 102, Safari desde 17.2 y Firefox desde octubre de 2024. Se proyecta que alcance Baseline "widely available" recién en <strong>abril de 2027</strong>, así que todavía hay una cola de navegadores viejos que lo ignora. No importa: es una <em>pista</em>, y si no se soporta simplemente no pasa nada. Es de las poquísimas optimizaciones sin downside.
+</div>
+
+<h2>FS3.8 Compresión: gzip, brotli y zstd</h2>
+
+<table>
+<thead><tr><th>Algoritmo</th><th>Ratio en texto</th><th>Velocidad de descompresión</th><th>Soporte</th></tr></thead>
+<tbody>
+<tr><td><strong>gzip</strong></td><td>Base</td><td>Muy rápida</td><td>Universal, incluso en clientes prehistóricos</td></tr>
+<tr><td><strong>brotli</strong> (<code>br</code>)</td><td>15–25% mejor que gzip en nivel 11</td><td>Rápida (algo menos que gzip)</td><td>Todos los navegadores modernos, solo sobre HTTPS</td></tr>
+<tr><td><strong>zstd</strong></td><td>Similar a brotli en niveles medios</td><td><strong>La más rápida de las tres</strong></td><td>Chrome/Edge 123+, Firefox 126+, Opera 109+, <strong>Safari 26+</strong>. Chrome solo lo anuncia sobre HTTPS</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Corrección respecto de lo que se decía hasta hace poco:</strong> zstd dejó de ser "cosa de Chromium". Con <strong>Safari 26</strong> pasó a estar en los cuatro motores principales, aunque siguen faltando algunos navegadores móviles minoritarios. En la práctica, si servís los tres (<code>zstd</code>, <code>br</code>, <code>gzip</code>) y dejás que el <code>Accept-Encoding</code> decida, no tenés que elegir.
+</div>
+
+<h3>Estática vs on-the-fly: la distinción que importa</h3>
+
+<div class="rule">
+  <strong>📌 Comprimí fuerte una vez en el build, no flojo un millón de veces en producción.</strong> Brotli nivel 11 puede tardar <em>segundos</em> por archivo — perfecto para CI, catastrófico por request. La regla: <strong>estáticos → precomprimidos al máximo nivel en el build; respuestas dinámicas → nivel medio en caliente</strong> (brotli 4–5 o gzip 6), que da la mayor parte del beneficio a una fracción del CPU.
+</div>
+
+<pre><code class="lang-bash"># En el build: comprimir al maximo, una sola vez
+find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.svg' -o -name '*.json' \) \
+  -exec brotli --best --keep {} \; \
+  -exec zstd -19 --keep --quiet {} \; \
+  -exec gzip  -9 --keep {} \;
+
+# Comparar lo que ganaste de verdad, en bytes
+ls -l dist/app.js dist/app.js.gz dist/app.js.br dist/app.js.zst
+# app.js       312400   (305 KB)
+# app.js.gz     97800   (95 KB)   -&gt; gzip -9
+# app.js.br     81200   (79 KB)   -&gt; brotli 11:  -17% vs gzip
+# app.js.zst    83900   (82 KB)   -&gt; zstd 19
+#
+# 16 KB menos que gzip. En un enlace 4G de ~200 KB/s: ~80 ms.
+# No es enorme, pero es gratis y aplica a TODOS los usuarios, siempre.</code></pre>
+
+<pre><code class="lang-nginx"># nginx: servir lo precomprimido, comprimir en caliente solo lo dinamico
+brotli_static on;      # sirve app.js.br si existe
+gzip_static   on;      # sirve app.js.gz si existe
+
+brotli        on;      # on-the-fly, para respuestas generadas
+brotli_comp_level 5;   # NO 11: seria quemar CPU por request
+brotli_types  text/html text/css application/javascript application/json image/svg+xml;
+brotli_min_length 1024;   # por debajo de 1 KB no compensa
+
+gzip_vary on;   # emite Vary: Accept-Encoding — imprescindible con CDN</code></pre>
+
+<div class="mistake">
+  <strong>Lo que NO hay que comprimir.</strong> JPEG, PNG, WebP, AVIF, MP4, ZIP y <code>woff2</code> ya están comprimidos — <code>woff2</code> literalmente lleva brotli adentro. Volver a comprimirlos gasta CPU, no ahorra bytes y a veces <strong>agranda</strong> la respuesta unos bytes. Revisá tu lista de <code>_types</code>: es habitual encontrar <code>image/png</code> ahí adentro por copiar y pegar una config de internet.
+</div>
+
+<div class="warn">
+  <strong>El costo de seguridad: BREACH.</strong> Comprimir una respuesta que mezcla un secreto (un token CSRF) con contenido que el atacante controla (un parámetro reflejado) permite deducir el secreto midiendo el tamaño comprimido. La mitigación no es apagar la compresión: es <strong>no reflejar entrada del usuario en respuestas que contienen secretos</strong>, y agregar un padding aleatorio o rotar el token por request. Aparece sobre todo en APIs y en HTML server-rendered con formularios.
+</div>
+
+<h2>FS3.9 Imágenes y media: el bug de performance más común que existe</h2>
+
+<p>Si tuviera que apostar a ciegas cuál es el problema de red de un sitio que nunca vi, apostaría a <strong>una imagen mal dimensionada</strong>. No mal comprimida: mal <em>dimensionada</em>. Un hero de 3000 px de ancho servido dentro de una caja de 720 px, en una pantalla de 1× que va a descartar el 94% de los píxeles que acaba de bajar.</p>
+
+<table>
+<thead><tr><th>Formato</th><th>Tamaño relativo</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><strong>JPEG</strong></td><td>Base (100%)</td><td>Ninguno. Funciona en todos lados.</td></tr>
+<tr><td><strong>WebP</strong></td><td>~70% del JPEG a calidad similar</td><td>Prácticamente ninguno hoy</td></tr>
+<tr><td><strong>AVIF</strong></td><td>~50% del JPEG, ~70% del WebP</td><td>Codificación <strong>lenta</strong> (segundos por imagen en efforts altos) y decodificación más costosa en gama baja</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-html">&lt;!-- El patron completo: formatos modernos + densidades + slot correcto --&gt;
+&lt;picture&gt;
+  &lt;source type="image/avif"
+          srcset="/hero-720.avif 720w, /hero-1440.avif 1440w, /hero-2160.avif 2160w"
+          sizes="(max-width: 700px) 100vw, 720px"&gt;
+  &lt;source type="image/webp"
+          srcset="/hero-720.webp 720w, /hero-1440.webp 1440w"
+          sizes="(max-width: 700px) 100vw, 720px"&gt;
+  &lt;img src="/hero-1440.jpg"
+       width="1440" height="810"
+       alt="Panel de control con tres graficos de uso mensual"
+       fetchpriority="high"
+       decoding="async"&gt;
+&lt;/picture&gt;</code></pre>
+
+<div class="concept">
+  <strong>💡 <code>sizes</code> es la parte que todo el mundo arruina.</strong> <code>srcset</code> dice <em>qué archivos existen y cuánto miden</em>; <code>sizes</code> dice <em>qué ancho va a ocupar la imagen en el layout</em>. El navegador elige el candidato <strong>antes de aplicar el CSS</strong>, así que no puede deducirlo solo: si mentís en <code>sizes</code>, elige mal, y la mentira típica es dejar el default (<code>100vw</code>) en una imagen que en escritorio ocupa 400 px. Resultado: bajás la versión de 2160 px para una caja de 400. Todo el trabajo de AVIF tirado por un atributo.
+</div>
+
+<div class="rule">
+  <strong>📌 Reglas de imagen que no se negocian:</strong><br>
+  • <code>width</code> y <code>height</code> siempre (o <code>aspect-ratio</code> en CSS) — reserva el espacio y evita el salto de layout (CLS, tema de FS4).<br>
+  • <code>loading="lazy"</code> en todo lo que está fuera del viewport inicial — y <strong>jamás</strong> en la imagen del LCP: retrasa su descubrimiento y te empeora justo la métrica que mirás.<br>
+  • <code>fetchpriority="high"</code> en la imagen del LCP, que arranca con prioridad baja por defecto porque el navegador todavía no sabe que es la principal.<br>
+  • La imagen del LCP va como <code>&lt;img&gt;</code> en el HTML, <strong>nunca como <code>background-image</code></strong>: un background solo se descubre después de descargar y parsear el CSS, y eso son cientos de milisegundos de retraso puro.
+</div>
+
+<pre><code class="lang-bash"># Auditar el desperdicio real, sin herramientas: lo que se bajo vs lo que se uso
+# (pegar en la consola del navegador, con la pagina ya cargada)
+[...document.images]
+  .filter(function (img) { return img.naturalWidth &gt; img.clientWidth * devicePixelRatio * 1.3; })
+  .map(function (img) {
+    return {
+      src: img.currentSrc.split('/').pop(),
+      bajada: img.naturalWidth + 'px',
+      usada: Math.round(img.clientWidth * devicePixelRatio) + 'px',
+      desperdicio: Math.round(100 - (img.clientWidth * devicePixelRatio / img.naturalWidth) * 100) + '%'
+    };
+  })
+// Cada fila con 60% o mas de desperdicio es ancho de banda que tiraste.</code></pre>
+
+<div class="tip">
+  Para video: <code>preload="none"</code> o <code>preload="metadata"</code> por defecto (un <code>preload="auto"</code> puede bajar decenas de megabytes que nadie va a mirar), un <code>poster</code> liviano en AVIF, y HLS/DASH si el video pasa del minuto. Un <code>&lt;video autoplay muted loop&gt;</code> de fondo es, en la práctica, la imagen mal dimensionada de FS3.9 multiplicada por treinta.
+</div>
+
+<h2>FS3.10 El Service Worker como proxy de red</h2>
+
+<p>Un Service Worker es JavaScript que se interpone entre tu página y la red. Cada petición pasa por su evento <code>fetch</code> y él decide: sirvo de caché, voy a la red, o invento una respuesta. Es la herramienta de red más poderosa del navegador y, por lejos, la que más incidentes de producción genera.</p>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Comportamiento</th><th>Buena para</th><th>Riesgo</th></tr></thead>
+<tbody>
+<tr><td><strong>cache-first</strong></td><td>Si está en caché, ni toca la red</td><td>Assets con hash, fuentes</td><td>Contenido viejo eterno si la aplicás a lo que cambia</td></tr>
+<tr><td><strong>network-first</strong></td><td>Red, y caché solo si la red falla</td><td>HTML, respuestas de API</td><td>No gana latencia; en red lenta, empeora sin timeout</td></tr>
+<tr><td><strong>stale-while-revalidate</strong></td><td>Sirve la caché ya y actualiza atrás</td><td>Avatares, listados, contenido semi-estático</td><td>El usuario ve una versión de atraso</td></tr>
+<tr><td><strong>cache-only</strong></td><td>Solo caché</td><td>El shell de una app offline</td><td>Falla duro si no precacheaste bien</td></tr>
+<tr><td><strong>network-only</strong></td><td>Solo red</td><td>Analytics, pagos, cualquier cosa con efectos</td><td>Ninguno — es el default correcto para lo dudoso</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-javascript">// sw.js — un proxy de red que TENES que poder apagar
+const VERSION = 'v7';
+const CACHE_ESTATICOS = 'estaticos-' + VERSION;
+
+self.addEventListener('fetch', function (evento) {
+  const req = evento.request;
+
+  // 1. Nunca interceptar nada que no sea GET: los POST tienen efectos.
+  if (req.method !== 'GET') return;
+
+  const url = new URL(req.url);
+
+  // 2. Assets con hash -&gt; cache-first. Son inmutables por construccion.
+  if (/\.[0-9a-f]{8,}\.(js|css|woff2|avif|webp)$/.test(url.pathname)) {
+    evento.respondWith(
+      caches.match(req).then(function (hit) {
+        return hit || fetch(req).then(function (res) {
+          const copia = res.clone();
+          caches.open(CACHE_ESTATICOS).then(function (c) { c.put(req, copia); });
+          return res;
+        });
+      })
+    );
+    return;
+  }
+
+  // 3. Navegaciones (HTML) -&gt; network-first CON TIMEOUT.
+  //    Sin el timeout, una red que responde en 20 s deja al usuario mirando el vacio.
+  if (req.mode === 'navigate') {
+    evento.respondWith(
+      Promise.race([
+        fetch(req),
+        new Promise(function (resolver) {
+          setTimeout(function () { resolver(caches.match('/offline.html')); }, 3000);
+        })
+      ]).catch(function () { return caches.match('/offline.html'); })
+    );
+    return;
+  }
+
+  // 4. Todo lo demas: red directa. Ante la duda, NO interceptar.
+});</code></pre>
+
+<h3>Actualizar un Service Worker sin romperle la sesión a nadie</h3>
+
+<p>El ciclo de vida es <code>install → waiting → activate</code>. Un SW nuevo se instala pero se queda <em>esperando</em> mientras haya pestañas usando el viejo. Podés saltear esa espera con <code>skipWaiting()</code> y <code>clients.claim()</code>, y ahí es donde se rompen las cosas.</p>
+
+<div class="danger">
+  <strong>⚠️ El incidente clásico.</strong> Hacés <code>skipWaiting()</code> en un deploy. Un usuario tiene la pestaña abierta con el <code>app.a1b2c3.js</code> viejo. El SW nuevo activa, limpia la caché anterior, y cuando esa página pide un chunk perezoso que todavía no había cargado, el archivo ya no existe: <strong>404 en un chunk, pantalla en blanco, y en los logs no aparece nada raro</strong>. Es de los bugs más difíciles de reproducir porque solo le pasa a quien tenía la pestaña abierta durante el deploy.
+</div>
+
+<div class="rule">
+  <strong>📌 El patrón seguro:</strong> instalá el SW nuevo, dejalo en <code>waiting</code>, y <strong>avisale al usuario</strong> con un cartel de "hay una versión nueva, recargá". El <code>skipWaiting()</code> se dispara recién cuando él acepta. Y nunca borres la caché de la versión anterior en el <code>activate</code> inmediato: dejala una vuelta más, para que las pestañas viejas tengan de dónde sacar sus chunks.
+</div>
+
+<pre><code class="lang-javascript">// En la pagina: detectar la version nueva y dejar que el usuario decida
+navigator.serviceWorker.register('/sw.js').then(function (reg) {
+  reg.addEventListener('updatefound', function () {
+    const nuevo = reg.installing;
+    nuevo.addEventListener('statechange', function () {
+      if (nuevo.state === 'installed' &amp;&amp; navigator.serviceWorker.controller) {
+        mostrarCartel('Hay una version nueva disponible', function aceptar() {
+          nuevo.postMessage({ tipo: 'SKIP_WAITING' });   // el SW llama skipWaiting()
+        });
+      }
+    });
+  });
+});
+
+// Recargar una sola vez cuando el control cambia de manos
+let recargando = false;
+navigator.serviceWorker.addEventListener('controllerchange', function () {
+  if (recargando) return;
+  recargando = true;
+  location.reload();
+});</code></pre>
+
+<div class="warn">
+  <strong>El interruptor de emergencia es obligatorio.</strong> Antes de tu primer deploy con SW, escribí y probá el SW que se desinstala solo. Si alguna vez servís un SW roto con caché agresiva, es la <em>única</em> forma de recuperar a los usuarios ya afectados — no podés pedirle a nadie que vaya a las DevTools a hacer "Unregister". Y asegurate de que <code>/sw.js</code> salga con <code>Cache-Control: no-cache</code>: el navegador acota su caché a 24 horas como máximo, pero 24 horas de un SW roto son 24 horas de un sitio caído.
+</div>
+
+<pre><code class="lang-javascript">// sw.js de emergencia: desregistrarse y limpiar todo.
+// Deployalo bajo el MISMO path que el SW roto.
+self.addEventListener('install', function () { self.skipWaiting(); });
+
+self.addEventListener('activate', function (evento) {
+  evento.waitUntil(
+    caches.keys()
+      .then(function (nombres) {
+        return Promise.all(nombres.map(function (n) { return caches.delete(n); }));
+      })
+      .then(function () { return self.registration.unregister(); })
+      .then(function () { return self.clients.matchAll(); })
+      .then(function (clientes) {
+        clientes.forEach(function (c) { c.navigate(c.url); });
+      })
+  );
+});</code></pre>
+
+<h2>FS3.11 Cuándo NO optimizar la red</h2>
+
+<p>Todo lo de este módulo tiene un costo de mantenimiento: hints que se vuelven mentira cuando cambia el layout, reglas de CDN que nadie entiende dos años después, un Service Worker que es una superficie de bugs permanente. Hay escenarios donde la respuesta correcta es <strong>no tocar nada</strong>.</p>
+
+<div class="step"><strong>1. App interna en LAN.</strong> RTT de 1–3 ms y un gigabit de ancho de banda. Veinte viajes secuenciales cuestan 40 ms. Si esa app tarda 6 segundos en ser usable, <strong>el problema no está en la red</strong>: está en los 3 segundos de parse y ejecución de JavaScript (FS2) o en una query sin índice. Poner un CDN acá es teatro.</div>
+
+<div class="step"><strong>2. El perfil dice hilo principal.</strong> Si el problema es INP alto o long tasks, ningún <code>preconnect</code> te va a salvar. La interactividad no es un problema de bytes: es de CPU. Diagnóstico y tratamiento están en FS2 y FS4.</div>
+
+<div class="step"><strong>3. El TTFB es casi todo think time del servidor.</strong> Volvé al desglose de <code>curl</code> de FS3.2: si <code>ttfb − tls</code> son 900 ms y el RTT es 40 ms, tenés ~860 ms de backend. Ahí no hay compresión que ayude. <em>Matiz importante</em>: cachear el HTML en el edge sí lo arregla, porque saltea el backend entero — pero solo si el HTML no es personalizado.</div>
+
+<div class="step"><strong>4. El sitio ya carga en menos de un segundo en el percentil 75.</strong> Optimizar de 900 a 800 ms no cambia ninguna métrica de negocio, y cada hint que agregás es deuda. Andá a arreglar otra cosa.</div>
+
+<div class="concept">
+  <strong>💡 El diagnóstico que ordena todo esto.</strong> Antes de tocar nada, partí el tiempo total en tres cubetas: <strong>(a)</strong> handshakes y viajes, <strong>(b)</strong> transferencia de bytes, <strong>(c)</strong> CPU (servidor y cliente). Optimizá la cubeta más grande. La causa raíz de casi todo el trabajo de performance desperdiciado es haber optimizado la segunda cuando el problema estaba en la primera o en la tercera.
+</div>
+
+<h2>🧑‍🎓 Worked Example — 4,2 s de LCP en 4G</h2>
+
+<blockquote>Un e-commerce mide 4,2 s de LCP en la vista de producto con throttling "Slow 4G" de DevTools (≈1,6 Mbps de bajada, 150 ms de RTT añadido) y CPU 4× más lenta. El equipo propone "comprimir mejor las imágenes". Vamos a mirar la cascada primero.</blockquote>
+
+<p><strong>Paso 1 — Capturar la cascada, no opinar.</strong></p>
+
+<pre><code class="lang-bash"># Local, reproducible, con la red emulada
+npx lighthouse https://tienda.ejemplo.com/producto/42 \
+  --preset=perf --throttling-method=simulate --output=json --output-path=./base.json
+
+# Y el desglose de conexion crudo, que Lighthouse no te muestra tan claro
+curl -sS -o /dev/null \
+  -w 'dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer}\n' \
+  https://tienda.ejemplo.com/producto/42</code></pre>
+
+<p><strong>Paso 2 — Leer la cascada.</strong> Los tiempos, en milisegundos desde el inicio de la navegación:</p>
+
+<pre><code class="lang-bash">   0     GET /producto/42                      (conexion ya tibia)
+ 620     primer byte del HTML                  &lt;- TTFB
+ 690     HTML completo (18 KB, brotli)
+ 700     GET /assets/main.a91f2c.css           mismo origen, conexion abierta
+ 700     GET https://widget-resenas.io/w.css   ORIGEN NUEVO: 3 RTT de handshake
+1140     main.css listo -&gt; empieza el layout
+1150     descubre la fuente: fonts.gstatic.com ORIGEN NUEVO: otros 3 RTT
+1160     w.css listo (bloqueaba el render)
+1620     fuente lista
+1680     descubre hero.jpg (esta en el CSS como background-image)
+4180     hero.jpg completo (1,8 MB, 3000 px de ancho)  &lt;- LCP 🔴</code></pre>
+
+<p><strong>Paso 3 — Nombrar las tres causas.</strong> La cascada las muestra sin ambigüedad:</p>
+
+<table>
+<thead><tr><th>#</th><th>Causa</th><th>Evidencia en la cascada</th><th>Costo estimado</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Sin <code>preconnect</code> al CDN de fuentes</td><td>La conexión a <code>fonts.gstatic.com</code> arranca recién en 1150, después de parsear el CSS</td><td>~450 ms de handshakes serializados</td></tr>
+<tr><td>2</td><td>Hero de 1,8 MB, 3000 px, y descubierto tarde por ser <code>background-image</code></td><td>Se descubre en 1680 y tarda 2500 ms en bajar</td><td>~2500 ms, la causa dominante</td></tr>
+<tr><td>3</td><td>CSS de terceros bloqueando el render</td><td><code>w.css</code> es render-blocking y encima compite por ancho de banda</td><td>~460 ms + los bytes robados al hero</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Fijate el orden de magnitud antes de elegir por dónde empezar.</strong> La causa 2 vale cinco veces más que la 1. El instinto de "agregamos preconnects" habría dado 250 ms sobre 4200: un 6%. Empezar por la imagen da diez veces más. <strong>El orden en que arreglás importa tanto como qué arreglás.</strong>
+</div>
+
+<p><strong>Paso 4 — Aplicar los cambios de a uno y medir cada uno por separado.</strong></p>
+
+<pre><code class="lang-html">&lt;!-- (a) preconnect a los dos origenes criticos, y solo a esos dos --&gt;
+&lt;link rel="preconnect" href="https://fonts.gstatic.com" crossorigin&gt;
+&lt;link rel="preconnect" href="https://cdn.tienda.ejemplo.com"&gt;
+
+&lt;!-- (b) el hero pasa de background CSS a &lt;img&gt; en el HTML,
+     en AVIF, al ancho que realmente ocupa, con prioridad alta --&gt;
+&lt;img src="/hero-1440.avif" width="1440" height="810"
+     alt="Zapatilla de running modelo Aura, vista lateral"
+     fetchpriority="high" decoding="async"&gt;
+
+&lt;!-- (c) el CSS del widget deja de bloquear el render --&gt;
+&lt;link rel="stylesheet" href="https://widget-resenas.io/w.css"
+      media="print" onload="this.media='all'"&gt;</code></pre>
+
+<table>
+<thead><tr><th>Cambio</th><th>LCP</th><th>Δ</th><th>Comentario</th></tr></thead>
+<tbody>
+<tr><td>Base</td><td>4200 ms</td><td>—</td><td></td></tr>
+<tr><td>(a) <code>preconnect</code> × 2</td><td>3950 ms</td><td><strong>−250 ms</strong></td><td>Los 3 RTT de fuentes ahora se solapan con la descarga del CSS</td></tr>
+<tr><td>(b) hero como <code>&lt;img&gt;</code> AVIF 1440 px + <code>fetchpriority</code></td><td>2380 ms</td><td><strong>−1570 ms</strong></td><td>1,8 MB → 172 KB, y se descubre 500 ms antes</td></tr>
+<tr><td>(c) CSS de terceros no bloqueante</td><td>2050 ms</td><td><strong>−330 ms</strong></td><td>Deja de bloquear y de robar ancho de banda</td></tr>
+<tr><td>(d) brotli 11 estático en CSS/JS</td><td>1980 ms</td><td><strong>−70 ms</strong></td><td>Chico pero gratis, y aplica a todas las páginas</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>1980 ms</strong></td><td><strong>−2220 ms (−53%)</strong></td><td></td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 5 — Y ahora la parte que casi nunca se publica: lo que NO funcionó.</strong></p>
+
+<table>
+<thead><tr><th>Cambio probado</th><th>Resultado</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Agregar <code>preload</code> a 8 recursos más</td><td><strong>+180 ms 🔴</strong></td><td>Los 8 se pusieron delante del hero en la cola. Suma cero: FS3.7</td></tr>
+<tr><td>Activar HTTP/3</td><td>−40 ms</td><td>El CDN ya tenía la conexión tibia; H3 brilla en conexiones frías y con pérdida</td></tr>
+<tr><td>Instalar un Service Worker</td><td>0 ms en la primera visita</td><td>El SW no existe todavía cuando el usuario llega por primera vez</td></tr>
+<tr><td><code>dns-prefetch</code> a 9 orígenes de terceros</td><td>±0 ms</td><td>Ninguno estaba en el camino crítico del LCP</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La lección del ejercicio.</strong> Cuatro de los ocho cambios probados no movieron la aguja y uno la empeoró. Si hubieran deployado todo junto —como se hace casi siempre— habrían visto "de 4200 a 2160" y se habrían llevado como conclusión que <em>los preloads ayudan</em>, que es exactamente lo contrario de lo que pasó. <strong>Medir de a un cambio por vez no es prolijidad: es la única forma de no acumular optimizaciones que en realidad son deuda.</strong>
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu jefe propone contratar el plan de internet del doble de velocidad para "acelerar el sitio". ¿Qué le decís?</summary>
+<p>Que el ancho de banda deja de ser el factor dominante por encima de unos 5 Mbps, y que lo que domina a partir de ahí es la <strong>latencia multiplicada por la cantidad de viajes secuenciales</strong>. Duplicar de 10 a 20 Mbps no cambia prácticamente nada porque el caño ya está subutilizado: el navegador pasa la mayor parte del tiempo <em>esperando</em>, no descargando. Lo que sí mueve la aguja es bajar el RTT (un CDN que termine TLS cerca del usuario) o eliminar viajes (caché agresiva con nombres hasheados, preconnect a los orígenes críticos, evitar cadenas de descubrimiento tardío). Y sobre todo: primero medir el desglose con <code>curl -w</code> o la pestaña Network para saber en cuál de las tres cubetas —viajes, bytes, CPU— está realmente el tiempo.</p></details>
+
+<details><summary>Tus bundles salen como <code>app.4f2a9c.js</code> con <code>Cache-Control: no-cache</code>. ¿Qué está mal y qué perdés?</summary>
+<p><code>no-cache</code> no significa "no guardar": el navegador guarda el archivo pero <strong>revalida en cada uso</strong>. Como el nombre ya lleva el hash del contenido, ese archivo es inmutable por construcción — su contenido no puede cambiar sin que cambie el nombre. Estás pagando un round trip por asset y por carga para confirmar algo que ya sabías. Con treinta assets a 120 ms de RTT eso son cientos de milisegundos regalados en cada visita, además de la carga de 304 en el origen. Lo correcto es <code>public, max-age=31536000, immutable</code>: cero peticiones y cero revalidaciones. El <code>immutable</code> además evita que un F5 dispare los condicionales igual. El <code>no-cache</code> va en el HTML, que es el índice que apunta a esos nombres.</p></details>
+
+<details><summary>Agregaste diez <code>preload</code> y el LCP empeoró 200 ms. ¿Por qué, y qué hacés en su lugar?</summary>
+<p>Porque <code>preload</code> no crea ancho de banda: reordena el que hay. En una conexión 4G efectiva entran ~200 KB por segundo, así que los recursos preloadeados se ponen delante de la imagen del LCP en la misma fila y le roban esos segundos. Encima pasás por encima del planificador de prioridades del navegador, que en general acierta. <code>preload</code> solo se justifica cuando el recurso cumple dos condiciones a la vez: es crítico para el primer render <em>y</em> el navegador lo descubre tarde (referenciado desde el CSS, o inyectado por JS) — el caso típico es una fuente. Si el recurso ya está como <code>&lt;img&gt;</code> o <code>&lt;script&gt;</code> en el HTML, el preload scanner ya lo encontró y lo que querés es <code>fetchpriority</code>, que reordena sin agregar bytes ni descargas.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>La latencia no se compra.</strong> Por encima de ~5 Mbps el ancho de banda deja de importar y manda el RTT × cantidad de viajes secuenciales. Tu trabajo es <em>contar viajes y borrarlos</em>.</li>
+  <li>Conectarse a un <strong>origen nuevo cuesta 3 RTT</strong> (DNS + TCP + TLS) antes de pedir un solo byte. Cada dominio de terceros paga ese peaje completo.</li>
+  <li><strong>HTTP/2</strong> multiplexó sobre una conexión y volvió contraproducentes al domain sharding y a los sprites. El <em>server push</em> se abandonó; lo reemplazó <code>103 Early Hints</code>.</li>
+  <li><strong>HTTP/3 sobre QUIC</strong> elimina el head-of-line blocking de TCP, hace el handshake en 1 RTT (0 con resumption) y sobrevive al cambio de Wi-Fi a móvil. Lo soporta ~93% de los usuarios y ~34% del top 10M de sitios; donde más gana es en móvil y en redes con pérdida.</li>
+  <li><strong>La caché es la única técnica que hace cero viajes.</strong> Dos niveles: assets hasheados con <code>max-age=31536000, immutable</code>, HTML con <code>no-cache</code>. Y <code>no-cache</code> ≠ <code>no-store</code>.</li>
+  <li>Del <strong>CDN</strong>, lo primero que te da no es la caché: es terminar TLS cerca del usuario. La métrica que importa es el <em>hit ratio</em>, y lo que lo destruye son las querystrings, el <code>Vary</code> ancho y las cookies en los assets.</li>
+  <li><strong>Los hints tienen costo.</strong> <code>preconnect</code>: 2, máximo 4. <code>preload</code>: 1–3, solo para lo crítico y de descubrimiento tardío. <code>fetchpriority</code> es el único gratis. Preloadear de más <strong>empeora</strong> el LCP.</li>
+  <li><strong>Comprimí fuerte una vez</strong> en el build (brotli 11 / zstd 19) y flojo en caliente (nivel 4–6). zstd ya está en los cuatro motores desde Safari 26. No comprimas lo que ya está comprimido.</li>
+  <li><strong>La imagen mal dimensionada es el bug de red más común que existe.</strong> AVIF + <code>srcset</code>/<code>sizes</code> correctos + <code>width</code>/<code>height</code> + <code>fetchpriority="high"</code> en el LCP, y nunca <code>lazy</code> ni <code>background-image</code> en esa imagen.</li>
+  <li>El <strong>Service Worker</strong> es un proxy programable y un generador de incidentes. Nunca interceptes lo que no sea <code>GET</code>, dejá que el usuario decida la actualización, y tené escrito el SW de emergencia <em>antes</em> del primer deploy.</li>
+  <li><strong>No optimices la red</strong> si la app corre en LAN, si el perfil dice hilo principal, o si el TTFB es casi todo think time del backend.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Corré el <code>curl -w</code> de FS3.2 contra tres sitios: uno tuyo, uno con CDN global conocido y uno alojado en otro continente sin CDN. Armá una tabla con dns/tcp/tls/ttfb y calculá qué porcentaje del TTFB son handshakes y qué porcentaje es think time del servidor.</li>
+  <li>Verificá con <code>performance.getEntriesByType('navigation')[0].nextHopProtocol</code> qué protocolo usan realmente cinco sitios que visitás a diario. ¿Cuántos sirven H3? Contrastá tu resultado con el ~34% del top 10M y explicá la diferencia según la muestra que elegiste.</li>
+  <li>Auditá los headers de caché de un sitio real: pedí con <code>curl -sI</code> el HTML y tres assets, y clasificá cada respuesta según la estrategia de dos niveles de FS3.5. ¿Cuántos assets con hash están revalidando sin necesidad?</li>
+  <li>Pegá el snippet de auditoría de imágenes de FS3.9 en la consola de tres sitios de e-commerce. Calculá los kilobytes desperdiciados por página y traducilos a segundos sobre un enlace de 200 KB/s.</li>
+  <li>Tomá una página tuya y agregá deliberadamente ocho <code>preload</code> innecesarios. Medí el LCP antes y después con throttling "Slow 4G", tres corridas de cada una, y reportá la mediana. Reproducí el resultado del Worked Example con tus propios números.</li>
+  <li>Precomprimí tu carpeta <code>dist/</code> con gzip -9, brotli -11 y zstd -19. Armá la tabla de bytes por algoritmo y calculá el ahorro en milisegundos a 200 KB/s. ¿Justifica la complejidad de servir tres encodings?</li>
+  <li>Escribí el Service Worker de emergencia de FS3.10, registralo en un proyecto de prueba junto con uno normal, y comprobá en DevTools → Application que efectivamente se desregistra y limpia las cachés. Hacelo <strong>antes</strong> de necesitarlo.</li>
+  <li>Elegí un sitio lento y clasificá su tiempo total en las tres cubetas de FS3.11 (viajes, bytes, CPU). Escribí en tres líneas cuál atacarías primero y cuánto esperás ganar — después medilo y compará tu predicción con el resultado.</li>
+</ol>
+
+<section class="quiz" id="quizFS3">
+  <style>
+    #quizFS3{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizFS3 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizFS3 .q{margin-bottom:1.5rem}
+    #quizFS3 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizFS3 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizFS3 .opt:hover{border-color:var(--accent)}
+    #quizFS3 .opt:disabled{cursor:default}
+    #quizFS3 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizFS3 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizFS3 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizFS3 .exp.show{display:block}
+    #quizFS3 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tus bundles salen con nombre hasheado (<code>app.4f2a9c.js</code>) y el header <code>Cache-Control: no-cache</code>. ¿Qué está ocurriendo?</p>
+    <button class="opt">Nada malo: <code>no-cache</code> impide guardarlos, así que siempre están frescos</button>
+    <button class="opt">Es la configuración correcta para archivos con hash en el nombre</button>
+    <button class="opt">Se guardan, pero el navegador revalida en cada carga: pagás un round trip por asset que el hash ya volvía innecesario</button>
+    <div class="exp"><code>no-cache</code> no es <code>no-store</code>: el archivo se guarda, pero se revalida siempre. Como el hash garantiza que el contenido no puede cambiar sin cambiar el nombre, esa revalidación no aporta nada y cuesta un RTT completo por asset — el <code>304</code> no trae cuerpo, pero el viaje se paga igual. Lo correcto es <code>public, max-age=31536000, immutable</code> para los assets hasheados y <code>no-cache</code> únicamente para el HTML.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. En una red móvil con 2% de pérdida de paquetes, un sitio sobre HTTP/2 rinde <em>peor</em> que el mismo sitio sobre HTTP/1.1 con seis conexiones. ¿Cuál es la explicación?</p>
+    <button class="opt">HTTP/2 multiplexa todo sobre una sola conexión TCP, y TCP entrega en orden: un paquete perdido frena la entrega de <em>todos</em> los streams</button>
+    <button class="opt">Porque HTTP/2 no comprime los headers y en redes lentas ese overhead pesa</button>
+    <button class="opt">Porque HTTP/2 desactiva la caché del navegador para los recursos multiplexados</button>
+    <div class="exp">Es el head-of-line blocking a nivel de transporte. HTTP/2 resolvió el bloqueo a nivel HTTP, pero TCP sigue garantizando entrega en orden, así que un hueco retiene todo lo que llegó después — para todos los streams a la vez. Con seis conexiones HTTP/1.1, una pérdida solo frena un sexto del tráfico. Exactamente por esto existe HTTP/3: QUIC conoce los streams y aísla la pérdida al stream afectado. (De paso: HTTP/2 sí comprime headers, con HPACK, y no toca la caché.)</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Agregaste <code>&lt;link rel="preload"&gt;</code> a doce recursos y el LCP empeoró 200 ms en 4G. ¿Cuál es la explicación más probable?</p>
+    <button class="opt">Los <code>preload</code> solo funcionan sobre HTTP/3 y el sitio está sirviendo HTTP/2</button>
+    <button class="opt"><code>preload</code> no crea ancho de banda: adelantó doce descargas que ahora compiten con la imagen del LCP por el mismo caño</button>
+    <button class="opt">Los <code>preload</code> se ignoran por completo si no llevan el atributo <code>crossorigin</code></button>
+    <div class="exp">El ancho de banda es de suma cero. En un 4G efectivo entran unos 200 KB por segundo; los recursos preloadeados se ponen adelante en esa misma fila y le roban tiempo al recurso del LCP. Encima pasás por encima del planificador de prioridades del navegador, que suele acertar. <code>preload</code> se justifica solo si el recurso es crítico <em>y</em> de descubrimiento tardío (una fuente referenciada desde el CSS, por ejemplo). Para reordenar sin agregar descargas, la herramienta es <code>fetchpriority</code>. El <code>crossorigin</code> importa —sin él una fuente se baja dos veces— pero no anula el preload.</div>
+  </div>
+
+  <div class="score" id="scoreFS3"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizFS3');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreFS3').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con FS4.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../fs2-motor-javascript/lecture.html">← FS2: El motor de JavaScript</a>
+  <a href="../fs4-web-vitals/lecture.html">FS4: Web Vitals →</a>
+</nav>
+
+</div>
+</body>
+</html>

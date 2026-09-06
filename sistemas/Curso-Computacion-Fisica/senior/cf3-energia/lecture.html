@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CF3 — Energía: diseñar para que dure cinco años con una pila · Computación Física Senior</title>
+  <meta name="description" content="Presupuesto energético, corriente media vs pico, químicas de batería y autodescarga, modos de bajo consumo de MCUs 2026, duty cycling, el costo real de la radio, medición con analizador de corriente, ladrones de batería, LDO vs switching y energy harvesting.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física Senior</a>
+  <a href="../../index.html">⚡ Curso de Computación Física</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CF3</span>
+  <span class="badge">⏱ 55–115 min</span>
+  <span class="badge">🎯 Pre-req: E00–E05 · CF1 · CF2</span>
+  <span class="badge">🔋 Autonomía</span>
+</div>
+
+<article>
+
+<h1>CF3 — Energía: diseñar para que dure cinco años con una pila</h1>
+
+<h2>CF3.0 Por qué este módulo</h2>
+
+<p>Hay una clase de proyecto embebido que se hace o no se hace en la primera semana: el que tiene que funcionar años sin que nadie lo toque. Un sensor de nivel en un tanque enterrado, un contador de agua, un rastreador de ganado, un detector de humo. En todos ellos la especificación no dice "que ande": dice <strong>cuántos años</strong> tiene que andar con una pila que ya está elegida y con un gabinete que ya está moldeado.</p>
+
+<p>Y ahí es donde se rompen los proyectos. Porque la autonomía no es una propiedad que se le agregue al firmware al final, cuando ya funciona todo. Es una <strong>restricción de arquitectura</strong>, del mismo orden que la memoria disponible o el tiempo de respuesta que viste en CF1. Se decide cuando elegís el SoC, la radio, el regulador y el período de muestreo — y cada una de esas cuatro decisiones puede, sola, tirar abajo el objetivo por un factor de diez.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El consumo de un equipo de campo casi nunca lo domina lo que hace: lo domina <strong>lo que le pasa mientras no hace nada</strong>. Un nodo que reporta una vez por minuto está despierto el 0,04 % del tiempo. El otro 99,96 % es donde se define si dura tres semanas o cinco años. Y la única herramienta que convierte esa intuición en decisiones es el <strong>presupuesto energético</strong>: una tabla de corriente por tiempo que se arma en el día uno y se corrige con mediciones, no con datasheets.
+</div>
+
+<p>En <a href="../../e00-fundamentos-electricos/lecture.html">E00</a> viste la ley de Ohm y la potencia como fundamentos. Acá esos mismos fundamentos se vuelven una herramienta de diseño: vas a aprender a escribir el presupuesto, a leer un perfil de corriente real, a reconocer los diez componentes que se roban la batería y a saber cuándo toda esta disciplina es tiempo perdido — porque también existe ese caso, y es más común de lo que parece.</p>
+
+<h2>CF3.1 El presupuesto energético: la única cuenta que importa</h2>
+
+<p>Empecemos por desarmar una confusión que arrastra medio ecosistema: <strong>los mAh no son energía</strong>. Son carga. Un miliamperio-hora son 3,6 culombios. La energía sale de multiplicar por la tensión:</p>
+
+<pre><code class="lang-python"># Energia de una pila, en las tres unidades que vas a usar
+capacidad_mAh = 225           # CR2032 tipica
+tension_V     = 3.0
+
+energia_mWh = capacidad_mAh * tension_V          # 675 mWh
+energia_J   = energia_mWh / 1000 * 3600          # 2430 J
+carga_C     = capacidad_mAh / 1000 * 3600        # 810 C
+
+print(f"{energia_mWh:.0f} mWh = {energia_J:.0f} J = {carga_C:.0f} C")</code></pre>
+
+<p>La distinción importa el día que comparás dos arquitecturas con tensiones distintas. Una celda Li-SOCl₂ de 2400 mAh a 3,6 V tiene 31 kJ; una alcalina AA de 2800 mAh a 1,5 V tiene 15 kJ. La de "menos mAh" tiene <strong>el doble de energía</strong>.</p>
+
+<p>Con eso claro, la cuenta de vida útil es de una simplicidad brutal:</p>
+
+<div class="rule">
+  <strong>📌 Vida útil [h] = Capacidad útil [mAh] / Corriente media [mA]</strong><br>
+  Y la corriente media es un <strong>promedio ponderado por tiempo</strong>, nunca un promedio de los valores del datasheet:<br>
+  <code>I_media = Σ (I_fase × t_fase) / T_ciclo</code>
+</div>
+
+<p>El promedio ponderado es la parte que la gente saltea, y es la única que importa. Un módulo que consume 88 mA parece un desastre; si está encendido 2,6 s cada hora, aporta 63,6 µA. Un regulador que consume 0,22 mA parece inofensivo; si está encendido las 24 horas, aporta 220 µA — <strong>tres veces y media más</strong> que el módulo espantoso. La intuición de "corriente alta = problema" es exactamente al revés de lo que hay que mirar.</p>
+
+<h3>Un presupuesto completo, fase por fase</h3>
+
+<p>Sensor de temperatura con BLE, un reporte cada 60 segundos, sobre nRF54L15. Cada fila es una fase del ciclo, con su corriente medida y su duración medida:</p>
+
+<table>
+<thead><tr><th>Fase</th><th>Corriente</th><th>Duración</th><th>% del ciclo</th><th>Aporte a I_media</th></tr></thead>
+<tbody>
+<tr><td>Sleep (System OFF + RTC + RAM)</td><td>1,5 µA</td><td>59,975 s</td><td>99,958 %</td><td><strong>1,499 µA</strong></td></tr>
+<tr><td>Wake-up + arranque de relojes</td><td>3,0 mA</td><td>3 ms</td><td>0,005 %</td><td>0,150 µA</td></tr>
+<tr><td>Lectura I²C del sensor</td><td>2,5 mA</td><td>15 ms</td><td>0,025 %</td><td><strong>0,625 µA</strong></td></tr>
+<tr><td>Cálculo + armado del paquete</td><td>2,8 mA</td><td>2 ms</td><td>0,003 %</td><td>0,093 µA</td></tr>
+<tr><td>BLE advertising ×3 canales</td><td>5,5 mA</td><td>4 ms</td><td>0,007 %</td><td>0,367 µA</td></tr>
+<tr><td>Vuelta a dormir</td><td>1,2 mA</td><td>1 ms</td><td>0,002 %</td><td>0,020 µA</td></tr>
+<tr><td><strong>Total</strong></td><td>—</td><td>60,000 s</td><td>100 %</td><td><strong>2,754 µA</strong></td></tr>
+</tbody>
+</table>
+
+<p>Leamos lo que dice esta tabla, porque tiene tres lecciones y ninguna es obvia:</p>
+
+<div class="step"><strong>1. El sleep aporta el 54 % de todo.</strong> Ocupa el 99,96 % del tiempo con la corriente más chica de la tabla, y aun así es la fila más grande. Bajar el sleep de 1,5 µA a 0,5 µA mejora la autonomía un 36 %, y no requiere tocar una línea del firmware funcional.</div>
+
+<div class="step"><strong>2. El despertar cuesta lo mismo que la radio.</strong> Los 3 ms de arranque de relojes aportan 0,150 µA; el advertising BLE completo aporta 0,367 µA. La radio, que todo el mundo culpa, es apenas 2,4× el costo de <em>encender el reloj</em>. En un diseño ya optimizado, el overhead de despertar compite de igual a igual con el trabajo útil.</div>
+
+<div class="step"><strong>3. La fase más cara despierto es leer el sensor.</strong> 15 ms de I²C aportan más que la radio. Nadie mira ahí. Bajar el bus de 100 kHz a 400 kHz corta esa fila a un cuarto y gana más que cualquier optimización de la trama BLE. Y muchos sensores de los que viste en <a href="../../e05-sensores-actuadores/lecture.html">E05</a> tienen un tiempo de conversión propio durante el cual tu MCU no tiene por qué estar despierto esperándolos.</div>
+
+<p>Ahora la vida útil, y acá aparece el primer descuento honesto:</p>
+
+<pre><code class="lang-python">I_media_uA = 2.754
+
+# Ingenuo: capacidad nominal de la hoja de datos
+print(225_000 / I_media_uA / 8760)      # 9.33 anios  &lt;- mentira
+
+# Real: capacidad util (corte del regulador, picos, temperatura) ~80 %
+print(180_000 / I_media_uA / 8760)      # 7.46 anios
+
+# Real de verdad: mas la autodescarga de la quimica, 1 %/anio
+autodescarga_uA = 225 * 0.01 * 1000 / 8760      # 0.257 uA equivalentes
+print(180_000 / (I_media_uA + autodescarga_uA) / 8760)   # 6.82 anios</code></pre>
+
+<div class="mistake">
+  <strong>El error de los 9,33 años.</strong> Es el número que aparece en la primera hoja de cálculo de todo proyecto, y es un 37 % optimista. La capacidad nominal se mide en condiciones de laboratorio —descarga lenta, 20 °C, corte de tensión bajo— que tu circuito no cumple. Y la autodescarga no aparece en ningún presupuesto porque no es "consumo del circuito", pero se lleva 0,257 µA que en este diseño son el 9 % del total. <strong>Poné las dos correcciones desde la primera versión de la tabla</strong>, no cuando el cliente reclame.
+</div>
+
+<h3>Corriente media vs corriente pico: dos preguntas distintas</h3>
+
+<p>La corriente media te dice <strong>cuánto dura</strong>. La corriente pico te dice <strong>si funciona</strong>. Son problemas independientes y se resuelven con componentes distintos.</p>
+
+<p>Toda pila tiene resistencia interna. Una CR2032 nueva ronda los 10–20 Ω y termina su vida arriba de 100 Ω. Cuando el circuito pide un pico, la tensión que ve el MCU cae por la ley de Ohm sobre esa resistencia:</p>
+
+<pre><code class="lang-python">V_pila, R_int = 3.0, 15.0        # CR2032 nueva
+
+for I_pico_mA in (5, 15, 50, 350):
+    caida = I_pico_mA / 1000 * R_int
+    print(f"{I_pico_mA:4d} mA -&gt; caida {caida:5.2f} V, "
+          f"el MCU ve {max(0, V_pila - caida):.2f} V")
+
+#    5 mA -&gt; caida  0.08 V, el MCU ve 2.93 V   ok
+#   15 mA -&gt; caida  0.23 V, el MCU ve 2.77 V   ok, al limite
+#   50 mA -&gt; caida  0.75 V, el MCU ve 2.25 V   brownout probable
+#  350 mA -&gt; caida  5.25 V, el MCU ve 0.00 V   la pila colapsa</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Por qué Wi-Fi no va con pila de moneda, aunque la cuenta de mAh cierre.</strong> Un ESP32-C6 transmitiendo pega picos arriba de 300 mA. La cuenta de energía puede dar años; la pila igual no arranca la radio. Y el modo de falla es el peor de todos: el equipo funciona en el banco con fuente, y en campo se resetea al primer intento de transmisión. Este bug es indistinguible de un bug de firmware hasta que alguien mide la tensión de alimentación con el osciloscopio <em>durante</em> el pico.
+</div>
+
+<p>La solución clásica —un capacitor de reserva que entregue el pico— se evalúa con una cuenta, no con intuición:</p>
+
+<pre><code class="lang-python"># C necesario para sostener un pico sin que la tension caiga mas de dV
+I_pico, t_pico, dV = 0.350, 0.002, 0.20     # 350 mA durante 2 ms, 200 mV de caida
+C = I_pico * t_pico / dV
+print(f"{C*1e6:.0f} uF")        # 3500 uF</code></pre>
+
+<p>3500 µF de cerámico o tántalo no entran ni en el gabinete ni en el presupuesto de una pila de moneda, y encima el capacitor tiene su propia corriente de fuga. La conclusión no es "poné un capacitor más grande": es <strong>cambiar la radio o cambiar la pila</strong>. El presupuesto de picos se resuelve en la arquitectura, igual que el de energía.</p>
+
+<h2>CF3.2 Baterías de verdad: por qué "3000 mAh" no son 3000 mAh</h2>
+
+<p>El número grande del envase se mide en condiciones que tu circuito no reproduce: descarga lenta y constante, 20 °C, y corte a una tensión más baja que la que tolera tu regulador. Cada una de esas tres condiciones te descuenta capacidad.</p>
+
+<table>
+<thead><tr><th>Química</th><th>V nominal (rango)</th><th>Capacidad típica</th><th>Autodescarga</th><th>Temp. operativa</th><th>Pico razonable</th></tr></thead>
+<tbody>
+<tr><td>Alcalina AA (LR6)</td><td>1,5 V (1,6 → 0,9)</td><td>2000–2800 mAh</td><td>2–3 %/año</td><td>−10 a 55 °C</td><td>~500 mA</td></tr>
+<tr><td>Litio primaria LiMnO₂ (CR2032)</td><td>3,0 V (3,2 → 2,0)</td><td>210–240 mAh</td><td>~1 %/año</td><td>−20 a 60 °C</td><td>3 mA cont. / 15 mA pulso</td></tr>
+<tr><td>Litio primaria Li-SOCl₂ (ER14505)</td><td>3,6 V (3,6 → 3,0)</td><td>2400 mAh</td><td>0,7–1 %/año</td><td>−55 a 85 °C</td><td>~100 mA (pasivación)</td></tr>
+<tr><td>Li-ion 18650</td><td>3,7 V (4,2 → 3,0)</td><td>2500–3500 mAh</td><td><strong>2–3 %/mes</strong></td><td>0–45 °C al cargar</td><td>varios A</td></tr>
+<tr><td>LiPo (formato libre)</td><td>3,7 V (4,2 → 3,0)</td><td>variable</td><td><strong>2–5 %/mes</strong></td><td>ídem</td><td>alto</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La autodescarga descarta el litio recargable para autonomías largas.</strong> No es una preferencia: es una cuenta. Una Li-ion de 3000 mAh al 3 %/mes retiene 0,97¹² = 69,4 % después de un año; pierde <strong>918 mAh al año</strong> sin hacer nada. El circuito del ejemplo CF3.1 consume 24,1 mAh/año. La autodescarga es <strong>38 veces</strong> el consumo de tu producto. Optimizar el firmware ahí es cómico. La misma cuenta con Li-SOCl₂ al 1 %/año da 24 mAh/año — comparable al circuito, y ahí sí el diseño tiene sentido.
+</div>
+
+<h3>Los tres descuentos</h3>
+
+<div class="step"><strong>1. Temperatura.</strong> A −20 °C una alcalina entrega 50–60 % de su capacidad nominal y su resistencia interna se multiplica por tres o cuatro. Una Li-SOCl₂ entrega 85–90 % a esa temperatura, y es la razón por la que domina la telemetría de exteriores pese a costar seis veces más. En el otro extremo, la autodescarga sigue Arrhenius: aproximadamente <strong>se duplica cada 10 °C</strong> de aumento. Un gabinete negro al sol en Corrientes puede estar a 60 °C interiores y triplicar la autodescarga de tu presupuesto.</div>
+
+<div class="step"><strong>2. Corriente de descarga.</strong> El nominal se mide a C/10 o C/20. Descargar más rápido baja la capacidad entregada (efecto Peukert, brutal en alcalinas y despreciable en litio primario) y, en pulsos, hace trabajar la resistencia interna. Una CR2032 que da 225 mAh a 200 µA constantes puede entregar menos de 150 mAh con pulsos de 15 mA.</div>
+
+<div class="step"><strong>3. La tensión de corte de TU circuito.</strong> Este es el descuento que más se olvida y el más fácil de recuperar. La capacidad nominal se cuenta hasta que la celda llega a un umbral bajo. Si tu regulador se apaga antes, toda la energía que queda debajo de ese umbral es tuya y no la vas a usar.</div>
+
+<div class="analogy">
+  <strong>La analogía del tanque con la canilla alta.</strong> Una pila no es un tanque que se vacía: es un tanque cuya <em>presión</em> baja a medida que se vacía. Si tu canilla está a media altura del tanque, cuando el nivel llega ahí dejás de recibir agua — aunque el tanque siga medio lleno. La tensión de corte del regulador es la altura de la canilla. Bajarla 100 mV puede devolverte el 15 % de la pila sin cambiar nada más del diseño.
+</div>
+
+<p>La cuenta concreta, con 2 pilas AA alcalinas en serie:</p>
+
+<table>
+<thead><tr><th>Alimentación</th><th>Corte del sistema</th><th>Corte por celda</th><th>Capacidad aprovechada</th></tr></thead>
+<tbody>
+<tr><td>LDO de 1,8 V con 200 mV de dropout</td><td>2,00 V</td><td>1,00 V</td><td>~85 %</td></tr>
+<tr><td>LDO de 1,8 V con 60 mV de dropout (nano-Iq)</td><td>1,86 V</td><td>0,93 V</td><td>~95 %</td></tr>
+<tr><td>Buck-boost hasta 1,8 V de entrada</td><td>1,80 V</td><td>0,90 V</td><td>~100 %</td></tr>
+<tr><td>MCU alimentado directo (rango 1,7–3,6 V)</td><td>1,70 V</td><td>0,85 V</td><td>~100 %</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>La opción de abajo suele ser la mejor y casi nadie la evalúa.</strong> Muchos MCUs modernos (nRF54L, STM32U5, ESP32-C6) funcionan en todo el rango 1,7/1,8–3,6 V. Si tus periféricos también, podés <strong>sacar el regulador del diseño</strong> y conectar la pila directo. Ahorrás el Iq del regulador, el dropout, dos capacitores y una parte de la BOM. El costo: el ADC pierde una referencia estable (usá la interna) y tenés que verificar el rango de <em>todos</em> los componentes, incluido el sensor.
+</div>
+
+<h2>CF3.3 Modos de bajo consumo: qué se apaga y qué se pierde</h2>
+
+<p>Todo MCU moderno tiene una escalera de modos. Los nombres cambian entre fabricantes, pero la escalera es siempre la misma y lo que se pierde en cada escalón también:</p>
+
+<table>
+<thead><tr><th>Escalón</th><th>Qué sigue vivo</th><th>Consumo típico</th><th>Tiempo de despertar</th><th>Qué se pierde</th></tr></thead>
+<tbody>
+<tr><td><strong>Active / Run</strong></td><td>Todo</td><td>0,5–12 mA</td><td>—</td><td>Nada</td></tr>
+<tr><td><strong>Sleep / Idle</strong> (<code>WFI</code>)</td><td>RAM, periféricos, todos los relojes</td><td>100 µA – 1 mA</td><td>&lt; 1 µs</td><td>Solo se para el core; las interrupciones despiertan al instante</td></tr>
+<tr><td><strong>Stop / Light sleep</strong></td><td>RAM completa, RTC, periféricos low-power</td><td>1,5–40 µA</td><td>5–100 µs</td><td>Relojes de alta velocidad y PLL: hay que rearrancarlos y esperar su estabilización</td></tr>
+<tr><td><strong>Standby / Deep sleep</strong></td><td>RTC + unos pocos KB de RAM retenida</td><td>0,3–7 µA</td><td>0,2–20 ms</td><td>Casi toda la RAM y el estado de los periféricos; el firmware <strong>rearranca desde reset</strong></td></tr>
+<tr><td><strong>Shutdown / System OFF</strong></td><td>Solo los pines de wake-up</td><td>0,1–1 µA</td><td>ms (reset completo)</td><td>Todo, incluido el RTC: al despertar no sabés qué hora es</td></tr>
+</tbody>
+</table>
+
+<h3>Los números de 2026</h3>
+
+<p>Tres familias que vas a ver en cualquier diseño nuevo, con los datos de sus hojas actuales:</p>
+
+<table>
+<thead><tr><th>Parámetro</th><th>nRF54L15 (2024, 22 nm)</th><th>STM32U5</th><th>ESP32-C6</th><th>nRF52840 (referencia)</th></tr></thead>
+<tbody>
+<tr><td>Core activo</td><td>20 µA/MHz · M33 @128 MHz</td><td>~34 µA/MHz · M33 @160 MHz</td><td>~12 mA (core HP, sin RF)</td><td>50 µA/MHz · M4F @64 MHz</td></tr>
+<tr><td>Stop / light sleep</td><td>~1,4 µA</td><td>1,7 µA (Stop 2)</td><td>~30–40 µA</td><td>~1,5 µA</td></tr>
+<tr><td>Deep sleep con RAM + RTC</td><td>0,5 µA</td><td>~0,3 µA (Standby + RTC)</td><td><strong>~7 µA</strong></td><td>0,4 µA</td></tr>
+<tr><td>Apagado total</td><td>0,2 µA (System OFF)</td><td><strong>110 nA</strong> (Shutdown)</td><td>—</td><td>0,3 µA</td></tr>
+<tr><td>Radio TX</td><td>3,4 mA @ 0 dBm (BLE)</td><td>sin radio integrada</td><td>~60 mA medio Wi-Fi, picos &gt; 300 mA</td><td>4,6 mA @ 0 dBm</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Qué cambió entre 2023 y 2026.</strong> El salto real no fue el sleep —hace una década que se llega a menos de 1 µA— sino la <strong>eficiencia activa</strong>. El nRF54L15 hace 20 µA/MHz contra los 50 µA/MHz del nRF52840, y corre a 128 MHz en vez de 64: termina el mismo trabajo en la mitad del tiempo con el 40 % de la corriente por MHz. Eso ataca la variable correcta, que es <em>el tiempo despierto</em>. Su TX bajó de 4,6 a 3,4 mA (−26 %), y con RRAM en vez de flash desaparece el costo de escritura de página. La regla que se derivó de esto: <strong>en 2026, para un diseño nuevo con objetivo de años de autonomía, la elección del SoC se hace por µA/MHz y por tiempo de despertar, no por corriente de sleep.</strong> Todos los candidatos serios ya están por debajo de 1 µA dormidos.
+</div>
+
+<div class="warn">
+  <strong>El ESP32-C6 está en esta tabla para que veas el contraste, no como candidato a pila.</strong> 7 µA de deep sleep son 14× el nRF54L15, y su ciclo de Wi-Fi cuesta órdenes de magnitud más que un advertising BLE. Además tiene una trampa medida por la comunidad: <em>entrar</em> en deep sleep consume ~30 µA durante varios segundos antes de bajar a los 7 µA nominales. Si tu período de despertar es corto, nunca llegás al número del datasheet. Es un SoC excelente enchufado o con batería recargable grande, y una mala elección para cinco años con una moneda.
+</div>
+
+<h3>El costo del despertar, y el punto de cruce</h3>
+
+<p>Bajar un escalón de la escalera siempre parece gratis y nunca lo es. Cuanto más profundo el sueño, más caro el despertar: hay que rearrancar osciladores, esperar que se estabilicen, reinicializar periféricos y, en deep sleep, volver a correr todo el <code>main()</code> hasta donde estabas. Ese costo fijo por despertar compite contra el ahorro por segundo.</p>
+
+<pre><code class="lang-python"># Punto de cruce entre Stop 2 y Standby en un STM32U5
+I_stop2, I_standby = 1.7, 0.3          # uA
+I_wake, t_wake     = 3000.0, 0.015     # 3 mA durante 15 ms de reinicializacion
+
+E_wake  = I_wake * t_wake                       # 45 uA*s por despertar
+T_cruce = E_wake / (I_stop2 - I_standby)        # 32.1 s
+
+for T in (1, 10, 32.1, 60, 300):
+    stop2   = I_stop2
+    standby = I_standby + E_wake / T
+    gana = "Stop 2" if stop2 &lt; standby else "Standby"
+    print(f"T={T:6.1f} s  Stop2={stop2:6.3f} uA  Standby={standby:7.3f} uA  -&gt; {gana}")
+
+# T=   1.0 s  Stop2= 1.700 uA  Standby= 45.300 uA  -&gt; Stop 2
+# T=  10.0 s  Stop2= 1.700 uA  Standby=  4.800 uA  -&gt; Stop 2
+# T=  32.1 s  Stop2= 1.700 uA  Standby=  1.702 uA  -&gt; Stop 2  (empate)
+# T=  60.0 s  Stop2= 1.700 uA  Standby=  1.050 uA  -&gt; Standby
+# T= 300.0 s  Stop2= 1.700 uA  Standby=  0.450 uA  -&gt; Standby</code></pre>
+
+<div class="rule">
+  <strong>📌 Con estos números, el cruce está en 32 segundos.</strong> Si despertás más seguido que eso, el modo <em>menos</em> profundo gana: el costo de reinicializar supera lo que ahorrás durmiendo más hondo. Si despertás más espaciado, gana el profundo. El número exacto depende de tu <code>t_wake</code>, que <strong>se mide, no se lee del datasheet</strong> — el tiempo real incluye tu propia inicialización de periféricos, que suele ser el 80 % del total.
+</div>
+
+<div class="mistake">
+  <strong>El error de "usá siempre el modo más profundo".</strong> Aparece en el 90 % de los tutoriales y es falso para cualquier período corto. Y tiene un hermano peor: el deep sleep que pierde la RAM obliga a rearrancar desde <code>reset</code>, lo que significa reinicializar el stack de radio completo. En un SoC BLE eso puede costar 30–80 ms y varios miliamperios — mucho más caro que la diferencia de corriente que fuiste a buscar. Antes de bajar un escalón, medí el ciclo entero, no el consumo del escalón.
+</div>
+
+<h3>Cómo se pide cada modo, en código</h3>
+
+<pre><code class="lang-c">/* Zephyr / nRF Connect SDK — System OFF con despertar por GPIO y por RTC */
+#include &lt;zephyr/kernel.h&gt;
+#include &lt;zephyr/pm/pm.h&gt;
+#include &lt;zephyr/drivers/gpio.h&gt;
+#include &lt;hal/nrf_gpio.h&gt;
+
+static const struct gpio_dt_spec boton =
+        GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+
+void dormir_profundo(uint32_t segundos)
+{
+    /* 1. Configurar la fuente de despertar ANTES de apagar nada */
+    nrf_gpio_cfg_sense_set(boton.pin, NRF_GPIO_PIN_SENSE_LOW);
+
+    /* 2. Dejar TODOS los pines no usados en un estado definido.
+     *    Un pin flotante en System OFF es una fuga de corriente. */
+    for (int p = 0; p &lt; 32; p++) {
+        if (p == boton.pin) continue;
+        nrf_gpio_cfg_input(p, NRF_GPIO_PIN_PULLDOWN);
+    }
+
+    /* 3. Programar el RTC del dominio always-on para el despertar temporizado */
+    programar_rtc_wakeup(segundos);
+
+    /* 4. System OFF: ~0.2 uA. Al despertar el firmware arranca desde reset. */
+    pm_state_force(0u, &amp;(struct pm_state_info){ PM_STATE_SOFT_OFF, 0, 0 });
+    k_sleep(K_FOREVER);   /* no se retorna de aca */
+}</code></pre>
+
+<div class="warn">
+  <strong>El paso 2 no es opcional y es el que más se saltea.</strong> Un pin de entrada flotante en un MCU CMOS deja el par complementario del buffer de entrada parcialmente conducido: consume entre 1 y 100 µA, varía con la humedad y con la temperatura, y no aparece en ninguna simulación. En una placa con 40 pines libres es la diferencia entre 0,2 µA y 400 µA de sleep. Si tu base de sleep es errática o cambia entre placas idénticas, mirá acá antes que en el firmware.
+</div>
+
+<h2>CF3.4 Duty cycling: el tiempo despierto es el enemigo</h2>
+
+<p>El patrón de todo nodo autónomo es siempre el mismo: <strong>despertar → medir → transmitir → dormir</strong>. Y la ecuación que gobierna su consumo tiene una forma muy reveladora:</p>
+
+<div class="concept">
+  <strong>💡 I_media ≈ I_sleep + (I_on − I_sleep) × D</strong>, donde <strong>D = t_on / T</strong> es el ciclo de trabajo.<br><br>
+  Lo que dice esta ecuación es que hay <strong>dos maneras exactamente equivalentes</strong> de bajar el consumo: achicar <code>t_on</code> o agrandar <code>T</code>. Un factor 2 en cualquiera de las dos da el mismo resultado. Pero <strong>no tienen el mismo costo de producto</strong>: agrandar T degrada la frecuencia de reporte, que es una decisión del cliente; achicar t_on es puro trabajo de ingeniería y no le saca nada a nadie.
+</div>
+
+<pre><code class="lang-python">I_sleep, I_on = 2.0, 8000.0      # uA
+
+def media(t_on, T):
+    return (I_sleep * (T - t_on) + I_on * t_on) / T
+
+base = media(0.120, 60)          # 18.00 uA
+print(base)
+print(media(0.060, 60))          # 10.00 uA  &lt;- mitad de t_on
+print(media(0.120, 120))         # 10.00 uA  &lt;- doble de T (identico)
+print(I_sleep)                   #  2.00 uA  &lt;- el piso: t_on -&gt; 0</code></pre>
+
+<p>Fijate en la última línea. Por más que reduzcas <code>t_on</code> a cero, no vas a bajar de <code>I_sleep</code>. En este ejemplo el piso son 2 µA, o sea 9× mejor que la base. <strong>Ese es el techo de lo que podés ganar optimizando el código.</strong> Si tu objetivo está por debajo del piso, ninguna cantidad de trabajo de firmware te va a salvar: hay que cambiar el hardware.</p>
+
+<h3>Las cuatro formas de achicar t_on, en orden de rendimiento</h3>
+
+<div class="step"><strong>1. Medir mientras dormís.</strong> Es la más potente y la más ignorada. Los MCU modernos traen máquinas de estado autónomas que operan periféricos con el core apagado: <strong>LPBAM</strong> en STM32U5, <strong>PPI/DPPI</strong> en Nordic, el <strong>coprocesador ULP</strong> del ESP32. Con eso el ADC muestrea, el DMA guarda en RAM y el core solo despierta cuando el buffer está lleno o cuando un umbral se cruzó. Reemplaza 50 despertares por uno y elimina el costo de wake-up de los otros 49. Ganancias típicas de 5× a 20×.</div>
+
+<div class="step"><strong>2. DMA en vez de polling.</strong> Leer 100 bytes por SPI con polling tiene al core activo todo el tiempo de la transferencia. Con DMA el core se va a <code>WFI</code> y despierta con la interrupción de fin. A 1 MHz de SPI son 800 µs de core apagado por transferencia — y eso, multiplicado por la frecuencia del ciclo, se nota.</div>
+
+<div class="step"><strong>3. Sacar los cálculos caros del camino caliente.</strong> Un <code>printf("%f")</code> en un Cortex-M0+ sin FPU tarda entre 3 y 8 ms. A 3 mA son hasta 24 µA·s por llamada: más caro que un advertising BLE completo. Lo mismo con las conversiones de punto flotante, las tablas trigonométricas y el logging por UART. En un nodo de batería, <strong>el logging de depuración se compila fuera de la build de producción</strong>, no se "deja porque no molesta".</div>
+
+<div class="step"><strong>4. Precalcular y cachear.</strong> Las constantes de calibración, las tablas de conversión y los encabezados de trama se calculan una vez al arrancar y se guardan en RAM retenida — no en cada ciclo. Si el modo de sueño no retiene RAM, van en flash/RRAM y se leen; leer es mucho más barato que recalcular.</div>
+
+<pre><code class="lang-c">/* ANTES: el core despierta 100 veces para promediar 100 muestras */
+uint32_t suma = 0;
+for (int i = 0; i &lt; 100; i++) {
+    dormir_ms(10);                       /* 100 wake-ups, 100 x t_wake */
+    suma += adc_leer_bloqueante();       /* core activo durante toda la conversion */
+}
+uint16_t promedio = suma / 100;
+
+/* DESPUES: el hardware muestrea solo; el core despierta UNA vez */
+static uint16_t buffer[100];
+
+void arrancar_muestreo_autonomo(void)
+{
+    /* El timer dispara el ADC; el DMA guarda en buffer[]; el core duerme.
+     * En Nordic esto es un canal DPPI; en STM32U5, una cadena LPBAM. */
+    timer_configurar_periodo_ms(10);
+    adc_configurar_disparo_por_timer();
+    dma_configurar(buffer, 100, DMA_IRQ_AL_COMPLETAR);
+    entrar_en_stop();                    /* 1.7 uA mientras el ADC trabaja */
+}
+
+void dma_completo_isr(void)              /* unico despertar del ciclo */
+{
+    uint32_t suma = 0;
+    for (int i = 0; i &lt; 100; i++) suma += buffer[i];
+    publicar(suma / 100);
+}</code></pre>
+
+<div class="tip">
+  <strong>Cómo se verifica que esto funcionó.</strong> No por el código: por el perfil. Antes tenías 100 pulsos de wake-up separados por 10 ms; después tenés una meseta plana de 1,7 µA con un solo pulso al final. Si en el analizador seguís viendo los 100 pulsos, la cadena autónoma no se armó y estás corriendo el camino viejo — pasa seguido, porque estos periféricos fallan en silencio si un canal quedó mal configurado.
+</div>
+
+<h2>CF3.5 El costo real de la radio</h2>
+
+<p>Transmitir es, con enorme diferencia, lo más caro que hace un nodo. Y no por una mala implementación: por física. La energía sale por la antena en forma de onda que se va y no vuelve; el amplificador de potencia tiene una eficiencia del 20–40 %, así que por cada milivatio radiado gastás tres; y el tiempo en el aire crece cuando bajás la tasa de datos para llegar más lejos.</p>
+
+<table>
+<thead><tr><th>Tecnología y escenario</th><th>I durante el ciclo</th><th>Duración</th><th>Energía por mensaje @3,3 V</th><th>Relativo a BLE</th></tr></thead>
+<tbody>
+<tr><td>BLE advertising (31 B, 3 canales)</td><td>5,0 mA</td><td>2,5 ms</td><td><strong>41 µJ</strong></td><td>1×</td></tr>
+<tr><td>BLE notificación en conexión</td><td>4,5 mA</td><td>3 ms</td><td>45 µJ</td><td>1,1×</td></tr>
+<tr><td>LoRa SF7 BW125 +14 dBm (20 B)</td><td>45 mA</td><td>62 ms</td><td>9,2 mJ</td><td>223×</td></tr>
+<tr><td>LoRa SF10 BW125 +14 dBm (20 B)</td><td>45 mA</td><td>371 ms</td><td>55 mJ</td><td>1 336×</td></tr>
+<tr><td>LoRa SF12 BW125 +14 dBm (20 B)</td><td>45 mA</td><td>1,48 s</td><td>220 mJ</td><td>5 328×</td></tr>
+<tr><td>Wi-Fi con reconexión rápida + POST</td><td>88 mA</td><td>1,1 s</td><td>319 mJ</td><td>7 744×</td></tr>
+<tr><td>Wi-Fi asociación completa + TLS</td><td>100 mA</td><td>3,5 s</td><td><strong>1,16 J</strong></td><td>28 000×</td></tr>
+<tr><td>NB-IoT con PSM (reconexión)</td><td>90 mA</td><td>2,5 s</td><td>743 mJ</td><td>18 000×</td></tr>
+<tr><td>NB-IoT attach completo</td><td>140 mA</td><td>10 s</td><td><strong>4,6 J</strong></td><td>112 000×</td></tr>
+</tbody>
+</table>
+
+<p>Traducido a la unidad que entiende un gerente de producto — cuántos mensajes entran en una CR2032 de 2430 J, ignorando todo el resto del circuito:</p>
+
+<table>
+<thead><tr><th>Tecnología</th><th>Mensajes por CR2032</th><th>Si reporta cada 15 min, eso dura…</th></tr></thead>
+<tbody>
+<tr><td>BLE advertising</td><td>58 900 000</td><td>1 680 años (irrelevante: manda el sleep)</td></tr>
+<tr><td>LoRa SF7</td><td>264 000</td><td>7,5 años</td></tr>
+<tr><td>LoRa SF12</td><td>11 000</td><td>3,8 meses</td></tr>
+<tr><td>Wi-Fi con reconexión rápida</td><td>7 600</td><td>2,6 meses</td></tr>
+<tr><td>Wi-Fi + TLS completo</td><td>2 100</td><td>3,6 semanas</td></tr>
+<tr><td>NB-IoT attach completo</td><td>530</td><td>5,5 días</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Mandar menos datos, más espaciados, le gana a cualquier optimización de código.</strong> Pasar de reportar cada minuto a cada quince divide el costo de radio por 15. No existe optimización de firmware que te dé 15× sobre el consumo de radio; en el mejor caso te da 1,3×. Por eso la primera pregunta de una revisión de autonomía nunca es "¿cómo optimizamos el código?" sino <strong>"¿por qué reporta tan seguido?"</strong> — y la respuesta suele ser que nadie lo pensó, se puso 30 s en el prototipo y quedó.
+</div>
+
+<h3>Tres costos de radio que no aparecen en las tablas</h3>
+
+<div class="step"><strong>1. Recibir también cuesta, y a veces más que transmitir.</strong> En LoRaWAN Class A, después de cada transmisión el nodo abre dos ventanas de recepción obligatorias. En el ejemplo del final vas a ver que esas ventanas aportan <strong>7,3 µA contra 3,1 µA de la transmisión</strong>: escuchar cuesta 2,4× más que hablar. La gente presupuesta el TX y se olvida del RX, y ahí se va la mitad del budget.</div>
+
+<div class="step"><strong>2. El handshake domina en mensajes chicos.</strong> Enviar 20 bytes por Wi-Fi con TLS cuesta 1,16 J; enviar 2000 bytes cuesta 1,20 J. El 97 % de la energía es asociación, DHCP y handshake TLS — el payload es ruido. Consecuencia directa: <strong>acumular y mandar de a lotes es casi gratis</strong>. Mandar 24 lecturas juntas una vez por día cuesta lo mismo que mandar una sola.</div>
+
+<div class="step"><strong>3. El spreading factor de LoRa es una decisión energética, no de cobertura.</strong> SF12 cuesta 24× lo que SF7 por el mismo payload. Si el nodo está cerca del gateway y el ADR (adaptación de tasa) no está habilitado o quedó fijo en SF12 "por las dudas", estás pagando 24× de más. Verificá el SF efectivo en producción, no el configurado.</div>
+
+<div class="danger">
+  <strong>⚠️ El costo escondido de los reintentos.</strong> Ninguna de estas tablas incluye los fallos. Si el 20 % de tus transmisiones necesita reintento, tu presupuesto de radio sube 20 % — y si el firmware reintenta tres veces con backoff antes de rendirse, en el peor caso sube 300 %. Un nodo al borde de la cobertura no consume "un poco más": consume varias veces más, y es el que primero se queda sin pila. <strong>Poné un tope duro de reintentos por ciclo y contá los fallos en la telemetría</strong>, porque el consumo de un nodo te está diciendo algo sobre su calidad de enlace.
+</div>
+
+<h2>CF3.6 Medir corriente en serio</h2>
+
+<p>Todo lo anterior son estimaciones. El presupuesto se convierte en ingeniería cuando lo medís, y para medirlo un multímetro no sirve. No es que sea impreciso: es que mide la magnitud equivocada.</p>
+
+<h3>Las tres razones por las que el multímetro falla</h3>
+
+<div class="step"><strong>1. No tiene ancho de banda.</strong> Un DMM de banco integra durante uno o varios ciclos de red: entre 20 y 400 ms. Un pico de radio de 3 ms queda promediado hasta desaparecer, y una base de sleep de 2 µA con un pulso de 88 mA cada 30 s te da una lectura que no es ninguno de los dos y que además baila.</div>
+
+<div class="step"><strong>2. El autorango tarda más que tus eventos.</strong> Cambiar de rango lleva entre 100 y 500 ms. Cuando la corriente salta de 2 µA a 300 mA en 50 microsegundos, el instrumento sigue con el shunt del rango de µA puesto. Y ahí viene el problema serio.</div>
+
+<div class="step"><strong>3. El burden voltage resetea tu circuito.</strong> El shunt del rango de microamperios de un DMM típico son 100 Ω o más. La caída sobre él se resta de tu alimentación:</div>
+
+<pre><code class="lang-python">R_shunt = 100.0     # ohm, rango de uA de un DMM tipico
+
+for I_mA in (0.01, 1, 10, 300):
+    print(f"{I_mA:7.2f} mA -&gt; caida {I_mA/1000*R_shunt:7.3f} V")
+
+#    0.01 mA -&gt; caida   0.001 V   invisible
+#    1.00 mA -&gt; caida   0.100 V   ya molesta
+#   10.00 mA -&gt; caida   1.000 V   el MCU ve 2 V en vez de 3
+#  300.00 mA -&gt; caida  30.000 V   imposible: el circuito colapsa y se resetea</code></pre>
+
+<div class="mistake">
+  <strong>"No arranca cuando lo mido."</strong> Es el síntoma clásico y confunde a todo el mundo, porque parece un problema del circuito. No lo es: es el instrumento robándose la alimentación. Si tu equipo funciona cuando lo conectás directo y falla con el multímetro en serie, el multímetro es el bug.
+</div>
+
+<h3>Lo que sí sirve</h3>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Rango</th><th>Muestreo</th><th>Fortaleza</th><th>Límite</th></tr></thead>
+<tbody>
+<tr><td><strong>Nordic PPK2</strong></td><td>200 nA – 1 A</td><td>100 kSps</td><td>Barato, alimenta y mide, buen software</td><td>Debajo de ~500 nA pierde precisión</td></tr>
+<tr><td><strong>Joulescope JS220</strong></td><td>0,5 nA – 10 A</td><td>2 MSps</td><td>34 bits de rango dinámico; cambia de shunt en 1 µs sin huecos</td><td>Precio</td></tr>
+<tr><td><strong>Otii Arc Pro</strong></td><td>nA – 5 A</td><td>4 kSps</td><td>Emula la curva de descarga de una batería real</td><td>Muestreo bajo: se pierden picos de µs</td></tr>
+<tr><td><strong>Shunt + amplificador + osciloscopio</strong></td><td>según shunt</td><td>alto</td><td>Ya lo tenés; sirve para ver la forma de un pico</td><td>Un solo shunt no cubre 6 órdenes de magnitud</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El problema del rango dinámico es la clave de todo esto.</strong> Tu circuito va de 0,5 µA a 300 mA: son <strong>seis órdenes de magnitud</strong>. Ningún shunt fijo mide bien en los dos extremos. Un shunt de 100 Ω te muestra los µA con claridad pero mata el pico; uno de 0,1 Ω pasa el pico sin perturbar pero deja los µA enterrados en el ruido. Por eso los instrumentos buenos conmutan shunts en microsegundos, y por eso valen lo que valen. Si vas por el camino barato del shunt fijo, hacé <strong>dos mediciones separadas</strong>: una para el sleep y otra para los picos.
+</div>
+
+<h3>Cómo se lee un perfil de consumo</h3>
+
+<div class="step"><strong>1. Mirá primero la línea de base.</strong> Debe ser plana y coincidir con la suma de los sleeps de la hoja de datos. Si medís 900 µA donde esperabas 4, tenés un problema de hardware o de configuración de pines, y no tiene sentido optimizar nada hasta resolverlo.</div>
+
+<div class="step"><strong>2. Identificá y nombrá cada evento.</strong> Cada meseta y cada pico corresponden a algo del firmware. Si hay un evento que no sabés qué es, ese es el que hay que investigar — es la definición de consumo fuera de control.</div>
+
+<div class="step"><strong>3. Calculá el ÁREA de cada evento, no su altura.</strong> El área es carga (µC o µAh) y es lo que se resta de la pila. La altura es un dato de diseño de la fuente, no de consumo.</div>
+
+<div class="step"><strong>4. Multiplicá cada área por su frecuencia</strong> para obtener el aporte a I_media, y armá la tabla del presupuesto con números medidos.</div>
+
+<div class="step"><strong>5. Ordená de mayor a menor y optimizá de arriba hacia abajo.</strong> Parar cuando la fila más grande deja de justificar el trabajo. La disciplina es la misma que perfilar software: sin ordenar por impacto, optimizás lo que te resulta divertido.</div>
+
+<div class="concept">
+  <strong>💡 El pico más alto casi nunca es el que más gasta.</strong> Un pico de 300 mA durante 200 µs son 60 µC. Una meseta de 8 mA durante 400 ms son 3200 µC: <strong>53 veces más carga</strong>. En la pantalla el pico se ve dramático y la meseta se ve como una alfombrita gris al ras del piso. El ojo te miente; el área no. Esto es exactamente lo mismo que el flamegraph de un profiler, donde la función lenta llamada una vez importa menos que la función rápida llamada un millón de veces.
+</div>
+
+<h2>CF3.7 Los ladrones de batería, y el orden en que se los busca</h2>
+
+<p>Cuando la base de sleep medida no coincide con la suma de las hojas de datos, hay un ladrón. Estos son los diez que aparecen una y otra vez, con su corriente típica:</p>
+
+<table>
+<thead><tr><th>Ladrón</th><th>Consumo típico</th><th>Cómo se detecta</th><th>Solución</th></tr></thead>
+<tbody>
+<tr><td>Pull-up de I²C con la línea en 0 durante el sleep</td><td><strong>702 µA por línea</strong> (3,3 V / 4,7 kΩ) — 1,4 mA con SDA y SCL</td><td>Base alta y constante; desaparece al levantar el sensor</td><td>Dejar el bus en alto antes de dormir, o alimentar los pull-ups desde un GPIO que se apaga</td></tr>
+<tr><td>LED de "power" siempre encendido</td><td>1 000 – 5 000 µA</td><td>Se ve con los ojos</td><td>Sacarlo de la BOM de producción</td></tr>
+<tr><td>Regulador LDO con Iq alta (tipo AMS1117)</td><td><strong>5 000 µA</strong> — 1667× un MCU dormido</td><td>Medir antes y después del regulador</td><td>LDO de Iq nano (1–2 µA)</td></tr>
+<tr><td>Módulo de radio que nunca entra en sleep</td><td>1 500 – 80 000 µA</td><td>Enorme y obvio en el perfil</td><td>Llamar la API de sleep <strong>y verificar en el analizador</strong></td></tr>
+<tr><td>Sensor que quedó en modo continuo</td><td>100 – 5 000 µA</td><td>Levantar el sensor y volver a medir</td><td>Configurarlo en one-shot / standby por registro</td></tr>
+<tr><td>SWD / dominio de depuración habilitado</td><td>300 – 1 000 µA</td><td>Comparar con y sin depurador conectado</td><td>Deshabilitar el dominio de debug antes de dormir</td></tr>
+<tr><td>GPIO flotante (entrada sin pull)</td><td>1 – 100 µA por pin, errático</td><td>Base ruidosa; cambia con la humedad y entre placas</td><td>Todos los pines libres como entrada con pull o salida a nivel fijo</td></tr>
+<tr><td>Divisor de medición de batería siempre conectado</td><td><strong>16,5 µA</strong> con 100 k + 100 k</td><td>Constante; se va al desoldar una resistencia</td><td>MOSFET en serie, o subir a 1 M + 1 M (1,65 µA)</td></tr>
+<tr><td>Oscilador de alta frecuencia o watchdog rápido</td><td>10 – 200 µA</td><td>Cambia al tocar la configuración de relojes</td><td>Usar el oscilador de 32 kHz para el dominio de sueño</td></tr>
+<tr><td>Fuga por flux, suciedad o humedad en el PCB</td><td>1 – 50 µA, sube con la humedad</td><td>Lavar la placa y volver a medir</td><td>Limpieza post-soldadura + conformal coating</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El orden de búsqueda es de afuera hacia adentro, y el firmware va último.</strong>
+  <br><strong>(1)</strong> Compará la base medida con la suma teórica: el <em>factor</em> te dice qué buscás. 2× es un pin o una fuga; 10× es un periférico; 1000× es un componente entero que nunca se apaga.
+  <br><strong>(2)</strong> Mirá la placa: LEDs, jumpers, el depurador enchufado.
+  <br><strong>(3)</strong> Medí por dominio de alimentación: antes y después de cada regulador. Eso parte el problema en dos.
+  <br><strong>(4)</strong> Levantá componentes de a uno (el módulo de radio, el sensor) y volvé a medir. Divide y vencerás, con soldador.
+  <br><strong>(5)</strong> Recién ahí, el firmware.
+</div>
+
+<div class="mistake">
+  <strong>La trampa de empezar por el firmware.</strong> Es la tentación natural porque es lo que podés cambiar sin soldar. Y es la peor inversión de tiempo: en un diseño roto de verdad, el firmware aporta el 2 % del consumo. Se pasan semanas puliendo modos de sueño mientras un LDO de 5 mA se lleva todo. La regla operativa: <strong>si la base medida es más de 10× la teórica, no toques el código todavía.</strong>
+</div>
+
+<h2>CF3.8 Reguladores y conversión: el componente que arruina el presupuesto</h2>
+
+<p>El regulador es el componente que más frecuentemente destruye un diseño de bajo consumo, porque se elige por su corriente máxima —que es el caso que casi nunca ocurre— y no por su corriente de reposo, que ocurre siempre.</p>
+
+<table>
+<thead><tr><th>Aspecto</th><th>LDO</th><th>Buck (switching)</th></tr></thead>
+<tbody>
+<tr><td>Eficiencia</td><td>V_out / V_in, fija. De 3,6 a 3,0 V: 83 %. De 3,7 a 1,8 V: <strong>49 %</strong></td><td>85–95 % en su zona buena, casi independiente de la relación</td></tr>
+<tr><td>Corriente de reposo (Iq)</td><td>1 µA (nano-Iq) a 5 mA (los viejos)</td><td>10–50 µA típico; 1–5 µA los diseñados para IoT</td></tr>
+<tr><td>Eficiencia a carga muy baja</td><td>Excelente: solo pierde el Iq</td><td><strong>Se derrumba</strong>: el Iq domina y la eficiencia cae debajo del 40 %</td></tr>
+<tr><td>BOM y área</td><td>2 capacitores</td><td>Inductor + capacitores; 3–5× el área</td></tr>
+<tr><td>Ruido</td><td>Silencioso; ideal para analógico y RF</td><td>Ripple de conmutación y EMI (ver CF5)</td></tr>
+<tr><td>Puede subir la tensión</td><td>No, solo baja</td><td>Sí, con topología boost o buck-boost</td></tr>
+</tbody>
+</table>
+
+<p>La comparación que decide, con números de un caso concreto: de una celda Li-SOCl₂ de 3,6 V a 3,0 V para el MCU, comparando un LDO de 1 µA de Iq contra un buck del 90 % con 15 µA de Iq:</p>
+
+<table>
+<thead><tr><th>Corriente de carga</th><th>LDO: I de entrada</th><th>Buck: I de entrada</th><th>Gana</th></tr></thead>
+<tbody>
+<tr><td>3 µA (dormido)</td><td><strong>4,0 µA</strong></td><td>17,8 µA</td><td>LDO por <strong>4,4×</strong></td></tr>
+<tr><td>10 µA</td><td><strong>11,0 µA</strong></td><td>24,3 µA</td><td>LDO por 2,2×</td></tr>
+<tr><td>100 µA</td><td><strong>101 µA</strong></td><td>107,6 µA</td><td>LDO por 1,07× (empate)</td></tr>
+<tr><td>1 mA</td><td>1,00 mA</td><td><strong>0,94 mA</strong></td><td>Buck por 1,06×</td></tr>
+<tr><td>40 mA (transmitiendo)</td><td>40,0 mA</td><td><strong>37,1 mA</strong></td><td>Buck por 1,08×</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La lección no es "LDO" ni "buck": es que la respuesta depende de dónde vive tu perfil.</strong> Un nodo que pasa el 99,96 % del tiempo a 3 µA vive en la primera fila, donde el LDO gana por 4,4×. Un equipo que transmite la mitad del tiempo vive en la última, donde el buck gana por 1,08 % — un margen que difícilmente justifique el inductor, el área y el EMI. <strong>Con una diferencia de tensión chica, el LDO nano-Iq gana casi siempre en aplicaciones de batería.</strong> El buck se vuelve obligatorio cuando la relación V_in/V_out es grande (de 12 V a 3,3 V, donde el LDO tira el 72 % en calor) o cuando hay que subir la tensión.
+</div>
+
+<div class="tip">
+  <strong>La tercera opción que nadie evalúa: los dos.</strong> Un LDO nano-Iq alimentando el dominio siempre-encendido, y un buck que solo se enciende (por GPIO) durante la ráfaga de radio. Se lleva lo mejor de cada uno. El costo es real: dos reguladores en la BOM, el tiempo de arranque del buck (100 µs a 2 ms, que hay que sumar al <code>t_on</code>), y un transitorio de conmutación entre dominios que puede resetear cosas si no lo secuenciás bien. Vale la pena arriba de unos 50 mA de pico y con una relación de tensión grande.
+</div>
+
+<div class="danger">
+  <strong>⚠️ El error más caro del capítulo: elegir el regulador por su corriente máxima.</strong> "Necesito 300 mA de pico, pongo este de 1 A." Ese regulador tiene 5 mA de Iq y se come 1667 veces lo que consume tu MCU dormido. La corriente máxima es un requisito de <em>que funcione</em>; el Iq es un requisito de <em>que dure</em>. En la hoja de datos, el Iq suele estar escondido tres páginas más adelante y a veces se llama <em>ground current</em> o <em>bias current</em>. <strong>Buscalo siempre, y buscá el valor a carga cero y a la temperatura máxima</strong>, que puede ser el triple del típico a 25 °C.
+</div>
+
+<h2>CF3.9 Energy harvesting: cuándo es real y cuándo es un póster de conferencia</h2>
+
+<p>La idea de un nodo que no necesita pila es irresistible, y por eso hay diez veces más papers sobre harvesting que productos con harvesting. La diferencia entre los dos casos es siempre la misma cuenta: <strong>¿la potencia media cosechada supera al consumo medio, con margen, en el peor mes del año?</strong></p>
+
+<table>
+<thead><tr><th>Fuente</th><th>Densidad realista</th><th>Ejemplo de área/volumen</th><th>Potencia útil</th><th>Alcanza para</th></tr></thead>
+<tbody>
+<tr><td>Solar exterior, día despejado</td><td>15–20 mW/cm²</td><td>10 cm²</td><td>150–200 mW</td><td>Prácticamente cualquier cosa</td></tr>
+<tr><td>Solar exterior, <strong>promedio anual</strong> (noche + nubes + suciedad)</td><td>0,3–1 mW/cm²</td><td>10 cm²</td><td>3–10 mW</td><td>Nodo LoRa completo con holgura</td></tr>
+<tr><td>Solar interior, 500 lux (oficina)</td><td>10–25 µW/cm²</td><td>10 cm²</td><td><strong>100–250 µW</strong></td><td>Nodo BLE de 5–30 µA, muy justo</td></tr>
+<tr><td>Solar interior, 200 lux (pasillo)</td><td>3–10 µW/cm²</td><td>10 cm²</td><td>30–100 µW</td><td>Un sensor muy espaciado, y con suerte</td></tr>
+<tr><td>Termoeléctrico, ΔT = 5 K</td><td>20–50 µW/cm²</td><td>4 cm²</td><td>80–200 µW</td><td>Sensor de baja tasa</td></tr>
+<tr><td>Termoeléctrico, ΔT = 30 K (caño industrial)</td><td>1–5 mW/cm²</td><td>4 cm²</td><td>4–20 mW</td><td>Nodo completo, sin restricciones</td></tr>
+<tr><td>Vibración piezo, máquina industrial (0,5 g, 50–100 Hz)</td><td>10–200 µW/cm³</td><td>2 cm³</td><td>20–400 µW</td><td>Nodo BLE espaciado, si la frecuencia coincide con la resonancia</td></tr>
+<tr><td>Vibración humana (caminar)</td><td>1–10 µW/cm³</td><td>2 cm³</td><td>2–20 µW</td><td>Casi nada</td></tr>
+<tr><td>RF ambiental (broadcast, Wi-Fi del vecino)</td><td>0,0001–0,1 µW/cm²</td><td>—</td><td>&lt; 1 µW</td><td><strong>Nada.</strong> Solo funciona con un lector dedicado cerca (RFID/NFC)</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El harvesting no reemplaza el diseño de bajo consumo: lo habilita.</strong> Un nodo de 3 mA de media no lo sostiene ningún panel de interior — necesitarías 1500 cm² a 500 lux, o sea una hoja A4 y media. Primero bajás el consumo a decenas de microamperios; recién ahí el cosechador entra en el rango de lo posible. El orden inverso —"le pongo un panelito y listo"— no funciona nunca.
+</div>
+
+<h3>Los tres costos que no aparecen en el paper</h3>
+
+<div class="step"><strong>1. La fuga del almacenamiento, que es el asesino silencioso.</strong> Un supercapacitor de 1 F barato tiene 5–10 µA de corriente de fuga. Si tu nodo consume 5 µA de media, <strong>la fuga del almacenamiento se come toda la cosecha y más</strong>. Los EDLC de baja fuga bajan a 0,5–1 µA y cuestan varias veces más; las celdas de estado sólido llegan a ~0,1 µA con capacidad chica. Elegir el almacenamiento es tan crítico como elegir la fuente, y se elige por fuga, no por capacidad.</div>
+
+<div class="step"><strong>2. El PMIC de cosecha tiene su propio Iq y su propio arranque en frío.</strong> Un BQ25570 o un AEM10941 consume 0,5–1 µA para funcionar, necesita ~330 mV de entrada para arrancar en frío, y hace seguimiento de punto de máxima potencia con su propio consumo. Cuando el sistema queda vacío del todo —un mes nublado, un almacén sin luz— tiene que poder volver, y ese es el escenario que hay que probar deliberadamente.</div>
+
+<div class="step"><strong>3. El peor caso no es el promedio.</strong> Un panel exterior que rinde 5 mW de promedio anual puede rendir 0,4 mW en una semana de niebla de invierno. Tu almacenamiento tiene que aguantar ese hueco entero. La cuenta que hay que hacer no es de potencia media: es de <strong>energía acumulada en el peor período de escasez</strong>, y eso dimensiona el supercapacitor o la celda.</div>
+
+<div class="concept">
+  <strong>💡 Cuándo el harvesting sí se paga.</strong> Cuando el costo de cambiar la pila supera al del cosechador. Una CR2032 cuesta USD 0,30 y dura cinco años; el sistema de cosecha completo (celda + PMIC + almacenamiento + protecciones) cuesta USD 8–20 en volumen bajo. Con el equipo al alcance de la mano, la pila gana siempre. Pero: 500 nodos en techos industriales, recambio cada 3 años, USD 90 por visita con permiso de trabajo en altura = <strong>USD 45 000 cada 3 años</strong>. El harvesting a USD 15/nodo son USD 7 500 <em>una sola vez</em>: se paga con el 17 % del primer recambio. La decisión es de costo total de propiedad, no de elegancia técnica — y los casos genuinos son los inaccesibles: torres, implantes, hormigón, y todo lo que una normativa prohíba abrir.
+</div>
+
+<h2>CF3.10 Cuándo NO optimizar energía</h2>
+
+<p>Este módulo entero puede ser tiempo perdido, y conviene saber reconocerlo antes de invertir semanas.</p>
+
+<pre><code class="lang-python">P_watts, tarifa_usd_kwh = 1.0, 0.15
+
+kwh_anio = P_watts * 8.76                 # 8.76 kWh/anio
+costo    = kwh_anio * tarifa_usd_kwh      # USD 1.31/anio
+
+print(f"un equipo de {P_watts} W enchufado cuesta USD {costo:.2f} por anio")
+print(f"bajarlo a la mitad ahorra USD {costo/2:.2f} por anio")
+print(f"dos semanas de ingenieria a USD 400/dia = USD {10*400:,}")
+print(f"periodo de repago: {10*400/(costo/2):,.0f} anios")   # 6,088 anios</code></pre>
+
+<div class="rule">
+  <strong>📌 En un equipo enchufado a la red, optimizar consumo es casi siempre trabajo tirado.</strong> El ahorro es de centavos por año y el trabajo cuesta miles de dólares. Ese esfuerzo rinde muchísimo más en confiabilidad, en tests o en las funciones que el cliente pidió. La pregunta que abre cualquier revisión de energía es: <strong>¿de dónde sale la energía de este equipo?</strong> Si la respuesta es "del enchufe", la revisión terminó.
+</div>
+
+<p>Ahora, hay cuatro excepciones donde el consumo importa <em>aunque</em> esté enchufado, y son excepciones de verdad:</p>
+
+<div class="step"><strong>1. Normativa de standby.</strong> La regulación europea de productos relacionados con la energía (ErP/Ecodesign) fija techos de consumo en espera para muchas categorías de producto — típicamente 0,5 W sin display y 1 W con display. Si no cumplís, no vendés en la UE. Acá el consumo no es un ahorro: es un requisito de mercado.</div>
+
+<div class="step"><strong>2. Disipación térmica.</strong> En un gabinete sellado IP67 sin ventilación, la energía que consumís es calor que tenés que sacar. A veces bajar el consumo es la única forma de mantener la electrónica dentro de su rango de temperatura, y ahí el objetivo son los grados, no los vatios.</div>
+
+<div class="step"><strong>3. Presupuestos de potencia impuestos.</strong> PoE 802.3af entrega 12,95 W garantizados en el dispositivo; USB tiene sus límites de negociación; un bus de 4–20 mA alimentado por lazo te da unos pocos miliamperios y punto. Si el presupuesto está cerrado por la infraestructura, cada miliamperio que ahorrás es un miliamperio que podés gastar en otra función.</div>
+
+<div class="step"><strong>4. Escala.</strong> Un vatio por unidad no es nada. Un millón de unidades son un megavatio y USD 1,3 millones al año de electricidad del parque instalado. A esa escala, dos semanas de ingeniería para bajar medio vatio son la mejor inversión del proyecto.</div>
+
+<div class="warn">
+  <strong>Y el caso intermedio que siempre se olvida: el equipo enchufado con batería de respaldo.</strong> El consumo en modo batería sí importa —define cuánto aguanta un corte— y como el 99,9 % del tiempo el equipo está en red, nadie lo mide. Se descubre el día del apagón, cuando el UPS que "aguantaba 4 horas" aguantó 20 minutos. Si tu producto tiene respaldo, el modo batería necesita su propio presupuesto energético, medido con la misma seriedad que el de un nodo autónomo.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "el sensor tenía que durar 2 años y duró 3 semanas"</h2>
+
+<blockquote>Sensor de humedad de suelo para un viñedo. ESP32-C6 con Wi-Fi, sensor capacitivo, 2 pilas AA alcalinas en serie (3,0 V, 2400 mAh de capacidad efectiva). Especificación: 2 años. Los primeros 40 nodos instalados en marzo se apagaron a fines del mismo mes. El equipo dice que el firmware "ya duerme".</blockquote>
+
+<h3>Paso 1 — Convertir la queja en un número</h3>
+
+<pre><code class="lang-python">CAP = 2400.0          # mAh efectivos
+
+presupuesto = CAP / (2 * 8760) * 1000       # 137 uA para durar 2 anios
+real        = CAP / (21 * 24) * 1000        # 4762 uA para durar 3 semanas
+
+print(f"presupuesto: {presupuesto:.0f} uA")
+print(f"real:        {real:.0f} uA")
+print(f"factor:      {real/presupuesto:.1f}x")     # 34.8x</code></pre>
+
+<div class="concept">
+  <strong>💡 El factor de error es un diagnóstico, no solo una métrica.</strong> 34,8× no es "el firmware está flojo". Un firmware flojo da 1,5× o 3×. Un factor de 35 significa que <strong>hay al menos un componente entero que nunca se apaga</strong>. Antes de abrir un editor, esa lectura ya te dice qué clase de bug estás buscando y dónde no perder tiempo.
+</div>
+
+<h3>Paso 2 — Medir de verdad</h3>
+
+<pre><code class="lang-bash"># Nordic PPK2 en modo source meter: alimenta la placa a 3.0 V
+# reemplazando las pilas, y mide la corriente que entrega.
+nrfutil device list
+ppk2 --source-meter --voltage 3000 --duration 3600 --out perfil.csv
+
+# Ver la linea de base sin los picos de radio, en microamperios
+python - &lt;&lt;'PY'
+import csv
+v = [float(r[1]) for r in csv.reader(open("perfil.csv"))]
+v.sort()
+print("mediana:", v[len(v)//2], "uA")     # la base real
+print("p99:    ", v[int(len(v)*0.99)], "uA")
+print("media:  ", sum(v)/len(v), "uA")    # el numero que define la vida util
+PY</code></pre>
+
+<p>Una hora de captura sobre un nodo real, con el perfil descompuesto en fases:</p>
+
+<table>
+<thead><tr><th>Fase medida (ciclo de 30 s)</th><th>Corriente</th><th>Duración</th><th>Aporte a I_media</th></tr></thead>
+<tbody>
+<tr><td><strong>A.</strong> Módulo Wi-Fi que nunca entró en sleep</td><td>1,90 mA</td><td>29,0 s</td><td>1 837 µA</td></tr>
+<tr><td><strong>B.</strong> Sesión Wi-Fi (reconexión + POST)</td><td>88,0 mA</td><td>1,0 s</td><td><strong>2 933 µA</strong></td></tr>
+<tr><td><strong>C.</strong> ADC habilitado el 100 % del tiempo</td><td>0,22 mA</td><td>30,0 s</td><td>220 µA</td></tr>
+<tr><td><strong>D.</strong> MCU dormido + fugas de placa</td><td>0,05 mA</td><td>29,0 s</td><td>48 µA</td></tr>
+<tr><td><strong>Total medido</strong></td><td>—</td><td>—</td><td><strong>5 038 µA</strong></td></tr>
+</tbody>
+</table>
+
+<p>2400 mAh / 5,038 mA = 476 h = <strong>19,8 días</strong>. El modelo reproduce las tres semanas observadas, así que el perfil es correcto y ya podemos confiar en él para simular los arreglos. Tres causas, y ninguna es "el código está mal escrito":</p>
+
+<div class="step"><strong>Causa 1 — El módulo Wi-Fi nunca durmió.</strong> El código llamaba a la API de ahorro de energía, pero antes de arrancar el subsistema de Wi-Fi, así que la configuración se perdía silenciosamente. El módulo se quedaba asociado al AP despertando en cada DTIM. 1,9 mA de base.</div>
+
+<div class="step"><strong>Causa 2 — El ADC quedaba habilitado.</strong> La unidad se inicializaba en el arranque y nunca se liberaba: el bloque analógico quedaba polarizado las 24 horas. 220 µA que solo se ven midiendo, porque en el perfil son un escalón de 0,22 mA que a simple vista parece la línea de base.</div>
+
+<div class="step"><strong>Causa 3 — Despertaba cada 30 segundos.</strong> La humedad de suelo tiene constantes de tiempo de horas (infiltración) a días (evapotranspiración). El evento más rápido que interesa —un riego— dura media hora. Muestrear cada 30 s es sobremuestreo de un factor 60: no aporta ni un bit de información y paga una sesión de radio completa cada vez. Este es el bug más caro de los tres y no está en el código: está en un valor que alguien puso en el prototipo y nadie volvió a mirar.</div>
+
+<h3>Paso 3 — Arreglar, recalculando el presupuesto en cada paso</h3>
+
+<p><strong>Fix 1: que el módulo duerma de verdad.</strong> Se corrige el orden de llamada y se pasa a desconectar entre ciclos.</p>
+
+<table>
+<thead><tr><th>Fase (ciclo de 30 s)</th><th>Corriente</th><th>Duración</th><th>Aporte</th></tr></thead>
+<tbody>
+<tr><td>Deep sleep del SoC (RTC + RAM)</td><td>0,012 mA</td><td>29,0 s</td><td>11,6 µA</td></tr>
+<tr><td>Sesión Wi-Fi con <strong>asociación completa</strong></td><td>88,0 mA</td><td>2,6 s</td><td><strong>7 627 µA</strong></td></tr>
+<tr><td>ADC habilitado el 100 % del tiempo</td><td>0,22 mA</td><td>29,0 s</td><td>213 µA</td></tr>
+<tr><td><strong>Total</strong></td><td>—</td><td>—</td><td><strong>7 851 µA</strong> → 12,7 días</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El primer arreglo empeoró las cosas un 56 %.</strong> Al desconectarse del AP, cada ciclo tiene que reasociarse desde cero: la sesión pasó de 1,0 s a 2,6 s. Ganamos 1,8 mA de base y perdimos 4,7 mA de radio. <strong>Esto es lo que separa un presupuesto energético de una corazonada:</strong> el arreglo era correcto en aislamiento y desastroso en el conjunto, y solo se ve porque cada cambio se vuelve a medir. Un equipo sin instrumentación habría desplegado esto convencido de que mejoró.
+</div>
+
+<p><strong>Fix 2: apagar el ADC entre lecturas.</strong> Total: 7 638 µA → 13,1 días. Mejora un 3 %. Es un arreglo real y correcto, pero a esta altura la radio domina tanto que casi no se nota. Buen recordatorio de que <em>arreglar de arriba hacia abajo</em> no es una preferencia estética: si hubiéramos empezado por el ADC, habríamos "trabajado" para ganar medio día.</p>
+
+<p><strong>Fix 3: llevar el período de 30 s a 15 min.</strong> Es una decisión de producto, no de firmware, y hay que ir a discutirla con el agrónomo. Su respuesta fue que 15 minutos ya son más resolución de la que usan.</p>
+
+<table>
+<thead><tr><th>Fase (ciclo de 900 s)</th><th>Corriente</th><th>Duración</th><th>Aporte</th></tr></thead>
+<tbody>
+<tr><td>Deep sleep del SoC</td><td>0,012 mA</td><td>897,4 s</td><td>12,0 µA</td></tr>
+<tr><td>Sesión Wi-Fi completa</td><td>88,0 mA</td><td>2,6 s</td><td><strong>254,2 µA</strong></td></tr>
+<tr><td><strong>Total</strong></td><td>—</td><td>—</td><td><strong>266,2 µA</strong> → 1,03 años</td></tr>
+</tbody>
+</table>
+
+<p>29× mejor de un solo cambio, y todavía a la mitad del objetivo. La radio sigue siendo el 95 % del presupuesto.</p>
+
+<p><strong>Fix 4: desacoplar el muestreo de la transmisión.</strong> Muestrear cada 15 min sigue siendo barato (12 µA de sleep más 25 ms de ADC); lo caro es la sesión de Wi-Fi. Se acumulan las 4 lecturas en RAM retenida y se transmiten juntas una vez por hora. Como vimos en CF3.5, el handshake domina: mandar 4 valores cuesta lo mismo que mandar 1.</p>
+
+<table>
+<thead><tr><th>Fase (ciclo de 3600 s)</th><th>Corriente</th><th>Duración</th><th>Aporte</th></tr></thead>
+<tbody>
+<tr><td>Deep sleep del SoC</td><td>0,012 mA</td><td>3 597,3 s</td><td><strong>11,99 µA</strong></td></tr>
+<tr><td>4 lecturas de ADC (25 ms c/u)</td><td>3,20 mA</td><td>0,10 s</td><td>0,09 µA</td></tr>
+<tr><td>Sesión Wi-Fi completa</td><td>88,0 mA</td><td>2,60 s</td><td><strong>63,56 µA</strong></td></tr>
+<tr><td>Subtotal del circuito</td><td>—</td><td>—</td><td>75,64 µA</td></tr>
+<tr><td>Autodescarga de la alcalina (2,5 %/año)</td><td>—</td><td>—</td><td>6,85 µA</td></tr>
+<tr><td><strong>Total</strong></td><td>—</td><td>—</td><td><strong>82,48 µA</strong></td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python">horas = 2400 / 0.08248
+print(f"{horas:,.0f} h = {horas/8760:.2f} anios")          # 3.32 anios
+print(f"con 30 % de margen: {horas/8760/1.3:.2f} anios")   # 2.55 anios</code></pre>
+
+<div class="rule">
+  <strong>📌 2,55 años con margen de diseño del 30 %: la especificación se cumple.</strong> Mejora total de <strong>67×</strong> sobre el estado inicial, y ni una sola línea de la lógica de la aplicación cambió. El desglose de dónde vino la mejora es la parte que hay que llevarse: cambiar el período aportó 29×, dormir el módulo aportó 2×, y el ADC aportó 1,03×. La decisión de producto valió catorce veces más que el mejor arreglo de firmware.
+</div>
+
+<h3>Paso 4 — Lo que NO se hizo, y por qué</h3>
+
+<p>La alternativa evidente era cambiar Wi-Fi por LoRaWAN. La cuenta, reportando cada 15 minutos:</p>
+
+<table>
+<thead><tr><th>Fase (ciclo de 900 s, LoRa SF7)</th><th>Corriente</th><th>Duración</th><th>Aporte</th></tr></thead>
+<tbody>
+<tr><td>Deep sleep del SoC</td><td>0,012 mA</td><td>898,7 s</td><td>11,98 µA</td></tr>
+<tr><td>Lectura de ADC</td><td>3,20 mA</td><td>0,025 s</td><td>0,09 µA</td></tr>
+<tr><td>LoRa TX SF7 (+14 dBm)</td><td>45,0 mA</td><td>0,062 s</td><td>3,10 µA</td></tr>
+<tr><td><strong>Ventanas RX1 + RX2 (obligatorias en Class A)</strong></td><td>5,50 mA</td><td>1,20 s</td><td><strong>7,33 µA</strong></td></tr>
+<tr><td>Autodescarga de la alcalina</td><td>—</td><td>—</td><td>6,85 µA</td></tr>
+<tr><td><strong>Total</strong></td><td>—</td><td>—</td><td><strong>29,35 µA</strong> → 9,3 años</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Dos lecciones finales, y las dos son de nivel senior.</strong><br><br>
+  <strong>(1) Escuchar salió 2,4× más caro que hablar.</strong> El TX aporta 3,10 µA; las ventanas de recepción obligatorias aportan 7,33 µA. Cualquier presupuesto de LoRaWAN que solo cuente el tiempo en el aire de la transmisión está subestimando la radio por más del doble.<br><br>
+  <strong>(2) Tocamos el piso de la química.</strong> De los 29,35 µA finales, la autodescarga de la pila aporta el 23 % y el deep sleep del SoC otro 41 %. Solo el 36 % es trabajo útil. A partir de acá, optimizar firmware no sirve <em>de nada</em>: para mejorar habría que cambiar de química (Li-SOCl₂ al 1 %/año) o de SoC (nRF54L15 a 0,5 µA en lugar de los 12 µA del ESP32-C6). <strong>Saber que llegaste al piso es tan valioso como saber optimizar</strong>, porque es lo que te dice cuándo parar.
+</div>
+
+<p>Y el motivo real por el que no se hizo: LoRaWAN necesita un gateway, el viñedo no tiene ninguno, y la infraestructura Wi-Fi de los galpones ya existía. Nueve años de autonomía no justifican desplegar y mantener una red nueva cuando la especificación pedía dos. <strong>El diseño técnicamente superior perdió contra la restricción de infraestructura, y estuvo bien que perdiera.</strong> Queda documentado en el informe para la versión siguiente, cuando el cliente evalúe cubrir las parcelas sin Wi-Fi.</p>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Medís un nodo y la base de sleep da 900 µA cuando la suma de las hojas de datos da 4 µA. ¿Por dónde empezás?</summary>
+<p>No por el firmware. El factor es 225×, y eso descarta que sea un problema de configuración de modos de sueño: es un componente entero que nunca se apaga o una fuga de hardware. El orden es de afuera hacia adentro: mirar la placa (LEDs, jumpers, el depurador conectado), después medir antes y después de cada regulador para partir el problema por dominio, después levantar componentes de a uno —el módulo de radio primero, que es el sospechoso más frecuente, después el sensor— y recién al final revisar el código. Con un factor de 225 los candidatos concretos son: un LDO con miliamperios de Iq, un módulo de radio que nunca durmió, o un pull-up de I²C con la línea en cero, que solo con SDA y SCL a 4,7 kΩ ya son 1,4 mA.</p></details>
+
+<details><summary>Tu nodo despierta cada 5 segundos. ¿Conviene deep sleep o el modo intermedio tipo Stop?</summary>
+<p>Casi seguro el intermedio. La cuenta es <code>T_cruce = E_wake / (I_stop − I_deep)</code>. Con un despertar de 3 mA durante 15 ms, la energía por despertar son 45 µA·s; con Stop a 1,7 µA y deep sleep a 0,3 µA, el cruce está en 32 segundos. Despertando cada 5 s, el deep sleep te costaría 0,3 + 45/5 = 9,3 µA contra 1,7 µA del Stop: <strong>cinco veces peor</strong>. Y hay un costo adicional que no entra en esa fórmula: si el deep sleep pierde la RAM, hay que reinicializar el stack de radio en cada despertar, lo que puede sumar decenas de milisegundos a varios miliamperios. El <code>t_wake</code> real hay que medirlo, porque incluye tu propia inicialización de periféricos, que suele ser la mayor parte.</p></details>
+
+<details><summary>Un cliente pide bajar el consumo de un equipo que está permanentemente enchufado a la red. ¿Qué le respondés?</summary>
+<p>Que probablemente sea trabajo tirado, y por qué: un equipo de 1 W permanente cuesta USD 1,31 al año de electricidad, así que bajarlo a la mitad ahorra 66 centavos anuales, y dos semanas de ingeniería nunca se pagan. Pero antes de cerrar el tema hay que preguntar por las cuatro excepciones reales: (1) si tiene que cumplir un tope regulatorio de standby, donde el consumo es un requisito de mercado y no un ahorro; (2) si el gabinete es sellado y el problema real es térmico, porque ahí el objetivo son los grados; (3) si la alimentación tiene un presupuesto cerrado como PoE o un lazo de 4–20 mA, donde cada miliamperio ahorrado se puede gastar en otra función; (4) si se van a fabricar cientos de miles de unidades, donde un vatio por unidad se vuelve un megavatio de parque instalado. Y una quinta que casi nadie menciona: si el equipo tiene batería de respaldo, el consumo en modo batería sí importa y nadie lo midió nunca.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>La autonomía se <strong>diseña</strong>, no se optimiza al final. La herramienta es el presupuesto energético: <code>I_media = Σ(I_fase × t_fase) / T</code>, armado en el día uno y corregido con mediciones.</li>
+  <li>La <strong>corriente media</strong> define cuánto dura; la <strong>corriente pico</strong> define si funciona. Son problemas distintos: la primera se resuelve con duty cycling, la segunda con la resistencia interna de la pila y capacitores de reserva.</li>
+  <li>Los mAh nominales tienen tres descuentos que hay que aplicar siempre: temperatura, corriente de descarga y la tensión de corte de tu regulador. Y la <strong>autodescarga</strong> descarta el litio recargable para años: 3 %/mes son 918 mAh/año, 38× lo que consume un nodo bien diseñado.</li>
+  <li>La escalera de modos de sueño tiene un <strong>punto de cruce</strong>: dormir más profundo cuesta más despertar. Con números típicos, debajo de ~32 segundos de período gana el modo intermedio. "Usá siempre el más profundo" es un mito.</li>
+  <li>En 2026 todos los SoC serios duermen a menos de 1 µA. La diferencia real está en los <strong>µA/MHz activos</strong> y el tiempo de despertar: 20 µA/MHz del nRF54L15 contra 50 del nRF52840. Se elige por tiempo despierto, no por sleep.</li>
+  <li>Transmitir es lo más caro: <strong>41 µJ un advertising BLE, 220 mJ un mensaje LoRa SF12, 1,16 J un POST por Wi-Fi con TLS</strong>. Y el handshake domina, así que mandar de a lotes es casi gratis. Recibir también cuesta: en LoRaWAN Class A las ventanas de RX pueden costar 2,4× la transmisión.</li>
+  <li><strong>Espaciar los reportes le gana a cualquier optimización de código.</strong> De 1 min a 15 min son 15×; ninguna optimización de firmware da más de 1,3×.</li>
+  <li>Un multímetro no sirve: no tiene ancho de banda, el autorango es más lento que tus eventos, y su burden voltage resetea el circuito. Se mide con analizador de corriente (PPK2, Joulescope, Otii) y se lee por <strong>área</strong>, nunca por altura de pico.</li>
+  <li>Los ladrones se buscan de afuera hacia adentro y el firmware va último. Si la base medida es más de 10× la teórica, no toques el código todavía.</li>
+  <li>El regulador se elige por su <strong>corriente de reposo</strong>, no por su corriente máxima. Con carga de microamperios el LDO nano-Iq gana 4,4× a un buck típico; el buck solo gana con relaciones de tensión grandes o cuando hay que subir.</li>
+  <li>El <strong>harvesting</strong> no reemplaza el bajo consumo: lo habilita. La fuga del supercapacitor puede superar toda la cosecha, y la cuenta que decide es de costo total de propiedad, no de elegancia.</li>
+  <li>Y en un equipo enchufado, todo esto es tiempo perdido — salvo por normativa de standby, disipación térmica, presupuesto de potencia impuesto, escala, o modo de batería de respaldo.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Armá el presupuesto energético de un proyecto tuyo (o de uno inventado) con la tabla de CF3.1: una fila por fase, con corriente y duración. Calculá la vida útil con capacidad nominal, con capacidad útil al 80 % y sumando la autodescarga. Compará los tres números y explicá cuál le darías al cliente.</li>
+  <li>Buscá la hoja de datos del MCU que uses y armá su tabla de modos: consumo, tiempo de despertar y qué se pierde en cada escalón. Calculá el punto de cruce entre los dos modos más profundos con la fórmula de CF3.3. ¿Cuál te conviene con el período de tu aplicación?</li>
+  <li>Medí el tiempo real de despertar de tu placa: poné un GPIO en alto como primera instrucción después del despertar y bajalo cuando terminó toda la inicialización. Miralo con el osciloscopio. ¿Cuánto de ese tiempo es el hardware y cuánto es tu propio código de inicialización?</li>
+  <li>Tomá las tres tecnologías de radio de la tabla de CF3.5 y calculá cuántos años dura tu proyecto con cada una, para períodos de reporte de 1 min, 15 min y 1 hora. Armá una matriz de 3×3. ¿Qué decisión cambia más la vida útil: la tecnología o el período?</li>
+  <li>Buscá los diez ladrones de CF3.7 en un esquemático real —uno tuyo, o cualquiera de código abierto—. Anotá los que encuentres y estimá el consumo de cada uno con la ley de Ohm. ¿Cuál sería la base de sleep de esa placa?</li>
+  <li>Con un shunt y un osciloscopio (o con un PPK2 si tenés), capturá el perfil de consumo de un ciclo completo de tu proyecto. Identificá cada evento, calculá su área en µC y armá la tabla del presupuesto con datos medidos. Compará con tu estimación del ejercicio 1: ¿cuánto te equivocaste y en qué dirección?</li>
+  <li>Elegí dos reguladores reales de un distribuidor: un LDO nano-Iq y un buck para IoT. Con sus Iq y eficiencias reales, reproducí la tabla de CF3.8 para tu perfil de carga. ¿Dónde está el cruce en <em>tu</em> caso?</li>
+  <li>Diseñá el sistema de harvesting para un nodo de 30 µA de media que vive en una oficina a 300 lux. Calculá el área de celda necesaria, el tamaño del almacenamiento para aguantar un fin de semana largo a oscuras, y la fuga máxima tolerable del supercapacitor. ¿Cierra?</li>
+  <li>Volvé al worked example y calculá qué pasa si el nodo está al borde de la cobertura Wi-Fi y el 30 % de las sesiones necesita un reintento completo. ¿Sigue cumpliendo los 2 años? ¿Qué tope de reintentos pondrías en el firmware?</li>
+  <li>Tomá el resultado final del worked example (82,48 µA) y calculá qué autonomía tendría con nRF54L15 en lugar de ESP32-C6 (deep sleep de 0,5 µA en vez de 12 µA) y con Li-SOCl₂ en lugar de alcalina (1 %/año en vez de 2,5 %). ¿Cuál de los dos cambios rinde más, y por qué?</li>
+</ol>
+
+<section class="quiz" id="quizCF_S3">
+  <style>
+    #quizCF_S3{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCF_S3 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCF_S3 .q{margin-bottom:1.5rem}
+    #quizCF_S3 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCF_S3 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCF_S3 .opt:hover{border-color:var(--accent)}
+    #quizCF_S3 .opt:disabled{cursor:default}
+    #quizCF_S3 .opt.ok{background:rgba(63,185,80,.16);border-color:var(--success, #3fb950)}
+    #quizCF_S3 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCF_S3 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCF_S3 .exp.show{display:block}
+    #quizCF_S3 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un nodo tiene dos consumos: un módulo de radio que pega 88 mA durante 2,6 s cada hora, y un regulador con 0,22 mA de corriente de reposo permanente. ¿Cuál se lleva más batería?</p>
+    <button class="opt">La radio, porque 88 mA es 400 veces más que 0,22 mA</button>
+    <button class="opt">Los dos aportan lo mismo, porque la energía total se conserva</button>
+    <button class="opt">El regulador: aporta 220 µA contra los 63,6 µA de la radio</button>
+    <div class="exp">La cuenta es <code>I × t / T</code>. La radio: 88 mA × 2,6 s / 3600 s = 63,6 µA. El regulador: 0,22 mA × 3600 s / 3600 s = 220 µA. El regulador "inofensivo" se lleva <strong>3,5 veces más</strong> que el módulo espantoso, porque está encendido el 100 % del tiempo contra el 0,07 % de la radio. Es exactamente la intuición que hay que desaprender: la corriente alta llama la atención, pero lo que define la vida útil es el área bajo la curva, no la altura.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu nodo despierta cada 3 segundos. El deep sleep consume 0,3 µA y el modo Stop 1,7 µA; despertar del deep sleep cuesta 3 mA durante 15 ms de reinicialización. ¿Qué modo elegís?</p>
+    <button class="opt">Stop, porque a 3 s de período el costo de despertar del deep sleep da 15,3 µA — nueve veces peor</button>
+    <button class="opt">Deep sleep, porque siempre conviene el modo de menor corriente</button>
+    <button class="opt">Da igual: la diferencia de 1,4 µA es despreciable en cualquier presupuesto</button>
+    <div class="exp">La energía por despertar es 3 mA × 15 ms = 45 µA·s, que repartida en un período de 3 s aporta 15 µA. Deep sleep te sale 0,3 + 15 = 15,3 µA; Stop te sale 1,7 µA. El punto de cruce está en <code>45 / (1,7 − 0,3) = 32 s</code>: solo con períodos más largos que eso conviene el modo profundo. Y hay un costo extra que la fórmula ni siquiera captura: si el deep sleep pierde la RAM, hay que reinicializar el stack de radio en cada despertar, lo que suma decenas de milisegundos más.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Un sensor con CR2032 tiene que reportar por Wi-Fi. La cuenta de energía cierra con margen: 2430 J de la pila contra 1,16 J por mensaje. ¿Por qué el prototipo se resetea cada vez que intenta transmitir?</p>
+    <button class="opt">Porque el firmware tiene un bug en la rutina de transmisión</button>
+    <button class="opt">Porque el pico de 300 mA sobre los 15 Ω de resistencia interna de la CR2032 hunde la tensión de alimentación</button>
+    <button class="opt">Porque la CR2032 no tiene suficientes mAh para alimentar Wi-Fi</button>
+    <div class="exp">La corriente media y la corriente pico son problemas independientes. La cuenta de energía cierra, pero un pico de 300 mA sobre 15 Ω de resistencia interna implica 4,5 V de caída sobre una pila de 3,0 V: colapsa. El síntoma es cruel porque parece firmware —anda en el banco con fuente, falla en campo— y solo se diagnostica mirando la tensión de alimentación con el osciloscopio <em>durante</em> el pico. Un capacitor de reserva no salva: para sostener 350 mA por 2 ms con 200 mV de caída hacen falta 3500 µF. La solución es de arquitectura: otra radio u otra pila.</div>
+  </div>
+
+  <div class="score" id="scoreCF_S3"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCF_S3');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCF_S3').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🔋 Seguí con CF4.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cf2-arquitectura-firmware/lecture.html">← CF2: Arquitectura de firmware</a>
+  <a href="../cf4-buses-industriales/lecture.html">CF4: Buses industriales →</a>
+</nav>
+
+</div>
+</body>
+</html>

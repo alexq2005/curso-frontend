@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CF5 — Integridad de señal y diseño de PCB: cuando el cable deja de ser un cable · Computación Física Senior</title>
+  <meta name="description" content="Cuándo una pista se vuelve línea de transmisión (el flanco, no el reloj), impedancia característica y microstrip, reflexiones y terminación, el camino de retorno de la corriente, desacoplo real con su inductancia parásita, crosstalk y la regla 3W, mezclar analógico con digital, EMI/EMC y área de bucle, ESD, stackup de 2 vs 4 capas, y cuándo no preocuparse por nada de esto.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física Senior</a>
+  <a href="../../index.html">🔌 Curso de Computación Física</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CF5</span>
+  <span class="badge">⏱ 45–105 min</span>
+  <span class="badge">🎯 Pre-req: E00, E01, E06 · CF4</span>
+  <span class="badge">📐 Diseño físico</span>
+</div>
+
+<article>
+
+<h1>CF5 — Integridad de señal y diseño de PCB: cuando el cable deja de ser un cable</h1>
+
+<h2>CF5.0 Por qué este módulo</h2>
+
+<p>Hasta acá el cable fue un detalle de implementación. En <a href="../../e00-fundamentos-electricos/lecture.html">E00</a> aprendiste que un conductor tiene resistencia; en <a href="../../e01-componentes-circuitos/lecture.html">E01</a>, que los componentes tienen valores; en <a href="../../e06-senales-sistemas/lecture.html">E06</a>, que una señal tiene espectro. Todo eso asume, implícitamente, que <strong>lo que sale por un extremo del cable llega igual al otro extremo, al instante</strong>. Es una aproximación excelente. Y deja de valer exactamente en el momento en que empezás a diseñar hardware que importa.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Una pista de cobre no es un nodo eléctrico: es una <strong>estructura física con retardo</strong>. Mientras el flanco de tu señal sea largo comparado con ese retardo, la pista se comporta como el cable ideal del esquemático. Cuando el flanco se vuelve corto, la misma pista pasa a ser una <strong>línea de transmisión</strong> —con impedancia, reflexiones y ecos— y el circuito que funcionaba deja de funcionar sin que hayas cambiado una sola línea de código ni un solo componente.
+</div>
+
+<p>Esto es lo que hace tan desconcertante la integridad de señal para quien viene del software. No hay un <em>commit</em> culpable. El firmware es el mismo, el esquemático es el mismo, el BOM es el mismo. Cambió el <em>layout</em>, o cambió el proveedor del chip por uno con salidas más rápidas, o simplemente hace calor. Y el sistema falla de manera intermitente, dependiente de la temperatura, no reproducible en el banco y perfectamente reproducible en la casa del cliente.</p>
+
+<div class="analogy">
+  <strong>🎭 La analogía útil.</strong> Pensá en gritar dentro de un túnel. Si hablás lento, tu voz y su eco se superponen y no notás nada raro: escuchás una sola voz. Si hablás rápido y cortado, cada sílaba vuelve rebotada encima de la siguiente y el mensaje se vuelve ilegible. No cambió el túnel: cambió la velocidad con la que hablás. En una pista, la "velocidad con la que hablás" es el <strong>tiempo de subida</strong>, y el eco es la <strong>reflexión</strong>.
+</div>
+
+<p>Este módulo es el más físico de la pista senior y, deliberadamente, el que menos código tiene. Lo que vas a llevarte son <strong>números y umbrales</strong>: cuándo empezar a preocuparte, cuánto cuesta cada mitigación y —tan importante como lo anterior— cuándo la respuesta correcta es no hacer nada.</p>
+
+<h2>CF5.1 Cuándo importa: el flanco, no el reloj</h2>
+
+<p>El error conceptual más extendido es creer que la integridad de señal empieza a partir de cierta frecuencia de reloj. <strong>La frecuencia del reloj es casi irrelevante.</strong> Lo que manda es el <strong>tiempo de subida</strong> (<em>t</em><sub>r</sub>): cuánto tarda el flanco en pasar del 10 % al 90 % de su amplitud.</p>
+
+<p>La razón es espectral, y la viste en <a href="../../e06-senales-sistemas/lecture.html">E06</a>: una onda cuadrada no contiene una frecuencia, contiene una serie infinita de armónicos. El contenido espectral relevante no se corta en la fundamental sino en la <strong>frecuencia de codo</strong>, que depende solo del flanco:</p>
+
+<pre><code class="lang-python">f_codo ≈ 0.5 / t_r          # regla de Howard Johnson
+
+# Una señal de 1 kHz con flancos de 1 ns
+# lleva energía significativa hasta 500 MHz.
+# El reloj es de 1 kHz. La placa se comporta como una placa de 500 MHz.</code></pre>
+
+<h3>La longitud crítica</h3>
+
+<p>Una pista deja de ser un cable cuando su retardo de propagación deja de ser despreciable frente al flanco. La regla de bolsillo más usada: la pista es <em>eléctricamente corta</em> si mide menos de <strong>un sexto de la extensión espacial del flanco</strong>.</p>
+
+<pre><code class="lang-python">v_microstrip = 173 mm/ns        # FR-4, εr efectivo ≈ 3.0
+t_pd         = 5.8 ps/mm ≈ 6 ps/mm
+
+ℓ_crítica = t_r · v / 6
+
+# Sustituyendo:  ℓ_crítica [mm] ≈ t_r [ps] / 36
+# O, para tenerlo en la cabeza:</code></pre>
+
+<div class="rule">
+  <strong>📌 28 mm por cada nanosegundo de flanco.</strong> En microstrip sobre FR-4, la longitud crítica es de unos <strong>28 mm por cada ns de tiempo de subida</strong>. Más largo que eso y tenés una línea de transmisión, con independencia total de la frecuencia a la que la uses.
+</div>
+
+<table>
+<thead><tr><th>Familia / origen del flanco</th><th>t<sub>r</sub> típico</th><th>f<sub>codo</sub></th><th>ℓ crítica</th></tr></thead>
+<tbody>
+<tr><td>74HC a 5 V (los chips de E02)</td><td>6 ns</td><td>83 MHz</td><td>167 mm</td></tr>
+<tr><td>74HCT / lógica lenta</td><td>2 ns</td><td>250 MHz</td><td>56 mm</td></tr>
+<tr><td>74LVC · GPIO en modo lento</td><td>1 ns</td><td>500 MHz</td><td>28 mm</td></tr>
+<tr><td>GPIO de MCU moderno (por defecto)</td><td>500 ps</td><td>1,0 GHz</td><td>14 mm</td></tr>
+<tr><td>74AUC · salidas de FPGA</td><td>300 ps</td><td>1,7 GHz</td><td>8 mm</td></tr>
+<tr><td>SerDes · DDR</td><td>150 ps</td><td>3,3 GHz</td><td>4 mm</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Acá está el problema real de 2026.</strong> Las placas didácticas siguen enseñando con lógica de los 90 (flancos de nanosegundos, longitud crítica de más de 15 cm: en una placa de 10 × 10 cm nunca pasa nada). Pero el chip que vos vas a poner es un MCU moderno cuyos GPIO conmutan en <strong>300–500 ps</strong> aunque lo uses para parpadear un LED. Tu longitud crítica bajó a <strong>8–14 mm</strong>. Cualquier pista más larga que el ancho de un dedo ya es una línea de transmisión.
+</div>
+
+<div class="tip">
+  <strong>🔧 El arreglo más barato de todo el módulo es de firmware.</strong> Casi todos los MCU modernos permiten configurar la velocidad de flanco de cada GPIO. En STM32 es el registro <code>OSPEEDR</code> (low / medium / high / very high); en ESP32, <code>gpio_set_drive_capability()</code>; en muchos otros, un bit de <em>slew rate control</em>. Poner un pin en velocidad baja puede llevar el flanco de 500 ps a más de 10 ns: la longitud crítica se multiplica por veinte y el problema desaparece <strong>sin tocar la placa</strong>. La regla es: dejá en velocidad alta solo los pines que de verdad necesitan velocidad.
+</div>
+
+<h2>CF5.2 Líneas de transmisión: qué es la impedancia característica</h2>
+
+<p>Cuando la pista es eléctricamente larga, la señal viaja como una <strong>onda</strong> y la pista presenta al emisor una <strong>impedancia característica</strong> Z<sub>0</sub>: la relación entre tensión y corriente de esa onda mientras avanza. No es una resistencia (no disipa nada) y no depende del largo: depende <strong>solo de la geometría de la sección transversal</strong>.</p>
+
+<pre><code class="lang-python">                      w = 0.33 mm
+                    ┌────────────┐   ← pista de cobre, t = 35 µm (1 oz)
+      ──────────────┴────────────┴─────────────────────
+      ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   dieléctrico FR-4
+      ░░░░░░░░░░░░░░░ εr ≈ 4.3 ░░░░░░░░░░░░ h = 0.2 mm   (prepreg)
+      ████████████████████████████████████████████████   ← PLANO DE MASA
+                  MICROSTRIP  (pista en capa externa)
+
+
+      ████████████████████████████████████████████████   ← plano de masa
+      ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+      ──────────────┬────────────┬─────────────────────  ← pista enterrada
+      ░░░░░░░░░░░░░░└────────────┘░░░░░░░░░░░░░░░░░░░░
+      ████████████████████████████████████████████████   ← plano de masa
+                  STRIPLINE  (pista en capa interna)</code></pre>
+
+<p>Para microstrip la aproximación clásica (IPC-2141) alcanza y sobra para diseñar:</p>
+
+<pre><code class="lang-python">import math
+
+def z0_microstrip(h, w, t=0.035, er=4.3):
+    """h, w, t en mm. Valida para 0.1 ≤ w/h ≤ 3.0"""
+    return (87 / math.sqrt(er + 1.41)) * math.log(5.98 * h / (0.8 * w + t))
+
+z0_microstrip(h=0.20, w=0.33)   # 50.5 Ω   ← 4 capas, prepreg fino
+z0_microstrip(h=0.40, w=0.33)   # 75.7 Ω   ← el doble de altura
+z0_microstrip(h=0.20, w=0.66)   # 27.4 Ω   ← el doble de ancho
+z0_microstrip(h=1.60, w=0.33)   # 126.2 Ω  ← 2 capas, plano del otro lado</code></pre>
+
+<div class="rule">
+  <strong>📌 Lo que determina Z<sub>0</sub> es la relación w/h, no el ancho solo.</strong> Duplicar la altura al plano sube la impedancia un 50 %; duplicar el ancho la baja casi a la mitad. Por eso <strong>una pista no tiene impedancia hasta que decidís dónde está su plano de referencia</strong>. El ancho por sí solo no dice nada.
+</div>
+
+<div class="warn">
+  <strong>El caso que arruina placas de dos capas.</strong> Esa misma pista de 0,33 mm que da 50 Ω sobre un prepreg de 0,2 mm da <strong>126 Ω</strong> si el único plano está del otro lado de un FR-4 de 1,6 mm. Para conseguir 50 Ω en una placa de dos capas de 1,6 mm necesitás una pista de <strong>2,9 mm de ancho</strong> — casi tres milímetros, que en la práctica no podés rutear. Es la razón técnica, no estética, por la que el trabajo de alta velocidad se hace en cuatro capas.
+</div>
+
+<h3>Por qué 50 Ω</h3>
+
+<p>Los 50 Ω no salen de la física: salen de un compromiso histórico del mundo del cable coaxial. La mínima pérdida en un coaxial con dieléctrico de aire está cerca de 77 Ω; la máxima potencia transmisible, cerca de 30 Ω; la media geométrica da ≈ 48 Ω, y se redondeó. Hoy es simplemente <strong>una convención que hace que los componentes de todo el mundo encajen entre sí</strong>: instrumentos, conectores, antenas, terminaciones. Vos elegís 50 Ω por la misma razón por la que elegís UTF-8, no porque sea óptimo sino porque todo lo demás lo asume.</p>
+
+<div class="info">
+  Hay excepciones consolidadas y conviene conocerlas: <strong>75 Ω</strong> en video y RF de consumo (minimiza atenuación), <strong>90 Ω diferencial</strong> en USB, <strong>100 Ω diferencial</strong> en Ethernet, LVDS y CAN, <strong>85 o 100 Ω</strong> en PCIe según generación. Si el bus lo especifica, no negociás: el estándar ya eligió por vos.
+</div>
+
+<h2>CF5.3 Reflexiones: ringing, overshoot y terminación</h2>
+
+<p>Cuando la onda llega al final de la línea y encuentra una impedancia distinta de Z<sub>0</sub>, parte de la energía <strong>rebota</strong>. Cuánto rebota lo dice el coeficiente de reflexión:</p>
+
+<pre><code class="lang-python">Γ = (Z_carga − Z_0) / (Z_carga + Z_0)
+
+# Casos límite:
+#   carga = Z0        →  Γ = 0     no rebota nada (terminación perfecta)
+#   carga abierta     →  Γ = +1    rebota TODO en fase  → la tensión se DUPLICA
+#   carga en corto    →  Γ = −1    rebota todo invertido → la tensión se anula</code></pre>
+
+<p>Y acá está el detalle que vuelve el problema inevitable en lógica digital: <strong>la entrada de un chip CMOS es prácticamente un circuito abierto</strong> (megaohms en paralelo con unos pocos picofaradios). Es decir, Γ ≈ +1: el peor caso posible. Toda señal que llega a una entrada CMOS por una línea sin terminar rebota entera.</p>
+
+<h3>La escalera de rebotes, con números</h3>
+
+<p>Salida de un MCU con impedancia de salida de 20 Ω, línea de 50 Ω, entrada CMOS al final, alimentación de 3,3 V:</p>
+
+<pre><code class="lang-python">Γ_fuente = (20 − 50) / (20 + 50) = −0.43
+Γ_carga  = +1.0                              # entrada CMOS = abierto
+
+onda incidente = 3.3 · 50 / (50 + 20) = 2.36 V   # divisor entre Rs y Z0
+
+  t = 1·TD →  V_carga = 4.71 V   (143 % de VDD)  ← OVERSHOOT
+  t = 3·TD →  V_carga = 2.69 V   ( 82 % de VDD)  ← UNDERSHOOT
+  t = 5·TD →  V_carga = 3.56 V   (108 % de VDD)
+  t = 7·TD →  V_carga = 3.19 V   ( 97 % de VDD)  → converge a 3.3 V</code></pre>
+
+<pre><code class="lang-python">  V ▲
+4.71┤          ┌────┐                                pico = 143 % de VDD
+    │          │    │
+3.56┤          │    │         ┌────┐
+3.30┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌┼╌╌╌┌───────────╌  VDD = 3.3 V
+3.19┤          │    │         │    │   │
+2.69┤          │    └─────────┘    └───┘
+    │          │
+0.00┼──────────┘                                   tiempo ▶
+    0         TD       3·TD      5·TD    7·TD
+
+      ▲ esto es "ringing": la señal converge rebotando</code></pre>
+
+<div class="danger">
+  <strong>⚠️ 4,71 V en un pin de 3,3 V.</strong> El <em>absolute maximum rating</em> típico de una entrada de 3,3 V es VDD + 0,3 = <strong>3,6 V</strong>. Ese pico de 4,71 V hace conducir los diodos de protección del chip, que inyectan corriente en el riel de alimentación. Con suerte el chip sobrevive y solo ves ruido; sin suerte, <em>latch-up</em>, o degradación acumulativa que mata la placa a los seis meses de campo. Y si la señal es un reloj, cada cruce espurio del umbral en el <em>undershoot</em> es un <strong>flanco extra que el chip cuenta</strong>.
+</div>
+
+<h3>Las terminaciones, con su costo</h3>
+
+<table>
+<thead><tr><th>Técnica</th><th>Cómo</th><th>Consumo en reposo</th><th>Cuándo usarla</th></tr></thead>
+<tbody>
+<tr><td><strong>Serie (source)</strong></td><td>R = Z<sub>0</sub> − Z<sub>salida</sub> pegada al emisor. Acá 50 − 20 = 30 Ω → <strong>33 Ω</strong> E24</td><td><strong>0 mA</strong></td><td>Punto a punto, una sola carga al final. El 90 % de los casos en embebidos</td></tr>
+<tr><td><strong>Paralelo simple</strong></td><td>50 Ω a masa en el receptor</td><td>66 mA · <strong>218 mW</strong> por línea en alto</td><td>Casi nunca en digital alimentado a batería</td></tr>
+<tr><td><strong>Thévenin (split)</strong></td><td>100 Ω a VDD + 100 Ω a GND (≡ 50 Ω, polarizado a VDD/2)</td><td>16,5 mA · <strong>54 mW</strong> siempre, en los dos estados</td><td>Buses multipunto rápidos con alimentación de red</td></tr>
+<tr><td><strong>AC (RC)</strong></td><td>50 Ω en serie con 100 pF a masa</td><td>Solo durante las transiciones</td><td>Cuando no podés pagar corriente continua pero necesitás terminar en el receptor</td></tr>
+<tr><td><strong>Diferencial</strong></td><td>100 Ω entre los dos conductores, en el receptor</td><td>Lo que exija el estándar</td><td>Obligatoria: USB, Ethernet, LVDS, CAN (ver <a href="../cf4-buses-industriales/lecture.html">CF4</a>)</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Empezá siempre por la terminación serie.</strong> Cuesta un resistor de un centavo, no consume corriente y resuelve el caso dominante en embebidos (un emisor, un receptor). Sus dos limitaciones: solo funciona si hay <strong>una sola carga, ubicada al final</strong> de la línea (una carga a mitad de camino ve la señal a media escala durante 2·TD), y el resistor tiene que estar <strong>a menos de un centímetro del pin que emite</strong>, no en cualquier parte del recorrido.
+</div>
+
+<div class="mistake">
+  <strong>El error clásico de laboratorio.</strong> Ver ringing en el osciloscopio, poner una punta con masa de cocodrilo de 15 cm, y creer lo que aparece en pantalla. Ese lazo de masa de la punta tiene decenas de nanohenrios y <strong>fabrica su propio ringing</strong> de 100–200 MHz que no existe en la placa. Para medir flancos rápidos hay que usar el resorte de masa corto (o soldar un cable de 5 mm al plano). Si no, estás midiendo tu propia punta.
+</div>
+
+<h2>CF5.4 El plano de masa: lo más importante de la placa</h2>
+
+<p>Si tuvieras que quedarte con una sola idea de este módulo, que sea esta: <strong>la corriente vuelve</strong>. Siempre. Cada electrón que sale por una pista tiene que regresar a la fuente, y el camino que elige para volver define la impedancia, el ruido, el crosstalk y las emisiones radiadas de tu placa entera.</p>
+
+<p>El punto contraintuitivo es <em>por dónde</em> elige volver. A corriente continua, el retorno toma el camino de <strong>mínima resistencia</strong>: se dispersa por todo el plano y va derecho. A alta frecuencia, toma el camino de <strong>mínima inductancia</strong>, que es el que encierra menos área: <strong>justo debajo de la pista de ida</strong>, siguiéndola en todo su recorrido, incluidas las curvas y los rodeos.</p>
+
+<pre><code class="lang-python">densidad de corriente de retorno bajo una microstrip:
+
+    J(x) = I / (π·h) · 1 / (1 + (x/h)²)          x = distancia lateral
+
+fracción del retorno dentro de ±X:  (2/π)·arctan(X/h)
+
+    ±1·h  →  50.0 %       con h = 0.2 mm  →  ±0.2 mm
+    ±2·h  →  70.5 %                          ±0.4 mm
+    ±3·h  →  79.5 %                          ±0.6 mm
+    ±5·h  →  87.4 %                          ±1.0 mm
+    ±10·h →  93.7 %                          ±2.0 mm</code></pre>
+
+<div class="concept">
+  <strong>💡 El retorno es una cinta angosta.</strong> Con un plano a 0,2 mm, la mitad de la corriente de retorno viaja dentro de una franja de <strong>0,4 mm de ancho</strong> pegada bajo la pista, y el 94 % dentro de 4 mm. No es una vaga "referencia de masa": es una corriente concreta, localizada, con la misma forma que la señal, circulando por el cobre que tenés justo debajo.
+</div>
+
+<h3>Cortar un plano: el error más caro y más común</h3>
+
+<p>Si esa cinta de retorno encuentra una ranura en el plano —una hilera de vías apretadas, un conector con demasiados agujeros, una separación deliberada entre "masa analógica" y "masa digital"— tiene que rodearla. Y al rodearla, encierra área.</p>
+
+<pre><code class="lang-python">   BIEN — plano continuo                MAL — plano con ranura
+   ═══════════════════════════          ═══════════════════════════
+   ──────────────────────────  señal    ──────────────────────────
+   ░░░░░░░░░░░░░░░░░░░░░░░░░░           ░░░░░░░░░░░░░░░░░░░░░░░░░░
+   ██████████████████████████  plano    ███████┐         ┌████████
+        retorno pegado,                 ███████│ RANURA  │████████
+        lazo mínimo                     ███████┘         └████████
+                                          el retorno rodea:
+                                          lazo enorme ▲▲▲</code></pre>
+
+<p>Las consecuencias de esa ranura se pagan las cuatro juntas: la impedancia de la línea se dispara donde cruza, aparece ringing donde antes no había, el lazo grande <strong>irradia</strong> (CF5.8) y <strong>capta</strong> ruido externo, y el retorno desviado atraviesa territorio que no le corresponde, contaminando todo lo que encuentra en el camino.</p>
+
+<div class="danger">
+  <strong>⚠️ Regla que no admite excepciones prácticas.</strong> <strong>Ninguna pista de señal debe cruzar una discontinuidad del plano de referencia.</strong> Ni una ranura, ni el borde entre dos planos, ni una zona despejada por un conector. Si el rutero te obliga a cruzar, la solución no es cruzar más rápido: es mover la pista, o rellenar la ranura, o —si la separación es real y necesaria— llevar la señal con su propio retorno diferencial.
+</div>
+
+<div class="warn">
+  <strong>Cambiar de capa también corta el retorno.</strong> Cuando una pista baja de la capa superior a la inferior por una vía, su corriente de retorno tiene que cambiar de plano igual que ella, y <strong>no puede hacerlo por el aire</strong>. Si los dos planos de referencia son el mismo, necesita una vía de masa cerca (a menos de 2–3 mm) para saltar. Si son planos distintos (uno de masa y otro de alimentación), necesita un capacitor de <em>stitching</em> ahí mismo. Sin eso, el retorno da un rodeo de centímetros buscando la vía más cercana, y ese rodeo es exactamente el lazo que no querías.
+</div>
+
+<h2>CF5.5 Desacoplo: qué hace realmente un capacitor de 100 nF</h2>
+
+<p>El capacitor de 100 nF junto a cada chip es la pieza más copiada y peor entendida del diseño de PCB. No está ahí para "filtrar ruido" en abstracto. Está ahí porque cuando un chip conmuta, <strong>pide un pulso de corriente en menos de un nanosegundo</strong>, y el regulador que lo alimenta —a diez centímetros y con lazos de control de microsegundos— no tiene ninguna posibilidad de responder a tiempo. El capacitor es un <strong>tanque local de carga</strong> que cubre ese hueco temporal.</p>
+
+<p>Y como todo tanque local, lo que importa no es cuánta carga tiene sino <strong>qué tan rápido puede entregarla</strong>. Eso lo limita la inductancia del lazo, no la capacidad.</p>
+
+<h3>La inductancia parásita, contada en detalle</h3>
+
+<p>Un capacitor real es un circuito RLC en serie: C, más su ESR, más una inductancia ESL que suma el encapsulado, las islas, las pistas y las vías. Por encima de su frecuencia de autorresonancia deja de ser capacitor y <strong>se comporta como inductor</strong>.</p>
+
+<pre><code class="lang-python">f_SRF = 1 / (2π · √(L · C))
+
+  10 µF 0805        L = 2.5 nH  →  SRF =   1.01 MHz
+   1 µF 0603        L = 2.0 nH  →  SRF =   3.56 MHz
+ 100 nF 0402 (bien) L = 1.5 nH  →  SRF =  12.99 MHz   ← ¡solo 13 MHz!
+  10 nF 0402        L = 1.5 nH  →  SRF =  41.09 MHz
+   1 nF 0402        L = 1.5 nH  →  SRF = 129.95 MHz</code></pre>
+
+<div class="concept">
+  <strong>💡 Tu capacitor de 100 nF deja de ser un capacitor a los 13 MHz.</strong> Por encima de esa frecuencia su impedancia <em>sube</em> con la frecuencia, como cualquier inductor: |Z| = 2π·f·L. A 100 MHz vale <strong>0,94 Ω</strong>, y ese valor no depende de la capacidad sino <strong>solo de la inductancia del lazo</strong>. Es decir: por encima de la resonancia, el único parámetro que podés mejorar es el <em>layout</em>. Cambiar el valor del capacitor no hace absolutamente nada.
+</div>
+
+<h3>De dónde sale esa inductancia</h3>
+
+<pre><code class="lang-python">inductancia de una pista sobre plano:   L' = Z_0 · t_pd
+                                        L' = 50 Ω · 6 ps/mm = 300 pH/mm
+
+inductancia de una vía:   L ≈ 0.2 · h · (ln(4h/d) + 1)   [nH, mm]
+
+   vía pasante en placa de 2 capas (h = 1.6 mm, d = 0.3):   1.30 nH
+   vía a plano interno en 4 capas  (h = 0.2 mm, d = 0.3):   0.08 nH
+                                                            ────────
+                                            16 veces menos inductancia</code></pre>
+
+<pre><code class="lang-python">   MAL — 3 mm de pista hasta la vía      BIEN — vía en la isla
+   ┌────┐                                ┌────┐
+   │ IC │pin                             │ IC │pin
+   └─┬──┘                                └─┬──┘
+     │                                     │  (0.5 mm)
+     └──────────────┐                    ┌─┴─┐
+                 ┌──┴──┐                 │ C │ 100 nF
+                 │  C  │ 100 nF          └─┬─┘
+                 └──┬──┘                   ●  ← vía pegada a la isla
+                    │                      ▼  plano
+             ───────┴───── pista de 3 mm
+                    ●  vía lejana
+                                          lazo ≈ 1.5 nH
+   lazo ≈ 2.4 nH                          |Z| a 100 MHz = 0.94 Ω
+   |Z| a 100 MHz = 1.51 Ω  (60 % peor)</code></pre>
+
+<div class="rule">
+  <strong>📌 Cada milímetro de pista entre la isla del capacitor y el pin del chip suma ~0,3 nH.</strong> Tres milímetros de más empeoran la impedancia de desacoplo a 100 MHz un <strong>60 %</strong>. Por eso "lo más cerca posible del pin" no es una recomendación estética: es literalmente el parámetro de diseño. Y por eso el capacitor va <strong>en la misma cara que el chip</strong> siempre que se pueda — cruzar a la cara opuesta agrega dos vías al lazo.
+</div>
+
+<h3>Por qué "más capacitores" no siempre es mejor</h3>
+
+<p>La receta heredada de los 90 —una escalera de 10 µF + 100 nF + 1 nF para "cubrir todas las frecuencias"— tiene un problema que se descubrió midiendo redes de distribución de energía reales: entre la resonancia del grande y la del chico, el grande ya es inductivo y el chico todavía es capacitivo. Un inductor en paralelo con un capacitor es un <strong>tanque resonante</strong>, y en paralelo la resonancia es un <strong>pico de impedancia</strong>, no un valle.</p>
+
+<pre><code class="lang-python">antirresonancia entre 10 µF (L = 2.5 nH) y 100 nF:
+
+    f_anti = 1 / (2π · √(L_grande · C_chico)) = 10.07 MHz
+
+   |Z| ▲
+       │      ╭─╮  ← PICO de impedancia a 10 MHz
+       │     ╱   ╲       (peor que sin el 100 nF)
+       │╲   ╱     ╲   ╱
+       │ ╲ ╱       ╲ ╱
+       │  ╰         ╰
+       └───┴─────────┴──────────▶  f
+         1 MHz     13 MHz
+        SRF 10µF  SRF 100nF</code></pre>
+
+<div class="mistake">
+  <strong>Lo que hoy se recomienda.</strong> No cinco valores distintos: <strong>pocos valores y muchas unidades del mismo</strong>, bien montadas. Poner cuatro capacitores de 100 nF en paralelo divide la inductancia por cuatro (y baja el valle) sin crear picos nuevos entre ellos, porque todos resuenan a la misma frecuencia. Los valores distintos se justifican por <em>década</em>, no por escalón: un bulk de 10 µF por riel, y 100 nF por pin de alimentación. Y si tenés que ir más arriba de 100 MHz, la respuesta ya no son capacitores: es <strong>acercar los planos</strong>.
+</div>
+
+<pre><code class="lang-python">capacitancia entre planos:   C = ε₀ · εr · A / d
+
+  A = 100 cm², εr = 4.3
+     d = 1.065 mm (stackup 4 capas típico)  →   358 pF
+     d = 0.200 mm (stackup con planos juntos) → 1.90 nF
+     d = 0.100 mm                             → 3.81 nF
+
+  ...y con inductancia prácticamente nula: funciona a GHz,
+     donde todos los MLCC ya se rindieron.</code></pre>
+
+<h2>CF5.6 Crosstalk: cuando la pista vecina te escribe encima</h2>
+
+<p>Dos pistas paralelas se acoplan de dos formas simultáneas: <strong>capacitivamente</strong> (el campo eléctrico entre ellas, proporcional a dV/dt) e <strong>inductivamente</strong> (el campo magnético del lazo, proporcional a dI/dt). El resultado es que un flanco en la pista agresora inyecta un pulso en la pista víctima, aunque no estén conectadas por nada.</p>
+
+<p>La magnitud depende de una sola relación geométrica, y no es la que la mayoría espera:</p>
+
+<pre><code class="lang-python">acoplamiento aproximado en microstrip:   k ≈ 0.55 / (1 + (s/h)²)
+
+   s = separación entre centros de pista
+   h = altura al plano de referencia          ← ¡el parámetro clave!</code></pre>
+
+<table>
+<thead><tr><th>Separación</th><th>4 capas (h = 0,2 mm)</th><th>2 capas (h = 1,6 mm)</th></tr></thead>
+<tbody>
+<tr><td>1,2 W = 0,40 mm</td><td>s/h = 2,0 → ≈ 11 %</td><td>s/h = 0,25 → acoplamiento máximo</td></tr>
+<tr><td>2 W = 0,66 mm</td><td>s/h = 3,3 → ≈ 4,6 %</td><td>s/h = 0,41 → acoplamiento máximo</td></tr>
+<tr><td><strong>3 W = 0,99 mm</strong></td><td>s/h = 5,0 → <strong>≈ 2,2 %</strong></td><td>s/h = 0,62 → prácticamente sin mejora</td></tr>
+<tr><td>5 W = 1,65 mm</td><td>s/h = 8,3 → ≈ 0,8 %</td><td>s/h = 1,03 → recién empieza a bajar</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La regla 3W funciona… si el plano está cerca.</strong> Separar las pistas tres anchos de pista entre centros deja el crosstalk cerca del 2 % con un plano a 0,2 mm. Con el plano a 1,6 mm, esa misma separación no alcanza ni de lejos: lo que gobierna es <strong>s/h</strong>, no <strong>s/w</strong>. Bajar el plano de 1,6 a 0,2 mm reduce el crosstalk más que cualquier separación que puedas permitirte en el rutado.
+</div>
+
+<div class="tip">
+  Reglas prácticas que se derivan de lo mismo: <strong>(1)</strong> lo que importa es la <em>longitud del tramo paralelo</em>, no el largo total — dos pistas que se cruzan en ángulo recto no se acoplan casi nada; <strong>(2)</strong> en capas adyacentes, ruteá una en horizontal y la otra en vertical; <strong>(3)</strong> nunca dejes una señal digital rápida corriendo paralela a una analógica de alta impedancia (una entrada de ADC, un micrófono, una termocupla); <strong>(4)</strong> si tenés que cruzar, cruzá perpendicular y seguí de largo.
+</div>
+
+<div class="info">
+  Hay una asimetría útil: en <strong>stripline</strong> el crosstalk de extremo lejano (<em>far-end</em>) se cancela, porque el campo viaja por un solo dieléctrico homogéneo. En <strong>microstrip</strong> no se cancela, porque una parte del campo va por el aire y la otra por el FR-4, y viajan a velocidades distintas. Es un argumento real para enterrar los buses críticos en capas internas cuando el presupuesto de capas lo permite.
+</div>
+
+<h2>CF5.7 Analógico y digital en la misma placa</h2>
+
+<p>Este es el terreno donde circula el peor consejo de todo el diseño de PCB, repetido durante treinta años en notas de aplicación y foros: <strong>"partí el plano de masa en analógico y digital y unilos en un solo punto"</strong>.</p>
+
+<div class="danger">
+  <strong>⚠️ El plano partido casi siempre empeora las cosas.</strong> Ya sabés por qué (CF5.4): partir un plano crea una ranura, y cualquier señal que cruce esa ranura pierde su camino de retorno y encierra un lazo enorme. El consejo se inventó cuando las señales eran lentas y el problema real era la caída de tensión continua en el cobre compartido. Con flancos de nanosegundos, el remedio es peor que la enfermedad: el plano partido convierte un problema de acoplamiento por impedancia común en un problema de radiación y de crosstalk mucho más difícil de diagnosticar.
+</div>
+
+<div class="rule">
+  <strong>📌 Lo que se hace hoy: un solo plano de masa continuo, y separación por <em>ubicación</em>.</strong> No cortes el cobre: <strong>partí la planta</strong>. Poné toda la circuitería analógica en una región de la placa, toda la digital en otra, y ruteá de modo que <strong>ninguna corriente de retorno digital tenga motivo para pasar por debajo de la región analógica</strong>. El plano sigue entero (todos los retornos tienen camino directo), pero las corrientes digitales viven en su barrio y no visitan el ajeno.
+</div>
+
+<pre><code class="lang-python">   ┌──────────────────────────┬───────────────────────────┐
+   │   REGIÓN ANALÓGICA       │      REGIÓN DIGITAL       │
+   │                          │                           │
+   │   sensor ─ AAF ─ ADC ════╪═══ SPI ══ MCU ── USB      │
+   │      ▲       ▲     ▲     │        ▲                  │
+   │   LDO propio  filtro REF │     DC-DC (lejos)         │
+   │                          │                           │
+   ├──────────────────────────┴───────────────────────────┤
+   │  UN SOLO PLANO DE MASA CONTINUO — sin cortes         │
+   └──────────────────────────────────────────────────────┘
+     el cruce ocurre en UN punto: el propio chip del ADC,
+     que es donde el fabricante puso el límite entre dominios</code></pre>
+
+<h3>El detalle que casi nadie cuida: la referencia del ADC</h3>
+
+<p>Un ADC no mide tensión: mide la <strong>relación</strong> entre su entrada y su referencia. Cualquier ruido en el pin de referencia se traduce directo en error de conversión, escalado por la señal. Con 16 bits sobre 3,3 V, un LSB vale <strong>50,4 µV</strong>: tres LSB son 150 µV, menos de lo que ondula un riel de alimentación mal desacoplado.</p>
+
+<div class="warn">
+  <strong>Usar VDD como referencia es una decisión, no un ahorro.</strong> Es perfectamente válido en mediciones <em>ratiométricas</em> (un potenciómetro o un puente alimentados por el mismo VDD: el error se cancela). Es un desastre en cualquier medición absoluta, porque VDD se mueve con la carga del MCU, con la radio, con la temperatura y con la batería. Si necesitás precisión, la referencia va aparte: un chip de referencia dedicado, filtrado con RC, y con su propio capacitor de desacoplo pegado al pin.
+</div>
+
+<h2>CF5.8 EMI/EMC: tu placa es una antena (te guste o no)</h2>
+
+<p>Compatibilidad electromagnética tiene dos caras que se diseñan juntas: <strong>emisiones</strong> (cuánto ruido irradia y conduce tu producto) e <strong>inmunidad</strong> (cuánto ruido externo aguanta antes de portarse mal). Las dos dependen del mismo parámetro físico: el <strong>área de los lazos de corriente</strong>.</p>
+
+<pre><code class="lang-python">campo E radiado por un lazo pequeño, en campo lejano:
+
+    E [V/m] = 1.3168e-14 · f² · I · A / r
+
+        f en Hz, I en A, A en m², r en m
+        (constante = η₀·π/c², verificada)
+
+    E ∝ f²  →  duplicar la frecuencia empeora 12 dB
+    E ∝ A   →  el área es el único parámetro que controlás por layout</code></pre>
+
+<p>Con números concretos: 20 mA de corriente armónica a 100 MHz, medidos a 3 m, contra el límite FCC Clase B de 150 µV/m (43,5 dBµV/m) en esa banda:</p>
+
+<table>
+<thead><tr><th>Área del lazo</th><th>Campo E a 3 m</th><th>En dBµV/m</th><th>Contra el límite</th></tr></thead>
+<tbody>
+<tr><td>10 cm² (rutado descuidado)</td><td>878 µV/m</td><td>58,9</td><td>🔴 <strong>+15,4 dB — reprueba</strong></td></tr>
+<tr><td>3 cm²</td><td>263 µV/m</td><td>48,4</td><td>🔴 +4,9 dB — reprueba</td></tr>
+<tr><td>1 cm² (plano continuo, desacoplo pegado)</td><td>87,8 µV/m</td><td>38,9</td><td>🟢 <strong>−4,6 dB — aprueba</strong></td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El área de bucle es la palanca, y es lineal.</strong> Reducir el lazo de 10 cm² a 1 cm² son 20 dB de emisiones. No hay ningún filtro, ninguna ferrita y ninguna lata blindada que te dé 20 dB tan barato como rutear bien. Por eso el orden correcto de trabajo en EMC es: <strong>primero el layout, después el filtrado, y el blindaje como último recurso</strong> — el blindaje es lo que se pone cuando ya no se puede rehacer la placa.
+</div>
+
+<h3>Los tres lazos que hay que mirar antes de mandar a fabricar</h3>
+
+<div class="step"><strong>1. El lazo de desacoplo.</strong> Pin de VDD → capacitor → vía a plano → plano → vía → pin de GND. Es el que conmuta más rápido de toda la placa. Milímetros, no centímetros (CF5.5).</div>
+
+<div class="step"><strong>2. El lazo de conmutación del DC-DC.</strong> El bucle formado por el condensador de entrada, el transistor y el diodo (o el <em>synchronous FET</em>) es donde circulan amperes con flancos de nanosegundos. Es, con enorme diferencia, la antena más eficiente de la placa. Ese bucle se rutea primero, antes que nada, y se hace lo más pequeño que la geometría permita.</div>
+
+<div class="step"><strong>3. Los cables.</strong> Un cable de un metro es una antena de media onda a 150 MHz. Todo lo que sale de la placa —USB, alimentación, sensores remotos— lleva ruido de modo común afuera y lo irradia con una eficiencia que ninguna pista alcanza. El filtrado va <strong>en el conector</strong>, en el punto exacto donde el cable entra, no diez milímetros adentro.</div>
+
+<h3>Ferritas: la pieza más mal usada del catálogo</h3>
+
+<p>Un <em>ferrite bead</em> no es un inductor: es un componente que se especifica por su <strong>impedancia a 100 MHz</strong> (por ejemplo, "600 Ω @ 100 MHz") y cuyo trabajo real es <strong>disipar</strong> energía de alta frecuencia convirtiéndola en calor. Por debajo de su punto de resonancia sí se comporta como inductor, y ahí está la trampa:</p>
+
+<pre><code class="lang-python">ferrita (≈ 1 µH a baja frecuencia) + MLCC de 10 µF en el riel:
+
+    f_resonancia = 1 / (2π · √(1e-6 · 10e-6)) = 50.3 kHz
+
+  con Q alto, ese tanque LC AMPLIFICA el ruido a 50 kHz
+  en vez de filtrarlo, y hace ringing en cada escalón de carga.</code></pre>
+
+<div class="mistake">
+  <strong>Ferrita + capacitor grande = filtro que resuena.</strong> Es el error que más veces convierte un riel limpio en un riel con un pico de 20 dB a decenas de kilohertz — justo la banda donde conmuta el DC-DC que estabas tratando de filtrar. Los tres antídotos: amortiguar con un resistor en serie de algunos ohms (o elegir un capacitor con ESR suficiente), elegir la ferrita por su curva de impedancia <strong>a la frecuencia del problema</strong> y no por su valor nominal, y verificar la <strong>corriente de saturación</strong>: una ferrita saturada pierde toda su impedancia y no filtra nada.
+</div>
+
+<div class="info">
+  <strong>Sobre la certificación.</strong> Las emisiones radiadas y conducidas se miden en un laboratorio acreditado contra normas concretas (FCC Parte 15 en EE. UU., EN 55032 y EN 55035 bajo marcado CE en la Unión Europea), y una sesión completa cuesta miles de dólares y semanas de calendario. Reprobar significa rediseñar la placa y volver a empezar. La estrategia sensata es hacer una <strong>preconformidad</strong> temprana —una sonda de campo cercano de veinte dólares y un analizador de espectro prestado detectan el 80 % de los problemas— y llegar al laboratorio a confirmar, no a descubrir. El proceso completo de certificación, sus costos y su cronograma se tratan en <a href="../cf8-prototipo-a-producto/lecture.html"><strong>CF8</strong></a>.
+</div>
+
+<h2>CF5.9 ESD y protección de entradas</h2>
+
+<p>Un producto que se cuelga cuando alguien lo toca no es un producto: es un prototipo. Y la descarga electrostática es la prueba que más productos amateur reprueba, porque es la única en la que el mundo exterior ataca activamente tu placa.</p>
+
+<pre><code class="lang-python">IEC 61000-4-2, descarga por contacto:
+
+    nivel 2:  4 kV  →  I_pico = 15 A
+    nivel 4:  8 kV  →  I_pico = 30 A       (3.75 A por kV)
+
+    tiempo de subida ≈ 1 ns   →   dI/dt ≈ 3e10 A/s
+
+tensión inducida en el lazo del propio protector:
+
+    V = L · dI/dt
+
+    lazo de 10 nH (TVS a 1 cm del conector, masa lejana):  300 V
+    lazo de  2 nH (TVS pegado, vía de masa al lado):        60 V</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Un TVS mal ubicado no protege nada.</strong> El componente puede recortar a 5 V perfectamente y aun así tu chip ve <strong>300 V</strong>, porque esa tensión no la genera el TVS: la genera la <strong>inductancia del lazo</strong> entre el punto de descarga, el TVS y el plano. Por eso la regla no es "poné un TVS", sino: el TVS va <strong>en el conector</strong>, con la vía de masa más corta posible, y la pista protegida pasa <strong>primero</strong> por el TVS y después sigue hacia el chip — nunca al revés, nunca en derivación desde un punto medio.
+</div>
+
+<table>
+<thead><tr><th>Defensa</th><th>Qué resuelve</th><th>Qué cuesta</th></tr></thead>
+<tbody>
+<tr><td><strong>TVS en el conector</strong></td><td>Deriva la energía antes de que entre</td><td>~0,10 USD y capacitancia parásita (elegir versiones de menos de 1 pF para USB y líneas rápidas)</td></tr>
+<tr><td><strong>Resistor serie de 100 Ω</strong></td><td>Limita la corriente hacia los diodos internos del chip</td><td>Un polo a <strong>159 MHz</strong> con 10 pF de entrada: gratis en I²C, fatal en un bus paralelo rápido</td></tr>
+<tr><td><strong>Anillo de guarda de masa</strong></td><td>Da un camino de retorno directo al plano en el borde de la placa</td><td>Área de cobre en el perímetro</td></tr>
+<tr><td><strong><em>Watchdog</em> + reset limpio</strong></td><td>Recupera el sistema si igual se cuelga</td><td>Firmware; es la red de seguridad, no la protección</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  El criterio de aprobación de ESD tiene niveles: <strong>clase A</strong> es "sigue funcionando normal durante y después"; <strong>clase B</strong> es "se degrada pero se recupera solo"; <strong>clase C</strong> es "necesita intervención del usuario". Definir a qué clase apuntás <strong>antes</strong> de diseñar cambia decisiones concretas: si te alcanza con clase B, un watchdog bien hecho reemplaza componentes de protección caros. Si necesitás clase A —equipamiento médico, industrial, automotriz— la protección es de hardware y no hay atajo.
+</div>
+
+<h2>CF5.10 El stackup: por qué cuatro capas suelen salir más baratas</h2>
+
+<pre><code class="lang-python">   2 CAPAS (1.6 mm)                    4 CAPAS (1.6 mm)
+   ══════════════════ L1 señal + GND   ══════════════════ L1 señal
+                                       ░░░░░░░░░ 0.20 mm  prepreg
+        1.6 mm de FR-4                 ██████████████████ L2 PLANO GND
+                                       ░░░░░░░░░ 1.06 mm  core
+   ══════════════════ L2 señal + GND   ██████████████████ L3 plano PWR
+                                       ░░░░░░░░░ 0.20 mm  prepreg
+                                       ══════════════════ L4 señal
+
+   h a la referencia .... 1.6 mm       h a la referencia .... 0.2 mm
+   Z0 de pista 0.33 mm .. 126 Ω        Z0 de pista 0.33 mm ... 50 Ω
+   L de una vía ......... 1.30 nH      L de una vía ......... 0.08 nH
+   crosstalk a 3W ....... altísimo     crosstalk a 3W ........ 2.2 %
+   retorno .............. disperso     retorno ............ ±0.4 mm</code></pre>
+
+<div class="rule">
+  <strong>📌 La cuenta que hay que hacer no es la del fabricante de PCB.</strong> El sobrecosto de pasar a cuatro capas en una tirada de prototipos es del orden de unos pocos dólares por unidad, y en producción se diluye. El costo de <strong>una sola revisión</strong> —rehacer el layout, esperar la fabricación, volver a montar, volver a probar— son entre una y tres semanas de calendario y varios días de trabajo de ingeniería. Con esa comparación, cuatro capas se paga a sí misma si evita <strong>media revisión</strong>. Y evita bastante más que media.
+</div>
+
+<h3>El orden razonable de las capas</h3>
+
+<table>
+<thead><tr><th>Stackup</th><th>Cuándo</th><th>Cuidado con</th></tr></thead>
+<tbody>
+<tr><td><strong>SIG / GND / PWR / SIG</strong></td><td>Uso general. El caso por defecto de cualquier placa con MCU</td><td>La capa 4 se referencia al plano de alimentación: sus retornos necesitan capacitores de <em>stitching</em> para saltar entre planos</td></tr>
+<tr><td><strong>SIG / GND / GND / SIG</strong></td><td>Alta velocidad, o RF, o cuando la EMC es crítica</td><td>La alimentación se rutea a mano con pistas anchas o polígonos. Más trabajo de layout, mejor comportamiento</td></tr>
+<tr><td><strong>GND / SIG / SIG / GND</strong></td><td>Cuando querés blindar los buses críticos entre planos (stripline)</td><td>Las capas externas quedan casi sin señal; suele desperdiciar área útil</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El prepreg de L1 a L2 tiene que ser fino.</strong> Es la decisión más importante del stackup, y la que más se deja en manos del fabricante por descuido. Un dieléctrico de <strong>0,1 a 0,2 mm</strong> entre la capa de señal y su plano te da microstrips controlables cerca de los 50 Ω, retornos apretados y crosstalk bajo. Si el fabricante te arma el stackup "estándar" con 0,5 mm ahí, perdiste casi todo lo que fuiste a buscar con las cuatro capas. Pedile el stackup por escrito y revisá ese número.
+</div>
+
+<div class="info">
+  <strong>Herramientas, estado 2026.</strong> <strong>KiCad 10</strong> (10.0.0 salió en marzo de 2026; la estable al día de hoy es 10.0.6) cubre este flujo sin costo: editor de stackup con constantes dieléctricas por capa, calculadora de impedancia para microstrip y stripline, rutado de pares diferenciales con ajuste de longitud y de <em>skew</em>, editor gráfico de reglas DRC y —novedad de la versión 10— <strong>ajuste de longitud en el dominio del tiempo</strong>: definís un perfil de retardo en ps/cm por capa, se lo asignás a una clase de red y sintonizás en picosegundos en lugar de milímetros. Lo que KiCad todavía <strong>no</strong> trae es un solucionador de campos integrado: para impedancia de precisión seguís necesitando el stackup real del fabricante o una herramienta externa. Del lado libre existen <strong>openEMS</strong> (FDTD), <strong>gerber2ems</strong> de Antmicro (toma tus Gerber de KiCad y arma la simulación de integridad de señal), <strong>scikit-rf</strong> para parámetros S, y <strong>ngspice</strong> integrado en KiCad para la parte de circuito. Para una estimación rápida de impedancia, la <strong>calculadora de PCB del propio KiCad</strong> o <strong>AppCAD</strong> (gratuita, de Broadcom) alcanzan.
+</div>
+
+<h2>CF5.11 Cuándo NO preocuparse por nada de esto</h2>
+
+<p>Todo lo anterior es una lista de formas de gastar tiempo y dinero. La marca de un diseñador senior no es aplicarlas todas: es <strong>saber cuáles no aplican a este proyecto</strong>.</p>
+
+<div class="rule">
+  <strong>📌 Un circuito a 1 kHz en una placa de 5 cm, con flancos de microsegundos, no necesita nada de este módulo.</strong> Ni terminación, ni cuatro capas, ni control de impedancia. Un plano de masa decente y desacoplo razonable, y listo. Poner resistores de terminación ahí no mejora nada: agrega componentes, costo y modos de falla.
+</div>
+
+<table>
+<thead><tr><th>Situación</th><th>Qué hacer</th></tr></thead>
+<tbody>
+<tr><td>Señales lentas (más de 10 ns de flanco), pistas de menos de 5 cm</td><td>Plano de masa continuo, 100 nF por chip. Nada más</td></tr>
+<tr><td>Sensores analógicos de baja frecuencia, sin nada digital rápido</td><td>Plano continuo, referencia filtrada, separación por ubicación</td></tr>
+<tr><td>Un solo MCU, sin buses externos, sin radio, prototipo interno</td><td>Dos capas alcanzan. Cuidá el desacoplo y el retorno</td></tr>
+<tr><td>Cualquier cosa con USB, Ethernet, DDR, radio o ADC de más de 12 bits</td><td>Cuatro capas y todo lo de este módulo, desde el primer día</td></tr>
+<tr><td>Producto que se va a certificar y a vender</td><td>Todo lo del módulo, más preconformidad temprana (CF8)</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>La trampa que sí hay que revisar siempre.</strong> "Es lento, no importa" es cierto para <em>la señal</em> y falso para <em>el flanco</em>. Ese GPIO que parpadea un LED a 2 Hz, si el pin quedó en velocidad alta, conmuta en 400 ps, emite armónicos hasta más de 1 GHz y su pista de 6 cm es una línea de transmisión. <strong>Antes de decidir que un diseño es lento, andá a mirar el tiempo de subida en la hoja de datos y la configuración de velocidad de los pines en tu código.</strong> Eso es un minuto de trabajo y cambia la respuesta.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el ADC de 16 bits que entrega 11</h2>
+
+<blockquote>Placa de adquisición de datos: un ADC SAR de 16 bits con referencia externa de 3,3 V, un MCU que lo lee por SPI a 10 MHz, alimentación por un DC-DC conmutado de 1,2 MHz, y un sensor de puente resistivo con su amplificador. Especificación: 15 bits efectivos. Lo medido en la primera placa: <strong>11,0 bits efectivos</strong>. El firmware es correcto, el promediado está bien hecho, el ADC es el que dice la hoja de datos. ¿Qué pasó?</blockquote>
+
+<p><strong>Paso 1 — Traducir "11 bits" a microvolts.</strong> La discusión no se puede tener en bits: hay que llevarla a la única unidad en la que el hardware se puede medir y comparar.</p>
+
+<pre><code class="lang-python">FSR = 3.3 V,  N = 16 bits
+
+1 LSB = 3.3 / 65536 = 50.35 µV
+ruido de cuantización ideal = LSB / √12 = 14.54 µV rms
+SNR ideal = 6.02·16 + 1.76 = 98.1 dB
+
+ENOB = 16 − log2(ruido_total / 14.54 µV)
+
+11.0 bits  →  ruido_total ≈ 477 µV rms
+              es decir, casi 10 LSB de ruido metidos por la placa</code></pre>
+
+<p><strong>Paso 2 — Localizar de dónde salen esos 477 µV.</strong> No se adivina: se aísla. Con la entrada del ADC cortocircuitada a la referencia de tierra analógica se mide el piso propio; después se va desconectando el mundo por partes (SPI en reposo, DC-DC reemplazado por una batería de laboratorio, referencia alimentada desde afuera) y se anota cuánto baja el ruido en cada paso. Como las fuentes son incorreladas, se suman en cuadratura, y esa aritmética permite atribuir responsabilidades:</p>
+
+<table>
+<thead><tr><th>Fuente</th><th>Aporte (rms)</th><th>Mecanismo</th></tr></thead>
+<tbody>
+<tr><td>Retorno digital del SPI cruzando bajo la sección analógica</td><td><strong>380 µV</strong></td><td>El plano quedó ranurado por una hilera de vías; el retorno de 10 MHz rodea y pasa por debajo del ADC</td></tr>
+<tr><td>Desacoplo del ADC a 8 mm del pin, en la cara opuesta</td><td>200 µV</td><td>~4 nH de lazo: el riel se hunde en cada conversión, y el ADC muestrea durante ese hundimiento</td></tr>
+<tr><td>Referencia sin filtrar</td><td>150 µV</td><td>El pin REF sale del chip de referencia por 4 cm de pista, sin RC ni capacitor local</td></tr>
+<tr><td>DC-DC conmutando a 12 mm del amplificador</td><td>130 µV</td><td>Acoplamiento por campo cercano del lazo de conmutación a 1,2 MHz y sus armónicos</td></tr>
+<tr><td>Piso del ADC + ruido del sensor</td><td>60 µV</td><td>Irreducible por layout</td></tr>
+<tr><td><strong>Total (suma cuadrática)</strong></td><td><strong>477 µV</strong></td><td>→ <strong>10,96 ENOB</strong> ✔ coincide con lo medido</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Por qué el diagnóstico tiene que ser cuantitativo.</strong> Las cuatro causas son "errores de layout de manual" y la tentación es arreglarlas todas de una y celebrar. Pero al sumar en cuadratura, <strong>la fuente dominante se come a las demás</strong>: mientras estén esos 380 µV del retorno digital, filtrar la referencia mejora el total de 477 a 454 µV — siete centésimas de bit, indistinguible del ruido de medición. Sin la tabla, ese arreglo parece "no haber servido" y se descarta la hipótesis correcta.
+</div>
+
+<p><strong>Paso 3 — El rediseño, y qué recupera cada cambio.</strong></p>
+
+<table>
+<thead><tr><th>Cambio aplicado (acumulativo)</th><th>Ruido total</th><th>ENOB</th><th>Δ bits</th></tr></thead>
+<tbody>
+<tr><td>Placa original</td><td>477 µV</td><td>10,96</td><td>—</td></tr>
+<tr><td>+ Plano continuo; SPI reruteado por el lado digital</td><td>288 µV</td><td>11,69</td><td><strong>+0,73</strong></td></tr>
+<tr><td>+ 100 nF en la misma cara, vía en la isla, a 1 mm del pin</td><td>207 µV</td><td>12,17</td><td>+0,47</td></tr>
+<tr><td>+ Referencia con RC de 10 Ω / 10 µF y 100 nF pegado al pin REF</td><td>145 µV</td><td>12,69</td><td>+0,52</td></tr>
+<tr><td>+ DC-DC movido al borde, lazo de conmutación minimizado, LDO para la rama analógica</td><td>68 µV</td><td><strong>13,77</strong></td><td><strong>+1,08</strong></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 De 11,0 a 13,8 bits efectivos: +2,8 bits, sin cambiar un solo componente activo.</strong> Mismo ADC, mismo MCU, mismo firmware. Lo único que cambió fue por dónde vuelve la corriente y a qué distancia está la carga almacenada. Eso es integridad de señal: <strong>los mismos componentes rinden dos órdenes binarios distintos según cómo estén conectados físicamente</strong>.
+</div>
+
+<div class="warn">
+  <strong>Y la parte incómoda: 13,8 no es 15.</strong> Faltan 1,2 bits para la especificación, y ningún cambio de layout los va a dar. A esta altura el problema se mudó de dominio: impedancia de salida del acondicionador frente al capacitor de muestreo del SAR, ancho de banda del filtro antialias (que deja pasar ruido de banda ancha y lo pliega, ver <a href="../../e06-senales-sistemas/lecture.html">E06</a>), y ruido propio del sensor. <strong>Saber cuándo dejaste de tener un problema de PCB es tan valioso como saber diagnosticarlo</strong>: seguir moviendo pistas después de este punto es trabajo perdido.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu reloj es de 1 MHz, pero la pista de 8 cm hace ringing. ¿Contradice la regla de la longitud crítica?</summary>
+<p>No, la confirma: la regla nunca dependió de la frecuencia del reloj. La longitud crítica se calcula con el <strong>tiempo de subida</strong>, no con el período. Si esa señal de 1 MHz sale de un GPIO configurado en velocidad alta, su flanco puede ser de 400 ps, y la longitud crítica es entonces 400/36 ≈ 11 mm. Tu pista de 80 mm es siete veces más larga: es una línea de transmisión sin terminar, y va a hacer ringing exactamente igual que si el reloj fuera de 500 MHz. El arreglo más barato es de firmware —bajar la velocidad de flanco de ese pin—; el segundo más barato es un resistor serie de 33 Ω junto al emisor.</p></details>
+
+<details><summary>Un compañero propone partir el plano de masa en "analógica" y "digital" para bajar el ruido del ADC. ¿Qué le decís?</summary>
+<p>Que ese consejo es de la época de las señales lentas y que hoy suele empeorar el problema. Partir el plano crea una ranura, y cualquier señal que la cruce pierde su camino de retorno: la corriente rodea el corte, encierra un área grande, irradia, capta ruido y le sube la impedancia a la línea. Lo correcto es <strong>un solo plano continuo</strong> y separar por <strong>ubicación</strong>: la circuitería analógica en una zona, la digital en otra, y el rutado organizado de modo que ningún retorno digital tenga motivo para pasar por debajo del área analógica. El único "punto de unión" real es el propio chip del ADC, que es donde el fabricante puso el límite entre dominios. Si de verdad hace falta aislar (por seguridad eléctrica, por ejemplo), la separación se hace con aisladores digitales o transformadores, no cortando cobre.</p></details>
+
+<details><summary>Agregaste un 100 nF junto al chip y las emisiones a 200 MHz no bajaron. ¿Por qué?</summary>
+<p>Porque a 200 MHz ese capacitor hace rato dejó de ser capacitor. Con 1,5 nH de inductancia de lazo su autorresonancia está en ~13 MHz; por encima de ahí su impedancia sube con la frecuencia y a 200 MHz vale casi 1,9 Ω, un valor que depende <strong>solo de la inductancia</strong> y no de la capacidad. Cambiarlo por 1 µF o por 10 nF no mueve la aguja. Lo que sí la mueve: acortar el lazo (vía en la isla, misma cara que el chip, pista mínima), poner varias unidades del mismo valor en paralelo para dividir la inductancia, y —para las frecuencias más altas— acercar los planos de alimentación y masa, que forman un capacitor distribuido de nanofaradios sin prácticamente nada de inductancia.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Lo que decide si una pista es un cable o una línea de transmisión es el <strong>tiempo de subida</strong>, no la frecuencia del reloj: <strong>≈ 28 mm de longitud crítica por cada ns de flanco</strong> en microstrip sobre FR-4.</li>
+  <li>La <strong>impedancia característica</strong> la fija la relación w/h. Una pista no tiene impedancia hasta que definís dónde está su plano de referencia: la misma pista da 50 Ω sobre 0,2 mm y 126 Ω sobre 1,6 mm.</li>
+  <li>Una entrada CMOS es un circuito abierto (Γ ≈ +1): sin terminar, una línea entrega picos del <strong>143 % de VDD</strong>. La <strong>terminación serie</strong> resuelve el caso dominante por un resistor y cero consumo.</li>
+  <li>La <strong>corriente vuelve</strong>, y a alta frecuencia vuelve pegada bajo la pista: la mitad dentro de ±0,2 mm con un plano a 0,2 mm. <strong>Ninguna señal cruza una discontinuidad del plano.</strong></li>
+  <li>Un <strong>100 nF deja de ser capacitor a los 13 MHz</strong>. Por encima, lo único que controlás es la inductancia del lazo (~0,3 nH por mm de pista). Pocos valores, muchas unidades, bien montadas — mezclar valores crea <strong>antirresonancias</strong>.</li>
+  <li>El <strong>crosstalk</strong> lo gobierna s/h, no s/w: la regla 3W solo funciona con el plano cerca.</li>
+  <li><strong>Nunca partas el plano</strong> para separar analógico de digital: separá por ubicación y cuidá la referencia del ADC.</li>
+  <li>Las emisiones van con <strong>f² y con el área del lazo</strong>: pasar de 10 cm² a 1 cm² son 20 dB, que ningún filtro te regala. Primero layout, después filtrado, el blindaje último.</li>
+  <li>En <strong>ESD</strong>, el enemigo es L·dI/dt: un lazo de 10 nH genera 300 V aunque el TVS recorte perfecto. El TVS va en el conector.</li>
+  <li><strong>Cuatro capas</strong> se pagan solas si evitan media revisión — y evitan más. Exigí un prepreg fino de L1 a L2.</li>
+  <li>Y lo más importante: <strong>un circuito lento en una placa chica no necesita nada de esto</strong>. Verificá el flanco antes de decidir que es lento.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Buscá en la hoja de datos del MCU que usás el tiempo de subida de sus GPIO en cada modo de velocidad. Calculá la longitud crítica de cada modo y compará contra la pista más larga de tu última placa. Después buscá en tu firmware qué velocidad quedó configurada.</li>
+  <li>Implementá <code>z0_microstrip()</code> y graficá Z<sub>0</sub> en función del ancho de pista para h = 0,1 · 0,2 · 0,5 · 1,6 mm. Marcá en el gráfico qué ancho necesitás para 50 Ω en cada caso y cuál de esos anchos es realmente ruteable.</li>
+  <li>Escribí la escalera de rebotes en código: dados V, R<sub>s</sub>, Z<sub>0</sub>, Γ<sub>carga</sub> y TD, devolvé la tensión en la carga en 1·TD, 3·TD, 5·TD y 7·TD. Verificá que con R<sub>s</sub> = Z<sub>0</sub> el ringing desaparece por completo en el primer rebote.</li>
+  <li>Calculá qué fracción del retorno viaja dentro de ±1 mm de la pista para h = 0,1 · 0,2 · 0,8 · 1,6 mm. Explicá con ese número por qué el crosstalk empeora tanto en placas de dos capas.</li>
+  <li>Tomá el capacitor de 100 nF de tu placa y estimá su lazo: largo de pista × 0,3 nH/mm + vías. Calculá la SRF y la impedancia a 100 MHz. Después rediseñá el montaje para bajar el lazo a la mitad y recalculá.</li>
+  <li>Con la fórmula del campo radiado, calculá qué área máxima de lazo podés permitirte para pasar FCC Clase B a 3 m con 10 mA de corriente armónica a 150 MHz. Comparala con el lazo de desacoplo real de tu placa.</li>
+  <li>Abrí una placa tuya en KiCad, activá la vista del plano de masa y buscá <strong>una</strong> señal que cruce una discontinuidad. Ruteala de nuevo evitándola y documentá qué tuviste que mover.</li>
+  <li>Armá el stackup de cuatro capas en el editor de KiCad con las constantes dieléctricas reales de tu fabricante, y usá la calculadora de PCB para obtener el ancho de pista de 50 Ω y el par diferencial de 90 Ω. Compará contra lo que hoy tenés ruteado.</li>
+  <li>Reproducí la tabla de ENOB del Worked Example en código: dadas las contribuciones de ruido en µV, calculá el ENOB total y el delta de cada arreglo. Después probá qué pasa si el arreglo dominante se aplica <strong>último</strong> en vez de primero, y explicá el resultado.</li>
+</ol>
+
+<section class="quiz" id="quizCF_S5">
+  <style>
+    #quizCF_S5{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCF_S5 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCF_S5 .q{margin-bottom:1.5rem}
+    #quizCF_S5 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCF_S5 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCF_S5 .opt:hover{border-color:var(--accent)}
+    #quizCF_S5 .opt:disabled{cursor:default}
+    #quizCF_S5 .opt.ok{background:rgba(63,185,80,.16);border-color:var(--success, #3fb950)}
+    #quizCF_S5 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCF_S5 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCF_S5 .exp.show{display:block}
+    #quizCF_S5 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Una pista de 8 cm lleva una señal de 1 kHz desde un GPIO configurado en velocidad máxima (flanco de 400 ps) y hace ringing en el osciloscopio. ¿Cuál es el diagnóstico correcto?</p>
+    <button class="opt">Imposible: a 1 kHz ninguna pista es una línea de transmisión</button>
+    <button class="opt">Es ruido acoplado desde otra pista; a esa frecuencia no hay reflexiones</button>
+    <button class="opt">Con 400 ps de flanco la longitud crítica es ~11 mm; la pista de 80 mm es una línea de transmisión sin terminar</button>
+    <div class="exp">La frecuencia del reloj no interviene en el cálculo. La longitud crítica es t<sub>r</sub>/36 ≈ 400/36 ≈ 11 mm, y 80 mm es siete veces más: la pista se comporta como línea de transmisión con independencia de que la uses a 1 kHz o a 500 MHz. Los dos arreglos, en orden de costo: bajar la velocidad de flanco de ese pin por firmware, o poner un resistor serie de 33 Ω pegado al emisor.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Agregás un capacitor de 100 nF junto a un chip y las emisiones a 200 MHz no bajan nada. ¿Por qué?</p>
+    <button class="opt">Porque con ~1,5 nH de lazo su autorresonancia está en 13 MHz: a 200 MHz ya es un inductor y su impedancia depende solo de la inductancia del lazo</button>
+    <button class="opt">Porque 100 nF es un valor demasiado grande; hay que usar 1 nF para esa frecuencia</button>
+    <button class="opt">Porque los capacitores cerámicos no funcionan por encima de 100 MHz por su material</button>
+    <button class="opt">Porque falta un segundo capacitor de 10 µF en paralelo para cubrir la banda</button>
+    <div class="exp">Por encima de la SRF el capacitor es inductivo y su impedancia vale 2π·f·L, un número que no depende de la capacidad. Cambiar el valor no mueve nada. Lo que sí sirve: acortar el lazo (vía en la isla, misma cara que el chip), poner varias unidades del mismo valor en paralelo para dividir la inductancia, y acercar los planos de alimentación y masa, que dan nanofaradios sin inductancia apreciable. Agregar un 10 µF, además, introduce una antirresonancia alrededor de 10 MHz.</div>
+  </div>
+
+  <div class="q" data-c="3">
+    <p>3. Tenés que hacer pasar una señal SPI de 10 MHz cerca de la sección analógica de un ADC de 16 bits. ¿Cuál es la peor decisión de las cuatro?</p>
+    <button class="opt">Ruteala por el lado digital y aceptar un recorrido más largo</button>
+    <button class="opt">Bajar la velocidad de flanco del SPI a lo mínimo que tolere el bus</button>
+    <button class="opt">Separar la pista del analógico 5W en lugar de 3W</button>
+    <button class="opt">Partir el plano de masa en analógico y digital y unirlos en un punto único</button>
+    <div class="exp">Es el mal consejo clásico. Partir el plano crea una ranura: cualquier señal que la cruce pierde su camino de retorno, la corriente rodea el corte encerrando un área grande, y el resultado es más radiación, más captación y más impedancia de línea que antes. Las otras tres opciones son todas defendibles; la correcta en la práctica es combinarlas: plano continuo, separación por ubicación, flanco mínimo y distancia razonable.</div>
+  </div>
+
+  <div class="score" id="scoreCF_S5"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCF_S5');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCF_S5').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CF6.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cf4-buses-industriales/lecture.html">← CF4: Buses industriales</a>
+  <a href="../cf6-seguridad-embebida/lecture.html">CF6: Seguridad embebida →</a>
+</nav>
+
+</div>
+</body>
+</html>

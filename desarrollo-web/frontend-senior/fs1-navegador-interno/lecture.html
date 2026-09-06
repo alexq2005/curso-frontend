@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FS1 — El navegador por dentro: del HTML al píxel · Frontend Senior</title>
+  <meta name="description" content="Arquitectura multiproceso y site isolation, el pipeline de render etapa por etapa, reflow vs repaint vs composite, layout thrashing, capas del compositor, el event loop real (tasks, microtasks, rAF, rIC), long tasks y yielding con scheduler.yield, Web Workers y cómo medir todo esto en el Performance panel sin engañarte.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Frontend Senior</a>
+  <a href="../../modulo-00-sillabus/lecture.html">🎨 Curso Frontend</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">FS1</span>
+  <span class="badge">⏱ 40–100 min</span>
+  <span class="badge">🎯 Pre-req: Curso Frontend M00–M13</span>
+  <span class="badge">🧠 Internals del navegador</span>
+</div>
+
+<article>
+
+<h1>FS1 — El navegador por dentro: del HTML al píxel</h1>
+
+<h2>FS1.0 Por qué este módulo</h2>
+
+<p>En el <strong>M01</strong> viste que escribís una URL, hay un DNS, viaja un HTTP y llega un HTML. En el <strong>M06</strong> aprendiste a tocar el DOM y a escuchar eventos. Los dos módulos te dieron un modelo mental que alcanza para <em>escribir</em> una interfaz. No alcanza para <em>arreglarla</em> cuando va lenta.</p>
+
+<p>Porque cuando una interfaz "va lenta", el usuario reporta un síntoma —"el scroll tironea", "el botón tarda en responder", "se traba al escribir"— y vos necesitás traducirlo a una causa que se pueda tocar. Esa traducción no se hace adivinando: se hace sabiendo qué etapas tiene el trabajo del navegador, cuál de ellas se disparó, y qué hilo la está haciendo.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Casi todo problema de fluidez se explica con dos preguntas: <strong>(1)</strong> ¿en qué etapa del pipeline cae el trabajo —style, layout, paint, composite— y <strong>(2)</strong> ¿qué hilo lo está ejecutando? Si el trabajo cae en <em>layout</em> y lo hace el <em>hilo principal</em>, la página se congela. Si cae en <em>composite</em> y lo hace la <em>GPU</em>, ni te enterás. Todo lo demás de este módulo son detalles de esas dos preguntas.
+</div>
+
+<p>El módulo es deliberadamente de arquitectura e instrumentación. No vas a encontrar una lista de "10 trucos para acelerar tu web": vas a encontrar el modelo que te deja <strong>descartar</strong> nueve de esos diez trucos porque no aplican a tu caso, y medir el décimo. La red —protocolos, caché, priorización— es <strong>FS3</strong>. Las Web Vitals y su medición en campo son <strong>FS4</strong>. Acá nos quedamos adentro del proceso de render.</p>
+
+<h2>FS1.1 Arquitectura multiproceso: quién ejecuta qué</h2>
+
+<p>Un navegador moderno no es un programa: es una constelación de procesos que se hablan por IPC. Chrome, Edge y Firefox comparten la estructura general, con nombres distintos.</p>
+
+<table>
+<thead><tr><th>Proceso</th><th>De qué se ocupa</th><th>Qué pasa si se cuelga</th></tr></thead>
+<tbody>
+<tr><td><strong>Browser</strong> (o <em>parent</em>)</td><td>UI del navegador, barra de direcciones, pestañas, permisos, coordinación</td><td>Se muere el navegador entero</td></tr>
+<tr><td><strong>Renderer</strong></td><td>Parse de HTML/CSS, DOM, style, layout, paint, y <strong>tu JavaScript</strong>. Uno por sitio (site isolation)</td><td>Muere una pestaña: "Aw, snap". El resto sigue vivo</td></tr>
+<tr><td><strong>GPU</strong></td><td>Rasterizado y composición de las capas; una sola instancia compartida</td><td>Se reinicia solo; la página parpadea y sigue</td></tr>
+<tr><td><strong>Network</strong></td><td>Sockets, TLS, caché HTTP, DNS. Compartido por todas las pestañas</td><td>Se cortan las descargas hasta que revive</td></tr>
+<tr><td><strong>Utility / Plugin / Extension</strong></td><td>Audio, storage, extensiones. Aislados a propósito</td><td>Se degrada esa función puntual</td></tr>
+</tbody>
+</table>
+
+<p><strong>Site isolation</strong> es la decisión de arquitectura que ordena todo lo demás: cada <em>site</em> (esquema + dominio registrable, o sea <code>https://banco.com</code> y <code>https://banco.com.ar</code> son sitios distintos) obtiene su propio proceso de render, y eso incluye los <code>iframe</code> de terceros. Chrome lo activó por defecto en Chrome 67; Firefox lo hizo con <strong>Project Fission</strong>; Safari usa el modelo split-process de WebKit2, que aísla web de UI pero no da el mismo aislamiento por sitio.</p>
+
+<pre><code class="lang-bash"># Ver los procesos reales de tu página (Chrome / Edge)
+#   Menú → Más herramientas → Administrador de tareas   (Shift + Esc)
+#   Muestra memoria, CPU y "ID de proceso" por pestaña, iframe y extensión
+
+# Detalle interno del árbol de frames y su asignación a procesos:
+#   chrome://process-internals/
+# Cuánta memoria consume cada uno, desagregado:
+#   chrome://memory-internals/</code></pre>
+
+<div class="info">
+  <strong>Lo que site isolation te cuesta.</strong> Aislar por sitio significa <strong>más procesos</strong>, y cada proceso arranca con decenas de MB propios. Una página con ocho <code>iframe</code> de terceros (chat, mapa, video, tres widgets de analytics) puede tener nueve procesos de render vivos. La seguridad se paga en RAM, y en equipos con poca memoria el navegador empieza a consolidar procesos, con lo cual el aislamiento se degrada. Es el trade-off explícito del diseño.
+</div>
+
+<div class="danger">
+  <strong>⚠️ Lo que site isolation NO te da.</strong> Todo el contenido <em>de tu propio sitio</em> —tu HTML, tu CSS, tus tres bundles de JavaScript, tu librería de gráficos— comparte <strong>un único hilo principal en un único proceso de render</strong>. El aislamiento te protege del iframe de publicidad, no de vos mismo. Cuando tu código bloquea, bloquea todo: no hay proceso hermano que te salve.
+</div>
+
+<h2>FS1.2 El pipeline de render, etapa por etapa</h2>
+
+<p>Dentro del proceso de render, convertir bytes en píxeles es una secuencia fija. Cada etapa consume lo que produjo la anterior:</p>
+
+<div class="analogy">
+  <strong>🔧 La cinta de montaje.</strong> Pensalo como una fábrica con seis estaciones. Si tocás una pieza en la estación 3, todo lo que viene después —4, 5, 6— hay que rehacerlo. Si la tocás en la estación 6, no se mueve nada más. <strong>La optimización del pipeline es, casi siempre, empujar el trabajo lo más tarde posible en la cinta.</strong>
+</div>
+
+<table>
+<thead><tr><th>#</th><th>Etapa</th><th>Entrada → salida</th><th>Qué la invalida</th><th>Dónde la ves en DevTools</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>Parse</strong></td><td>bytes → tokens → nodos</td><td>HTML nuevo, <code>innerHTML</code>, streaming</td><td><em>Parse HTML</em> (azul)</td></tr>
+<tr><td>2</td><td><strong>DOM + CSSOM</strong></td><td>nodos → dos árboles</td><td>Insertar/quitar nodos, agregar hojas de estilo</td><td><em>Parse Stylesheet</em></td></tr>
+<tr><td>3</td><td><strong>Style</strong></td><td>DOM + CSSOM → estilo computado por nodo</td><td>Cambiar clases, variables CSS, atributos que matchean selectores</td><td><em>Recalculate Style</em> (violeta)</td></tr>
+<tr><td>4</td><td><strong>Layout</strong> (reflow)</td><td>estilo → geometría: posición y tamaño de cada caja</td><td>Todo lo que cambia geometría: <code>width</code>, <code>top</code>, texto, fuentes</td><td><em>Layout</em> (violeta)</td></tr>
+<tr><td>5</td><td><strong>Paint</strong></td><td>geometría → listas de comandos de dibujo por capa</td><td><code>color</code>, <code>background</code>, <code>box-shadow</code>, <code>border-radius</code></td><td><em>Paint</em> (verde)</td></tr>
+<tr><td>6</td><td><strong>Composite</strong></td><td>capas rasterizadas → el frame final en pantalla</td><td><code>transform</code>, <code>opacity</code>, scroll</td><td><em>Composite Layers</em> (verde oscuro)</td></tr>
+</tbody>
+</table>
+
+<p>Entre 4 y 5 hay un paso que a veces se nombra aparte, <strong>Layerize</strong>: el compositor decide cuántas capas independientes va a manejar. Lo vemos en FS1.5, porque es donde se toma la peor decisión de performance de la industria (<code>will-change</code> puesto en todos lados).</p>
+
+<div class="rule">
+  <strong>📌 La regla que ordena el resto del módulo.</strong> El pipeline solo corre hacia adelante. Tocar la etapa 4 obliga a rehacer 4, 5 y 6. Tocar la 5 obliga a rehacer 5 y 6. Tocar la 6 solo rehace la 6 — y la hace la GPU, no el hilo principal. Por eso una animación de <code>transform</code> puede correr a 120 fps mientras la misma animación con <code>top</code> se arrastra a 12.
+</div>
+
+<h2>FS1.3 Reflow, repaint y composite: el precio de cada propiedad</h2>
+
+<p>Esta tabla es el corazón práctico del módulo. Vale la pena leerla dos veces:</p>
+
+<table>
+<thead><tr><th>Si cambiás…</th><th>Etapas que se rehacen</th><th>Quién trabaja</th><th>Costo típico (lista de 500 nodos)</th></tr></thead>
+<tbody>
+<tr><td><code>width</code>, <code>height</code>, <code>top</code>, <code>left</code>, <code>margin</code>, <code>padding</code>, <code>font-size</code>, insertar un nodo</td><td>Style → <strong>Layout</strong> → Paint → Composite</td><td>Hilo principal</td><td>10–120 ms</td></tr>
+<tr><td><code>color</code>, <code>background-color</code>, <code>box-shadow</code>, <code>border-radius</code>, <code>visibility</code>, <code>outline</code></td><td>Style → <strong>Paint</strong> → Composite</td><td>Hilo principal + rasterizado</td><td>2–25 ms</td></tr>
+<tr><td><code>transform</code>, <code>opacity</code>, <code>filter</code> (en una capa propia)</td><td><strong>Composite</strong></td><td>Compositor / GPU</td><td>&lt; 1 ms</td></tr>
+</tbody>
+</table>
+
+<p>La diferencia no es de grado, es de naturaleza. <code>transform</code> y <code>opacity</code> son baratas porque el compositor puede aplicarlas a una textura <strong>ya rasterizada</strong>: mover una imagen que ya existe en memoria de GPU es una multiplicación de matriz, no un recálculo. <code>width</code> y <code>top</code> son caras porque cambian el <em>flujo</em>: si una caja se ensancha, sus hermanas se corren, su contenedor puede crecer, el texto se reacomoda y hay que volver a preguntarle a la fuente dónde parte cada línea.</p>
+
+<pre><code class="lang-css">/* ❌ Anima la geometría: layout + paint + composite en CADA frame */
+.panel-lento {
+  left: 0;
+  transition: left .3s ease;
+}
+.panel-lento.abierto { left: 320px; }
+
+/* ✅ Anima solo la composición: la GPU mueve una textura que ya existe */
+.panel-rapido {
+  transform: translateX(0);
+  transition: transform .3s ease;
+}
+.panel-rapido.abierto { transform: translateX(320px); }</code></pre>
+
+<div class="mistake">
+  <strong>El error de leer esta tabla como un dogma.</strong> "Usá siempre <code>transform</code>" es falso apenas salís de las animaciones. Un layout que se recalcula <strong>una vez</strong>, en respuesta a un click, con 200 nodos, cuesta 4 ms y es completamente aceptable — reescribirlo con transforms para ahorrar esos 4 ms es complejidad regalada. La tabla importa cuando el cambio ocurre <strong>60 veces por segundo</strong>: en animaciones, en handlers de scroll, en drag &amp; drop y en cualquier cosa atada a <code>requestAnimationFrame</code>.
+</div>
+
+<h3>Los casos frontera que conviene conocer</h3>
+
+<ul>
+  <li><strong><code>filter: blur()</code></strong> corre en GPU pero es caro en <em>fill rate</em>: un blur grande sobre un área grande puede costar más que el layout que evitaste.</li>
+  <li><strong><code>box-shadow</code> animado</strong> es repaint en cada frame. Si necesitás animar una sombra, animá la <code>opacity</code> de un pseudo-elemento que ya tiene la sombra pintada.</li>
+  <li><strong>Cambiar una variable CSS</strong> en <code>:root</code> invalida el estilo de todo lo que la usa. Es la forma más fácil de disparar un <em>Recalculate Style</em> de la página completa sin darte cuenta.</li>
+  <li><strong><code>display: none</code> → <code>block</code></strong> es layout completo del subárbol. <code>visibility: hidden</code> → <code>visible</code> es solo paint, porque la caja ya ocupaba lugar.</li>
+</ul>
+
+<h2>FS1.4 Layout thrashing: el patrón leer-escribir-leer</h2>
+
+<p>Esta es la causa raíz número uno de los tirones en interfaces reales, y es invisible en el código si no sabés qué buscar. El navegador es perezoso: cuando escribís un estilo, <strong>no</strong> recalcula el layout en el acto — lo encola para hacerlo una sola vez antes del próximo frame. Pero si le preguntás algo que depende de la geometría, no le queda otra que calcular el layout <em>ahí mismo</em>, sincrónicamente, para poder responderte.</p>
+
+<pre><code class="lang-javascript">// ❌ leer-escribir-leer-escribir: cada lectura fuerza un layout síncrono
+const filas = document.querySelectorAll('.fila');
+
+for (const fila of filas) {
+  const ancho = fila.offsetWidth;              // LEE  → obliga a calcular layout AHORA
+  fila.style.width = (ancho + 10) + 'px';      // ESCRIBE → invalida el layout recién hecho
+}
+// 500 filas = 500 layouts completos.
+// En un catálogo real medido con throttling 4×: 310 ms de bloqueo.</code></pre>
+
+<pre><code class="lang-javascript">// ✅ separar fases: TODAS las lecturas, después TODAS las escrituras
+const filas = [...document.querySelectorAll('.fila')];
+
+const anchos = filas.map(f =&gt; f.offsetWidth);   // 1 solo layout, para las 500
+filas.forEach((f, i) =&gt; {                        // 0 layouts adicionales
+  f.style.width = (anchos[i] + 10) + 'px';
+});
+// Mismo resultado visual. 310 ms → 9 ms.</code></pre>
+
+<h3>Qué APIs fuerzan layout</h3>
+
+<p>No hace falta memorizar la lista completa (existe, y es larga), pero sí el patrón: <strong>cualquier cosa que devuelva un número que dependa de dónde está algo en la pantalla</strong>.</p>
+
+<table>
+<thead><tr><th>Familia</th><th>Ejemplos</th><th>Alternativa que NO fuerza layout</th></tr></thead>
+<tbody>
+<tr><td>Geometría de elemento</td><td><code>offsetTop</code>, <code>offsetWidth</code>, <code>clientHeight</code>, <code>getBoundingClientRect()</code></td><td><code>ResizeObserver</code>, <code>IntersectionObserver</code></td></tr>
+<tr><td>Scroll</td><td><code>scrollTop</code>, <code>scrollHeight</code>, <code>scrollIntoView()</code></td><td><code>IntersectionObserver</code>, <code>scrollend</code></td></tr>
+<tr><td>Estilo computado</td><td><code>getComputedStyle(el).height</code></td><td>Guardar el valor vos, o usar variables CSS</td></tr>
+<tr><td>Ventana</td><td><code>innerWidth</code>, <code>innerHeight</code>, <code>getMatchedCSSRules</code></td><td><code>matchMedia()</code>, <code>ResizeObserver</code> en <code>documentElement</code></td></tr>
+<tr><td>Foco y rangos</td><td><code>focus()</code>, <code>Range.getBoundingClientRect()</code></td><td>—</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Cómo lo detectás en tres lugares distintos.</strong>
+  <br>· <strong>Consola:</strong> Chrome loguea solo <code>[Violation] Forced reflow while executing JavaScript took 312ms</code>. Cualquier valor por encima de ~30 ms merece investigación.
+  <br>· <strong>Performance panel:</strong> los bloques violetas de <em>Layout</em> con un <strong>triángulo rojo</strong> en la esquina. Al pasar el mouse te dice la línea exacta de JS que lo forzó. El panel además tiene un insight llamado <em>Forced reflow</em> que los agrupa.
+  <br>· <strong>En producción:</strong> la Long Animation Frames API expone <code>forcedStyleAndLayoutDuration</code> por script (FS1.10). Es la única de las tres que te dice si les pasa a tus usuarios reales y no solo a tu notebook.
+</div>
+
+<div class="warn">
+  <strong>El costo de la corrección.</strong> Separar lecturas de escrituras te obliga a mantener dos pasadas y un array intermedio: más memoria, más código, y una ventana en la que los datos leídos ya están viejos. En un componente chico es innecesario. La corrección se justifica cuando el bucle tiene más de unas decenas de nodos <strong>y</strong> corre en un handler que se dispara muchas veces por segundo. Medí antes: un bucle de 12 elementos con thrashing cuesta menos que la abstracción que ibas a escribir para evitarlo.
+</div>
+
+<h2>FS1.5 Capas del compositor: cuándo crear una y cuánto cuesta</h2>
+
+<p>El compositor divide la página en <strong>capas</strong> (layers): texturas independientes que rasteriza una vez y después mueve, escala y funde en la GPU. Una capa se crea cuando el navegador decide que algo va a moverse independientemente del resto.</p>
+
+<p>Los disparadores más comunes: <code>will-change: transform | opacity</code>, un <code>transform: translateZ(0)</code> o <code>translate3d</code>, elementos <code>position: fixed</code>, <code>&lt;video&gt;</code> y <code>&lt;canvas&gt;</code>, iframes, animaciones aceleradas ya en curso, y elementos que se superponen a una capa existente.</p>
+
+<pre><code class="lang-css">/* ❌ El anti-patrón más común de 2016 que sigue vivo en 2026:
+   200 tarjetas × una capa permanente cada una */
+.tarjeta { will-change: transform; }
+
+/* ✅ Prometer el cambio solo durante la ventana en la que va a ocurrir */
+.tarjeta:hover        { will-change: transform; }
+.tarjeta.animando     { will-change: transform, opacity; }</code></pre>
+
+<pre><code class="lang-javascript">// Y sacarlo cuando termina: si queda puesto, la capa queda viva para siempre
+el.classList.add('animando');
+el.addEventListener('transitionend', () =&gt; {
+  el.classList.remove('animando');
+  el.style.willChange = 'auto';
+}, { once: true });</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Aritmética de la memoria de GPU.</strong> Una capa se guarda como bitmap RGBA: <strong>ancho × alto × 4 bytes</strong>, y en pantallas con <code>devicePixelRatio: 2</code> eso se multiplica por cuatro. Una capa a pantalla completa de 1920×1080 son <strong>≈ 8 MB</strong>; en un portátil retina, <strong>≈ 33 MB</strong>. Doscientas tarjetas de 300×200 con <code>will-change</code> puesto de más son <strong>≈ 48 MB</strong> de VRAM permanentemente ocupados — y en un móvil de gama media eso no es una molestia, es el motivo por el que la pestaña se recarga sola al volver de segundo plano.
+</div>
+
+<div class="step"><strong>Cómo verlo, no suponerlo.</strong> En DevTools: <em>More tools → Layers</em> te da la vista 3D con el tamaño en memoria de cada capa y el <strong>motivo de compositing</strong> de cada una ("has a will-change: transform", "overlaps a composited layer"). En <em>More tools → Rendering</em>, <em>Layer borders</em> pinta los bordes en vivo y <em>Paint flashing</em> te resalta en verde lo que se está repintando: si al hacer scroll parpadea toda la pantalla, no estás compositando, estás repintando.</div>
+
+<div class="info">
+  <strong>Capas creadas sin que vos las pidas.</strong> El compositor promueve automáticamente cualquier elemento que se superponga a una capa existente, para no romper el orden de pintado. Un <code>position: sticky</code> mal ubicado, o un tooltip que pasa por encima de un video, pueden generar una cascada de capas nuevas. Si el panel <em>Layers</em> muestra muchas más de las que esperabas, buscá el elemento compositado que está "contagiando" a sus vecinos.
+</div>
+
+<h2>FS1.6 El event loop de verdad</h2>
+
+<p>El "event loop" que se enseña con <code>setTimeout</code> y promesas es una simplificación útil que se queda corta apenas te importa la fluidez, porque omite el paso más importante: <strong>el render</strong>. El ciclo real de una iteración es este:</p>
+
+<div class="step"><strong>1. Task.</strong> Se saca <em>una</em> tarea de la cola de macrotasks y se ejecuta hasta el final. Un evento de click, un <code>setTimeout</code> vencido, un <code>message</code>, el parseo de un chunk de HTML.</div>
+
+<div class="step"><strong>2. Microtasks.</strong> Se vacía <strong>completa</strong> la cola de microtasks: <code>.then()</code>, <code>await</code>, <code>queueMicrotask</code>, <code>MutationObserver</code>. Si una microtask agrega otra, esa también corre. No hay límite.</div>
+
+<div class="step"><strong>3. ¿Toca renderizar?</strong> El navegador decide si este es el momento de un frame (según la frecuencia del monitor y si la pestaña está visible). Si no toca, vuelve al paso 1 sin pintar nada.</div>
+
+<div class="step"><strong>4. requestAnimationFrame.</strong> Corren todos los callbacks de rAF registrados. Es el último punto donde tu JS puede tocar el DOM antes de que se calcule este frame.</div>
+
+<div class="step"><strong>5. Render.</strong> Style → Layout → Paint → Composite (FS1.2). También corren acá <code>ResizeObserver</code> e <code>IntersectionObserver</code>, y las animaciones de CSS y de la Web Animations API.</div>
+
+<div class="step"><strong>6. requestIdleCallback.</strong> Si sobró tiempo antes del próximo frame, corren los callbacks ociosos, con un <code>deadline</code> que te dice cuánto te queda.</div>
+
+<pre><code class="lang-javascript">console.log('A · script sincrónico');
+
+setTimeout(()            =&gt; console.log('D · task de timer'), 0);
+queueMicrotask(()        =&gt; console.log('B · microtask'));
+Promise.resolve().then(()=&gt; console.log('C · microtask de promesa'));
+requestAnimationFrame(() =&gt; console.log('E · rAF, justo antes de calcular el frame'));
+requestIdleCallback(()   =&gt; console.log('F · idle, si sobró tiempo'));
+
+// Garantizado: A → B → C  (sincrónico, después TODAS las microtasks)
+// D contra E NO está garantizado: depende de si toca frame en ese instante.
+// F siempre último, y puede tardar segundos si el hilo está ocupado.</code></pre>
+
+<div class="mistake">
+  <strong>Microtask starvation: el bloqueo que no aparece como long task.</strong> Como el paso 2 vacía la cola <em>entera</em>, una cadena infinita de microtasks nunca deja llegar al paso 3. La pestaña se congela sin que se registre una tarea larga, porque técnicamente son mil tareas cortas encadenadas.
+</div>
+
+<pre><code class="lang-javascript">// ❌ congela la pestaña para siempre, y el profiler cuesta leerlo
+function loop() { Promise.resolve().then(loop); }
+loop();
+
+// ✅ un bucle equivalente que sí cede: cada vuelta es una task nueva
+function loop() { setTimeout(loop, 0); }   // el navegador puede pintar entre vueltas</code></pre>
+
+<h3>El presupuesto de 16,6 ms</h3>
+
+<table>
+<thead><tr><th>Pantalla</th><th>Presupuesto por frame</th><th>Presupuesto real para tu JS</th></tr></thead>
+<tbody>
+<tr><td>60 Hz (lo más común)</td><td>16,6 ms</td><td>≈ 8–10 ms</td></tr>
+<tr><td>120 Hz (móviles de gama alta, ProMotion)</td><td>8,3 ms</td><td>≈ 4–5 ms</td></tr>
+<tr><td>144 Hz (monitores gamer)</td><td>6,9 ms</td><td>≈ 3–4 ms</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 No tenés los 16,6 ms.</strong> De ese presupuesto, el navegador se queda con una porción para style, layout, paint y composite, más el <em>overhead</em> propio del ciclo. La regla de trabajo es que tu callback de rAF debe terminar en <strong>menos de la mitad</strong> del período del frame. Y ojo con la trampa de los 120 Hz: código que va perfecto en tu monitor de 60 Hz puede perder uno de cada dos frames en el iPhone del usuario, que corre al doble de velocidad.
+</div>
+
+<h2>FS1.7 Long tasks y yielding cooperativo</h2>
+
+<p>Una <strong>long task</strong> es, por definición de la Long Tasks API, cualquier tarea que ocupa el hilo principal <strong>50 ms o más</strong>. Durante esos 50 ms el navegador no puede: procesar un click, mostrar el cursor de texto, actualizar una animación, ni pintar un frame. El usuario percibe la interfaz como rota, aunque después responda perfecto.</p>
+
+<div class="analogy">
+  <strong>🔧 Por qué 50 ms y no otro número.</strong> El umbral no viene de la fluidez visual sino de la <em>respuesta percibida</em>: si un click llega justo cuando empieza una tarea de 50 ms, se atiende 50 ms tarde, y el techo aceptable para que una interacción se sienta instantánea ronda los 100 ms. Cincuenta deja margen para el trabajo real de responder. De ahí sale la métrica <strong>INP</strong>, que vemos en FS4.
+</div>
+
+<p>La solución no es hacer el trabajo más rápido —a veces no se puede— sino <strong>partirlo y devolverle el control al navegador entre pedazo y pedazo</strong>. A eso se le llama <em>yielding</em>. En 2026 hay tres formas, con soporte muy distinto:</p>
+
+<table>
+<thead><tr><th>API</th><th>Qué hace</th><th>Soporte (sept. 2026)</th><th>Trampa</th></tr></thead>
+<tbody>
+<tr><td><code>scheduler.yield()</code></td><td>Cede y vuelve <strong>al frente</strong> de la cola con prioridad heredada</td><td>Chrome/Edge (129+) y Firefox (desde 2025). <strong>Safari no.</strong> No es Baseline</td><td>Necesita fallback sí o sí</td></tr>
+<tr><td><code>scheduler.postTask()</code></td><td>Encola con prioridad explícita y <code>AbortSignal</code></td><td>Igual que arriba: Chromium y Firefox, sin Safari</td><td>Tres prioridades fijas, no un scheduler general</td></tr>
+<tr><td><code>setTimeout(fn, 0)</code></td><td>Cede y vuelve <strong>al final</strong> de la cola</td><td>Universal</td><td>Cualquier task encolada mientras tanto se te adelanta</td></tr>
+<tr><td><code>requestIdleCallback()</code></td><td>Corre solo si sobra tiempo, con <code>deadline</code></td><td>Chrome, Edge, Firefox. <strong>Safari lo tiene detrás de un flag</strong>, no en estable</td><td>Puede no ejecutarse nunca si el hilo está ocupado</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-javascript">// Función de yielding con degradación honesta
+function cederAlHiloPrincipal() {
+  if (typeof scheduler !== 'undefined' &amp;&amp; typeof scheduler.yield === 'function') {
+    return scheduler.yield();               // vuelve al FRENTE de la cola
+  }
+  return new Promise(r =&gt; setTimeout(r, 0)); // vuelve al FINAL: peor, pero funciona
+}
+
+async function procesarLote(items) {
+  let inicio = performance.now();
+  for (const item of items) {
+    trabajoPesado(item);
+    // Cortamos ANTES del umbral, no cuando ya lo pasamos
+    if (performance.now() - inicio &gt; 40) {
+      await cederAlHiloPrincipal();
+      inicio = performance.now();
+    }
+  }
+}</code></pre>
+
+<div class="warn">
+  <strong>La diferencia entre "frente" y "final" no es cosmética.</strong> Con <code>setTimeout(0)</code>, cada vez que cedés, cualquier tarea que haya llegado mientras tanto —un mensaje de un worker, un evento de red, el callback de otro componente— se ejecuta antes que la continuación de tu bucle. En una app cargada, un procesamiento partido en 200 pedazos con <code>setTimeout</code> puede tardar <strong>varias veces más</strong> en terminar que el mismo procesamiento sin partir. <code>scheduler.yield()</code> existe exactamente para eso: cede sin perder el turno.
+</div>
+
+<pre><code class="lang-javascript">// postTask: prioridades explícitas y cancelación
+scheduler.postTask(() =&gt; pintarResultados(), { priority: 'user-blocking' }); // lo que el usuario espera
+scheduler.postTask(() =&gt; precalcularFiltros(), { priority: 'user-visible' }); // por defecto
+scheduler.postTask(() =&gt; enviarTelemetria(),   { priority: 'background' });   // que espere
+
+// Cancelar una búsqueda que ya no importa porque el usuario siguió tecleando
+const ctrl = new TaskController({ priority: 'user-visible' });
+scheduler.postTask(() =&gt; buscar(q), { signal: ctrl.signal });
+ctrl.abort();   // la tarea nunca corre si todavía no empezó</code></pre>
+
+<div class="mistake">
+  <strong>Yielding de más también es un bug.</strong> Cada corte tiene un costo: se cierra la tarea, se vacían microtasks, el navegador evalúa si toca frame. Ceder cada 200 items en un bucle de 200.000 está bien; ceder en <em>cada</em> item convierte 300 ms de trabajo en 4 segundos de trabajo troceado, y el usuario ve una barra de progreso eterna en vez de un congelamiento breve. La heurística sana es <strong>cortar por tiempo transcurrido, no por cantidad de items</strong>, como en el ejemplo de arriba: los items no duran todos lo mismo.
+</div>
+
+<h2>FS1.8 Parsing: por qué un script bloquea y qué salva el preload scanner</h2>
+
+<p>El parser de HTML construye el DOM de arriba hacia abajo. Cuando encuentra un <code>&lt;script&gt;</code> clásico sin atributos, tiene que parar: el script podría contener un <code>document.write</code> que cambie el HTML que viene después, así que el parser <strong>descarga y ejecuta</strong> antes de seguir leyendo. Esa es la definición de <em>render-blocking</em>.</p>
+
+<pre><code class="lang-html">&lt;!-- ❌ bloquea el parser: descarga Y ejecuta antes de seguir leyendo el HTML --&gt;
+&lt;script src="app.js"&gt;&lt;/script&gt;
+
+&lt;!-- ✅ descarga en paralelo, ejecuta al terminar el parseo, en orden de aparición --&gt;
+&lt;script src="app.js" defer&gt;&lt;/script&gt;
+
+&lt;!-- ✅ los módulos son defer por defecto; no hace falta el atributo --&gt;
+&lt;script type="module" src="app.js"&gt;&lt;/script&gt;
+
+&lt;!-- ⚠️ async: descarga en paralelo pero ejecuta APENAS llega, sin orden garantizado,
+     y esa ejecución sí puede interrumpir el parser. Solo para scripts sin dependencias. --&gt;
+&lt;script src="analytics.js" async&gt;&lt;/script&gt;</code></pre>
+
+<p>Mientras el parser está detenido, el navegador no se queda quieto: corre el <strong>preload scanner</strong>, un segundo parser liviano que lee el HTML crudo por adelantado buscando URLs para empezar a descargarlas. Es una de las optimizaciones que más rendimiento aporta en la web real, y es <strong>trivial de romper sin querer</strong>.</p>
+
+<pre><code class="lang-html">&lt;!-- ✅ el preload scanner ve esta URL y la empieza a bajar aunque el parser esté frenado --&gt;
+&lt;img src="/hero.avif" width="1200" height="600" fetchpriority="high" alt="Portada"&gt;
+
+&lt;!-- ❌ invisible para el scanner: la URL solo existe cuando el JS corre.
+     La descarga arranca cientos de milisegundos más tarde. --&gt;
+&lt;div id="hero"&gt;&lt;/div&gt;
+&lt;script&gt;hero.style.backgroundImage = 'url(/hero.avif)';&lt;/script&gt;
+
+&lt;!-- ❌ mismo problema: imágenes inyectadas por el framework después de hidratar --&gt;
+&lt;div id="app"&gt;&lt;/div&gt;</code></pre>
+
+<div class="tip">
+  <strong>Cuándo un CSS bloquea y cuándo no.</strong> Una hoja de estilos sin <code>media</code> bloquea el render de <strong>toda</strong> la página hasta que llega: el navegador no quiere mostrarte contenido sin estilo. Pero si le decís que no aplica al medio actual, la baja con prioridad baja y no bloquea nada.
+</div>
+
+<pre><code class="lang-html">&lt;!-- bloquea el render de toda la página --&gt;
+&lt;link rel="stylesheet" href="app.css"&gt;
+
+&lt;!-- NO bloquean: el navegador sabe que no aplican ahora mismo --&gt;
+&lt;link rel="stylesheet" href="print.css" media="print"&gt;
+&lt;link rel="stylesheet" href="escritorio.css" media="(min-width: 1200px)"&gt;
+
+&lt;!-- Truco clásico: cargar sin bloquear y activar al terminar.
+     Costo: puede producir un flash de contenido sin estilo. Usalo solo
+     para CSS que NO afecta lo que se ve arriba del pliegue. --&gt;
+&lt;link rel="stylesheet" href="tardio.css" media="print" onload="this.media='all'"&gt;</code></pre>
+
+<div class="warn">
+  <strong>El costo de defer que nadie menciona.</strong> Poner <code>defer</code> en todo mejora la métrica de "primer pintado" y puede empeorar la de "primera interacción útil": el contenido aparece antes, pero no responde, porque todo el JavaScript se ejecuta junto al final del parseo, en una única long task gigante. Mover el bloqueo de lugar no es lo mismo que eliminarlo. Lo que se mide acá es el tiempo hasta que la página <em>responde</em>, no hasta que se <em>ve</em> — la distinción es el tema de FS4.
+</div>
+
+<h2>FS1.9 Web Workers: qué se puede mover y qué no</h2>
+
+<p>Un Web Worker es un hilo real, con su propio event loop, corriendo en el mismo proceso de render. Es la única forma de sacar trabajo de JavaScript del hilo principal sin sacarlo del navegador.</p>
+
+<table>
+<thead><tr><th>Disponible en un Worker</th><th>NO disponible</th></tr></thead>
+<tbody>
+<tr><td><code>fetch</code>, <code>WebSocket</code>, <code>IndexedDB</code>, <code>Cache</code></td><td><strong>El DOM entero</strong>: <code>document</code>, <code>window</code>, elementos</td></tr>
+<tr><td><code>WebAssembly</code>, <code>crypto.subtle</code>, <code>TextDecoder</code></td><td><code>localStorage</code> (es sincrónico por diseño)</td></tr>
+<tr><td><code>OffscreenCanvas</code>, <code>createImageBitmap</code></td><td><code>alert</code>, <code>confirm</code>, y cualquier UI</td></tr>
+<tr><td><code>performance</code>, <code>structuredClone</code>, timers</td><td>Acceso directo a la geometría: no hay layout que consultar</td></tr>
+</tbody>
+</table>
+
+<p>La regla es simple y absoluta: <strong>un Worker no puede tocar el DOM</strong>. Puede calcular <em>qué</em> hay que mostrar, y mandarle el resultado al hilo principal para que lo muestre. Todo lo que sea "recorrer nodos" no se puede mover, por definición.</p>
+
+<h3>El costo real: structured clone</h3>
+
+<p>La comunicación con un Worker pasa por <code>postMessage</code>, que <strong>copia</strong> los datos con el algoritmo de clonado estructurado. Esa copia es sincrónica y bloquea el hilo <strong>de los dos lados</strong>. Es el detalle que arruina la mitad de las migraciones a Workers.</p>
+
+<pre><code class="lang-javascript">// main.js
+const worker = new Worker('./parser.js', { type: 'module' });
+
+// ❌ 40 MB de objetos JS: se serializa acá (≈70 ms de bloqueo)
+//    y se deserializa allá (otros ≈70 ms). Movimos el problema, no lo resolvimos.
+worker.postMessage(catalogoEnormeComoObjetos);
+
+// ✅ Transferable: el buffer CAMBIA de dueño en vez de copiarse. Costo ≈ 0.
+const buf = new ArrayBuffer(40 * 1024 * 1024);
+worker.postMessage(buf, [buf]);
+console.log(buf.byteLength);   // 0 → el ArrayBuffer quedó "detached" acá
+
+// ✅ Mejor todavía: que el Worker haga el fetch y el JSON.parse él mismo,
+//    y devuelva solo las 50 filas que la UI va a mostrar.
+worker.postMessage({ tipo: 'buscar', url, query, pagina: 1 });</code></pre>
+
+<table>
+<thead><tr><th>Forma de pasar datos</th><th>Costo aproximado (40 MB)</th><th>Cuándo usarla</th></tr></thead>
+<tbody>
+<tr><td>Objetos JS (structured clone)</td><td>≈ 140 ms en total, bloqueando ambos hilos</td><td>Solo con payloads chicos (kilobytes)</td></tr>
+<tr><td><code>ArrayBuffer</code> transferible</td><td>&lt; 1 ms</td><td>Datos binarios, resultados numéricos, imágenes</td></tr>
+<tr><td><code>SharedArrayBuffer</code></td><td>0: memoria compartida real</td><td>Solo con cabeceras COOP/COEP; requiere sincronización manual</td></tr>
+<tr><td>No pasar nada (el Worker hace el fetch)</td><td>0</td><td>La opción por defecto que casi nadie considera primero</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Cuándo un Worker conviene de verdad.</strong> Cuando el trabajo es (a) <strong>puro cómputo</strong> sobre datos, (b) dura <strong>más de ~100 ms</strong> por invocación, y (c) el resultado es <strong>chico comparado con la entrada</strong>. Parsear un CSV de 30 MB y devolver 200 filas agregadas: ideal. Filtrar un array de 500 objetos: nunca — el <code>postMessage</code> de ida y vuelta cuesta más que el filtro.
+</div>
+
+<div class="info">
+  <strong>Novedad 2026:</strong> hasta hace poco, el trabajo dentro de un Worker era una caja negra para la instrumentación. Desde <strong>Chrome 153</strong> (septiembre de 2026) la Long Animation Frames API se extiende a los <em>dedicated workers</em>: podés observar <code>long-animation-frame</code> <strong>dentro</strong> del worker y ver qué script suyo tarda. Es Chrome-only por ahora, y el observer tiene que registrarse en el worker, no en la página — y la correlación entre lo que tarda el worker y la acción del usuario que lo originó la tenés que armar vos.
+</div>
+
+<h2>FS1.10 Cómo medir esto sin engañarte</h2>
+
+<p>Todo lo anterior es inútil si tus mediciones mienten. Y por defecto, mienten.</p>
+
+<div class="danger">
+  <strong>⚠️ Las cuatro formas más comunes de medir mal.</strong>
+  <br><strong>1. Medir en tu máquina de desarrollo.</strong> Tu notebook es entre 4 y 20 veces más rápida que el teléfono de tu usuario mediano. Activá siempre el <em>CPU throttling</em> (4× o 6×) en el Performance panel.
+  <br><strong>2. Medir con extensiones activas.</strong> Y el modo incógnito <strong>no</strong> las desactiva: muchas piden permiso para correr ahí. Usá un perfil limpio con <code>--disable-extensions</code>.
+  <br><strong>3. Medir una sola vez.</strong> La varianza entre corridas de un mismo trace es enorme. Corré cinco veces y quedate con la <strong>mediana</strong>, nunca con la mejor.
+  <br><strong>4. Medir solo en el laboratorio.</strong> El lab te dice si un cambio mejoró algo; solo el campo te dice si a alguien le importaba. Eso es FS4.
+</div>
+
+<pre><code class="lang-bash"># 1) Perfil limpio y reproducible (el incógnito NO alcanza)
+chrome --user-data-dir=/tmp/perf-limpio --no-first-run --disable-extensions
+
+# 2) Trace desde la terminal, con el mismo throttling que aplica el panel
+npx lighthouse https://tu-sitio.dev --preset=desktop --view
+npx lighthouse https://tu-sitio.dev --throttling.cpuSlowdownMultiplier=4 --view
+
+# 3) Cinco corridas y mediana, no la mejor
+for i in 1 2 3 4 5; do
+  npx lighthouse "$URL" --quiet --output=json --output-path="corrida-$i.json"
+done</code></pre>
+
+<h3>Instrumentar tu propio código</h3>
+
+<pre><code class="lang-javascript">// performance.mark/measure: aparece como una banda propia en el track "Timings"
+// del Performance panel, alineada con el flame chart. Es la forma más barata
+// de saber cuál de TUS funciones corresponde a ese bloque amarillo.
+performance.mark('filtro:inicio');
+const resultado = filtrarCatalogo(items, query);
+performance.mark('filtro:fin');
+performance.measure('filtro-catalogo', 'filtro:inicio', 'filtro:fin');
+
+// Y el mismo dato sirve en producción
+const [m] = performance.getEntriesByName('filtro-catalogo');
+if (m.duration &gt; 50) reportar('filtro-lento', m.duration);</code></pre>
+
+<pre><code class="lang-javascript">// Long Tasks API: tareas ≥ 50 ms. Barata, universal en Chromium, sin atribución fina.
+new PerformanceObserver(lista =&gt; {
+  for (const e of lista.getEntries()) {
+    console.log('long task', Math.round(e.duration), 'ms', e.attribution);
+  }
+}).observe({ type: 'longtask', buffered: true });</code></pre>
+
+<pre><code class="lang-javascript">// Long Animation Frames (Chrome 123+): el FRAME entero, con atribución por script.
+// Es la herramienta que convierte "algo va lento" en "esta función, este archivo".
+const soportado = PerformanceObserver.supportedEntryTypes
+  ?.includes('long-animation-frame');
+
+if (soportado) {
+  new PerformanceObserver(lista =&gt; {
+    for (const frame of lista.getEntries()) {
+      console.log('frame', Math.round(frame.duration), 'ms',
+                  '| bloqueo', Math.round(frame.blockingDuration), 'ms');
+      for (const s of frame.scripts) {
+        console.log('  ', s.invoker,
+                    Math.round(s.duration), 'ms',
+                    '| reflow forzado:',
+                    Math.round(s.forcedStyleAndLayoutDuration), 'ms');
+      }
+    }
+  }).observe({ type: 'long-animation-frame', buffered: true });
+}</code></pre>
+
+<div class="warn">
+  <strong>El costo de instrumentar.</strong> Un <code>PerformanceObserver</code> de LoAF con muchas entradas genera trabajo en el mismo hilo que estás tratando de aliviar, y mandar cada entrada a tu backend multiplica las peticiones. En producción se <strong>muestrea</strong> (por ejemplo, el 1% de las sesiones) y se reporta solo lo peor: el frame más largo por sesión, no los 400 frames. Y como LoAF es Chrome-only, tus percentiles no representan a los usuarios de Safari — guardá siempre el navegador junto con el número.
+</div>
+
+<h2>FS1.11 Cuándo NO optimizar el pipeline</h2>
+
+<p>Este módulo te dio herramientas potentes para un problema que, estadísticamente, <strong>no es el tuyo</strong>. En la enorme mayoría de las aplicaciones lentas, el pipeline de render está perfecto y el tiempo se va en otro lado.</p>
+
+<div class="step"><strong>1. Si el problema es la red, esto no ayuda.</strong> Si el <em>waterfall</em> muestra 2,3 segundos esperando el primer byte, o 900 KB de JavaScript bajando por 4G, ninguna optimización de paint mueve la aguja. Eso se ataca con protocolos, caché y priorización: <strong>FS3</strong>.</div>
+
+<div class="step"><strong>2. Si el problema es tu JavaScript, esto tampoco.</strong> Un algoritmo O(n²) sobre 5.000 items no se arregla con <code>will-change</code>. Se arregla cambiando el algoritmo, o entendiendo por qué el motor lo está desoptimizando: <strong>FS2</strong>.</div>
+
+<div class="step"><strong>3. Si nadie se queja, no midas para justificar un refactor.</strong> Las Web Vitals de campo son el filtro: si tu INP en el percentil 75 está en 140 ms, tu pipeline está bien y ese tiempo lo tenés que gastar en otra cosa. <strong>FS4</strong>.</div>
+
+<div class="step"><strong>4. Si el reflow ocurre una vez, dejalo.</strong> Un layout de 6 ms al abrir un modal no es un bug. Convertirlo en tres capas compositadas y un <code>IntersectionObserver</code> agrega estado, casos borde y superficie de bugs a cambio de nada perceptible.</div>
+
+<div class="rule">
+  <strong>📌 El orden de investigación correcto.</strong> Red → JavaScript → pipeline de render. Es el orden de probabilidad decreciente de que ahí esté tu problema, y también el orden de costo creciente de la corrección. Empezar por el final es la forma más común de pasar tres días optimizando capas de GPU para descubrir que el endpoint tardaba dos segundos.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "la lista scrollea con tirones"</h2>
+
+<blockquote>Un panel de administración muestra una tabla virtualizada de 800 filas con un indicador de progreso por fila. En una notebook de desarrollo va bien. En las máquinas de la oficina, el scroll "salta" y el navegador avisa que la página no responde. El equipo ya intentó agregar <code>will-change: transform</code> a las filas y no cambió nada. ¿Qué está pasando?</blockquote>
+
+<p><strong>Paso 1 — Reproducir el problema, no el entorno.</strong> Antes de grabar nada: perfil limpio sin extensiones, y <em>CPU throttling</em> 4× en el Performance panel para acercarse al hardware real. Grabamos 5 segundos de scroll continuo. Si en esas condiciones no se reproduce, el problema no es el que creemos.</p>
+
+<p><strong>Paso 2 — Leer el flame chart antes de tocar código.</strong> Lo que aparece:</p>
+
+<ul>
+  <li>Frames de <strong>341 ms</strong> donde deberían durar 16,6: unos 3 fps efectivos.</li>
+  <li>Bloques violetas de <em>Layout</em> con <strong>triángulo rojo</strong>, repetidos cientos de veces dentro de un mismo frame.</li>
+  <li>El insight <em>Forced reflow</em> del panel atribuye <strong>318 ms</strong> a un solo callback.</li>
+  <li>En la consola: <code>[Violation] Forced reflow while executing JavaScript took 318ms</code>.</li>
+  <li><em>Paint flashing</em> activado muestra que casi no se repinta. <strong>No es un problema de paint ni de capas</strong> — por eso el <code>will-change</code> no hizo nada.</li>
+</ul>
+
+<p><strong>Paso 3 — Llegar a la causa raíz.</strong> El triángulo rojo apunta a una línea. Ahí está:</p>
+
+<pre><code class="lang-javascript">// El handler original: corre en CADA evento de scroll y lee geometría por fila
+lista.addEventListener('scroll', () =&gt; {
+  for (const fila of filas) {
+    const caja = fila.getBoundingClientRect();          // LEE  → fuerza layout
+    fila.classList.toggle('visible', caja.top &lt; 800);   // ESCRIBE → lo invalida
+    fila.style.setProperty('--y', caja.top + 'px');     // ESCRIBE otra vez
+  }
+});
+// 800 filas × 1 layout forzado cada una × ~40 eventos de scroll por segundo.</code></pre>
+
+<p>Es exactamente el patrón de FS1.4: leer-escribir dentro de un bucle, dentro de un handler de alta frecuencia. Y hay un segundo problema encima: el handler corre en <em>cada</em> evento de scroll, que puede dispararse muchas más veces por segundo que los frames que el navegador va a pintar.</p>
+
+<p><strong>Paso 4 — Corrección 1: batch de lecturas y escrituras, una vez por frame.</strong></p>
+
+<pre><code class="lang-javascript">let pendiente = false;
+
+lista.addEventListener('scroll', () =&gt; {
+  if (pendiente) return;          // un solo trabajo por frame, no uno por evento
+  pendiente = true;
+  requestAnimationFrame(() =&gt; {
+    pendiente = false;
+    const cajas = filas.map(f =&gt; f.getBoundingClientRect());  // TODAS las lecturas
+    filas.forEach((f, i) =&gt; {                                  // TODAS las escrituras
+      f.classList.toggle('visible', cajas[i].top &lt; 800);
+      f.style.setProperty('--y', cajas[i].top + 'px');
+    });
+  });
+}, { passive: true });</code></pre>
+
+<p>Medido de nuevo: reflow forzado de 318 ms a <strong>11 ms</strong>, frame p95 de 341 a <strong>38 ms</strong>. Ya es usable, pero todavía perdemos frames. El <code>{ passive: true }</code> es aparte y gratis: le promete al navegador que el handler no va a llamar a <code>preventDefault()</code>, así que puede empezar a scrollear sin esperarlo.</p>
+
+<p><strong>Paso 5 — Corrección 2: dejar de preguntar lo que el navegador ya sabe.</strong> La lectura de geometría existía solo para saber qué filas están visibles. Eso el navegador lo calcula igual, en el paso 5 del event loop, y lo puede avisar gratis:</p>
+
+<pre><code class="lang-javascript">const io = new IntersectionObserver(entradas =&gt; {
+  for (const e of entradas) e.target.classList.toggle('visible', e.isIntersecting);
+}, { root: lista, rootMargin: '200px' });   // 200px de margen: precargar antes de que entre
+
+filas.forEach(f =&gt; io.observe(f));
+// El handler de scroll desaparece por completo. 0 lecturas forzadas.</code></pre>
+
+<p>Reflow forzado: <strong>0 ms</strong>. Frame p95: <strong>6 ms</strong>. <em>Costo real:</em> la semántica cambió. "Visible" ya no es un booleano exacto al píxel calculado sincrónicamente, sino una notificación asincrónica con margen. Si alguna lógica dependía de la precisión exacta, hay que revisarla — y esa revisión es parte del trabajo, no un detalle.</p>
+
+<p><strong>Paso 6 — Corrección 3: que el navegador ni siquiera calcule lo que no se ve.</strong></p>
+
+<pre><code class="lang-css">.fila {
+  content-visibility: auto;            /* saltea layout y paint de lo que está fuera de vista */
+  contain-intrinsic-size: auto 72px;   /* alto estimado mientras no se calcula */
+
+  transform: translateY(8px);
+  opacity: 0;
+  transition: transform .18s, opacity .18s;
+}
+.fila.visible { transform: translateY(0); opacity: 1; }</code></pre>
+
+<p>Frame p95: <strong>4 ms</strong>, estable también a 120 Hz. <em>Costo real:</em> si <code>contain-intrinsic-size</code> queda mal estimado, la barra de scroll cambia de tamaño mientras el usuario baja. El valor tiene que salir de medir filas reales, no de inventarlo.</p>
+
+<table>
+<thead><tr><th>Paso</th><th>Reflow forzado / frame</th><th>Frame p95</th><th>FPS efectivos</th><th>Costo asumido</th></tr></thead>
+<tbody>
+<tr><td>Baseline</td><td>318 ms</td><td>341 ms</td><td>≈ 3</td><td>—</td></tr>
+<tr><td><code>will-change</code> en las filas <em>(el intento previo)</em></td><td>318 ms</td><td>344 ms</td><td>≈ 3</td><td><strong>+38 MB de VRAM a cambio de nada</strong></td></tr>
+<tr><td>1 · Batch read/write en rAF</td><td>11 ms</td><td>38 ms</td><td>≈ 26</td><td>Array intermedio; hasta 1 frame de retraso</td></tr>
+<tr><td>2 · <code>IntersectionObserver</code></td><td>0 ms</td><td>6 ms</td><td>60</td><td>"Visible" pasa a ser asincrónico y con margen</td></tr>
+<tr><td>3 · <code>content-visibility</code> + <code>transform</code></td><td>0 ms</td><td>4 ms</td><td>60 · 118 a 120 Hz</td><td>Scrollbar inestable si el tamaño intrínseco está mal</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 7 — Verificar en campo, no solo en el laboratorio.</strong> El trace dice que mejoró en <em>una</em> máquina. Dejamos un observer muestreado para confirmarlo con usuarios reales, y —esto es lo que separa el trabajo senior— una prueba que impida que la regresión vuelva a entrar sin que nadie se entere:</p>
+
+<pre><code class="lang-javascript">// Guardia de regresión: falla si alguien reintroduce lectura de geometría
+// dentro del bucle. Se corre con la lista renderizada y un scroll simulado.
+test('el scroll de la tabla no fuerza layout', async () =&gt; {
+  const forzado = await medirForcedReflowDurante(() =&gt; scrollear(lista, 2000));
+  expect(forzado).toBeLessThan(5);   // ms acumulados; el baseline eran 318
+});</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá IntersectionObserver".</strong> Es el orden: <strong>reproducir en condiciones realistas → leer el trace → identificar la etapa del pipeline → recién ahí elegir la herramienta</strong>. El equipo había empezado por la herramienta (<code>will-change</code>), y no solo no arregló nada: agregó 38 MB de memoria de GPU. Cuando optimizás sin medir, el mejor resultado posible es no empeorar.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué animar <code>transform</code> es barato y animar <code>left</code> es caro, si visualmente hacen lo mismo?</summary>
+<p>Porque tocan etapas distintas del pipeline. <code>left</code> cambia la geometría de la caja, así que el navegador tiene que rehacer <strong>Layout</strong> (¿dónde queda ahora?, ¿se corren las hermanas?, ¿el texto se reacomoda?), después <strong>Paint</strong> y después <strong>Composite</strong> — todo en el hilo principal, en cada frame. <code>transform</code>, sobre un elemento que ya tiene su capa, solo toca <strong>Composite</strong>: la textura ya está rasterizada en la GPU y aplicarle una traslación es una multiplicación de matriz. El resultado visual es idéntico; el trabajo es de otro orden de magnitud y lo hace otro procesador. Ojo con la conclusión: esto importa cuando el cambio ocurre 60 veces por segundo. Un <code>left</code> que cambia una sola vez al abrir un panel no es un problema.</p></details>
+
+<details><summary>Tenés un bucle que tarda 400 ms. Lo partís con <code>await new Promise(r =&gt; setTimeout(r, 0))</code> cada 10 items y ahora tarda 3 segundos. ¿Qué pasó, y qué habrías usado?</summary>
+<p>Dos cosas a la vez. Primero, <code>setTimeout(0)</code> te devuelve el control <strong>al final</strong> de la cola de tareas: cada vez que cedés, todo lo que llegó mientras tanto —mensajes, eventos de red, callbacks de otros componentes— se ejecuta antes que tu continuación. En una app cargada, eso multiplica el tiempo total. Segundo, estás cortando por <strong>cantidad de items</strong> en lugar de por <strong>tiempo transcurrido</strong>: si cada item cuesta poco, cortar cada 10 significa cientos de cortes, y cada corte tiene overhead propio. La corrección es <code>scheduler.yield()</code>, que vuelve al frente de la cola con la prioridad heredada, con fallback a <code>setTimeout</code> para Safari, y cortar cuando <code>performance.now()</code> dice que pasaste los ~40 ms desde el último corte.</p></details>
+
+<details><summary>El scroll de tu app tironea. ¿Cómo distinguís, con el Performance panel, si el problema es layout, paint o composite?</summary>
+<p>Por el color y por dos herramientas del panel <em>Rendering</em>. Si el flame chart está lleno de bloques <strong>violetas</strong> (<em>Recalculate Style</em>, <em>Layout</em>), especialmente con triángulos rojos, es <strong>layout forzado</strong>: buscá lecturas de geometría dentro de handlers o bucles. Si predominan los bloques <strong>verdes</strong> de <em>Paint</em> y al activar <em>Paint flashing</em> parpadea toda la pantalla al scrollear, es <strong>repaint</strong>: hay algo que se repinta cuando debería solo componerse. Si el hilo principal está prácticamente vacío y el tirón sigue, mirá el track del compositor y el panel <em>Layers</em>: probablemente tengas demasiadas capas, o capas gigantes que la GPU no llega a rasterizar a tiempo. Y si <em>ninguna</em> de las tres cosas aparece, el problema no está en el pipeline: está en la red o en tu JavaScript.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El navegador es multiproceso y <strong>site isolation</strong> te aísla de terceros, pero <strong>todo tu propio código comparte un hilo principal</strong>. El aislamiento no te salva de vos mismo.</li>
+  <li>El pipeline —parse, DOM/CSSOM, style, <strong>layout</strong>, <strong>paint</strong>, <strong>composite</strong>— solo corre hacia adelante. Optimizar es empujar el trabajo lo más tarde posible en la cinta.</li>
+  <li><code>transform</code> y <code>opacity</code> tocan solo composite (GPU, &lt; 1 ms); <code>width</code> y <code>top</code> tocan layout (hilo principal, decenas de ms). Importa a 60 fps, no en un cambio único.</li>
+  <li><strong>Layout thrashing</strong> (leer-escribir-leer) es la causa raíz más frecuente de los tirones. Se detecta en la consola, con el insight <em>Forced reflow</em> del panel, y en producción con <code>forcedStyleAndLayoutDuration</code> de LoAF.</li>
+  <li><code>will-change</code> de más cuesta <strong>memoria de GPU real</strong>: ancho × alto × 4 bytes por capa, × 4 en pantallas retina. Se promete durante la animación y se saca al terminar.</li>
+  <li>El event loop real incluye un <strong>paso de render</strong>: task → microtasks (completas) → rAF → style/layout/paint/composite → idle. El presupuesto es 16,6 ms a 60 Hz y <strong>8,3 ms a 120 Hz</strong>.</li>
+  <li>Una <strong>long task</strong> es ≥ 50 ms. Se parte cediendo por <em>tiempo transcurrido</em>: <code>scheduler.yield()</code> (Chromium y Firefox; <strong>no Safari</strong>, no es Baseline) con fallback a <code>setTimeout(0)</code>. Ceder de más también es un bug.</li>
+  <li>Un script sin <code>defer</code> bloquea el parser; el <strong>preload scanner</strong> salva la situación y se rompe apenas las URLs las inventa el JavaScript. El CSS bloquea el render salvo que su <code>media</code> no aplique.</li>
+  <li>Los <strong>Workers</strong> no tocan el DOM y su <code>postMessage</code> copia: conviene cuando el cómputo dura más de ~100 ms y el resultado es mucho más chico que la entrada. Mejor todavía: que el Worker haga el <code>fetch</code>.</li>
+  <li>Medí con throttling de CPU, perfil limpio, cinco corridas y mediana. Y antes de tocar el pipeline, descartá <strong>red (FS3)</strong> y <strong>JavaScript (FS2)</strong>: casi siempre el problema está ahí.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Armá una página con 500 <code>&lt;div&gt;</code> y escribí dos versiones del mismo cambio de ancho: una con thrashing y otra con lecturas y escrituras separadas. Cronometrá ambas con <code>performance.measure</code>, con y sin <em>CPU throttling</em> 4×. Reportá los cuatro números y explicá por qué el throttling no multiplica los dos casos por igual.</li>
+  <li>Tomá una animación existente que use <code>left</code> o <code>margin-left</code> y reescribila con <code>transform</code>. Grabá un trace de cada versión y compará: cantidad de bloques de <em>Layout</em>, tiempo total en el hilo principal, y frames perdidos.</li>
+  <li>Poné <code>will-change: transform</code> en 200 elementos y abrí <em>More tools → Layers</em>. Anotá cuántas capas se crearon y cuánta memoria reportan en total. Después sacá el <code>will-change</code> y repetí la medición. Calculá el costo en MB de esa sola línea de CSS.</li>
+  <li>Ejecutá el ejemplo de orden del event loop de FS1.6 diez veces seguidas y anotá si <code>D</code> sale siempre antes que <code>E</code>. Explicá con el modelo del ciclo por qué ese orden no está garantizado.</li>
+  <li>Escribí un procesamiento de 100.000 items en tres versiones: sin cortes, cortando cada 100 items, y cortando por tiempo con <code>scheduler.yield()</code> más fallback. Medí el <strong>tiempo total</strong> y la <strong>tarea más larga</strong> de cada una. Armá la tabla y decidí cuál elegirías, justificándolo.</li>
+  <li>Instrumentá cualquier página tuya con el observer de LoAF de FS1.10. Interactuá dos minutos y quedate con el frame más largo: ¿qué script lo causó?, ¿cuánto de ese tiempo fue reflow forzado? Si tu navegador no lo soporta, escribí la rama de fallback con <code>longtask</code>.</li>
+  <li>Tomá una función de tu proyecto que tarde más de 100 ms y movela a un Web Worker. Medí tres cosas: el tiempo de cómputo, el tiempo de <code>postMessage</code> de ida y el de vuelta. Concluí, con esos números, si la migración valió la pena — y si la respuesta es que no, dejalo documentado.</li>
+</ol>
+
+<section class="quiz" id="quizFS1">
+  <style>
+    #quizFS1{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizFS1 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizFS1 .q{margin-bottom:1.5rem}
+    #quizFS1 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizFS1 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizFS1 .opt:hover{border-color:var(--accent)}
+    #quizFS1 .opt:disabled{cursor:default}
+    #quizFS1 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizFS1 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizFS1 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizFS1 .exp.show{display:block}
+    #quizFS1 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un handler de <code>scroll</code> recorre 400 filas y, en cada una, llama a <code>getBoundingClientRect()</code> y después le escribe una clase. La consola avisa "Forced reflow took 280ms". ¿Cuál es la corrección de fondo?</p>
+    <button class="opt">Agregar <code>will-change: transform</code> a las filas para que la GPU se encargue</button>
+    <button class="opt">Envolver el handler en <code>setTimeout(fn, 0)</code> para sacarlo del hilo principal</button>
+    <button class="opt">Separar todas las lecturas de todas las escrituras, y mejor todavía: reemplazar la lectura de geometría por un <code>IntersectionObserver</code></button>
+    <div class="exp">Es layout thrashing puro: cada lectura de geometría obliga al navegador a calcular el layout en el acto, y la escritura siguiente lo invalida. <code>will-change</code> no toca layout —solo crea capas de compositor, y encima consume VRAM—; <code>setTimeout</code> no saca nada del hilo principal, solo lo retrasa. La corrección es agrupar lecturas y escrituras en dos fases y, cuando lo único que necesitás saber es qué está visible, dejar de preguntar: eso el navegador ya lo calcula y te lo notifica gratis con <code>IntersectionObserver</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Partís un procesamiento de 400 ms con <code>await new Promise(r =&gt; setTimeout(r, 0))</code> cada 10 items, y el tiempo total sube a 3 segundos. ¿Por qué?</p>
+    <button class="opt">Porque <code>setTimeout(0)</code> te devuelve el control al final de la cola: todo lo que llegó mientras tanto se ejecuta antes que tu continuación</button>
+    <button class="opt">Porque <code>setTimeout</code> tiene un mínimo obligatorio de 4 ms que se suma en cada corte y explica los 3 segundos</button>
+    <button class="opt">Porque partir una tarea siempre la hace más lenta y no hay forma de evitarlo</button>
+    <div class="exp">El problema es la posición en la cola: cedés y volvés <strong>último</strong>, así que cualquier mensaje, evento o callback que llegó entre medio se te adelanta. Por eso existe <code>scheduler.yield()</code>, que cede y vuelve al frente con la prioridad heredada (Chromium y Firefox; en Safari necesitás el fallback). El clamp de 4 ms es real pero solo aparece a partir del quinto <code>setTimeout</code> anidado y no alcanza para explicar la diferencia. Y partir de más también penaliza: por eso se corta por tiempo transcurrido, no por cantidad de items.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tu página tarda 3,1 s en mostrar contenido. El waterfall muestra 1,9 s esperando la respuesta del servidor y 700 KB de JavaScript bajando después. ¿Qué esperás ganar optimizando el pipeline de render?</p>
+    <button class="opt">Bastante: menos capas y menos reflow acortan siempre el tiempo hasta el primer pintado</button>
+    <button class="opt">Prácticamente nada: el tiempo se va en la red, y eso se ataca en FS3, no acá</button>
+    <button class="opt">Todo, porque el pipeline es lo último que corre y por lo tanto lo que determina el resultado final</button>
+    <div class="exp">Es el caso de manual de optimizar donde no está el tiempo. Con 1,9 s de espera de red y 700 KB de JavaScript por descargar y ejecutar, el pipeline de render podría ser instantáneo y el usuario seguiría esperando casi tres segundos. El orden de investigación correcto es red → JavaScript → pipeline, que además es el orden de probabilidad decreciente y de costo creciente de la corrección. Este módulo se aplica cuando el trace ya mostró que el tiempo está en style, layout o paint.</div>
+  </div>
+
+  <div class="score" id="scoreFS1"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizFS1');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreFS1').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con FS2.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../index.html">← Frontend Senior</a>
+  <a href="../fs2-motor-javascript/lecture.html">FS2: El motor de JavaScript →</a>
+</nav>
+
+</div>
+</body>
+</html>

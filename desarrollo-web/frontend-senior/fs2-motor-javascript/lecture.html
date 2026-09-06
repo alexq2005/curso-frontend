@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FS2 — El motor de JavaScript: V8 por dentro y el costo real del código · Frontend Senior</title>
+  <meta name="description" content="Los cuatro tiers de V8 (Ignition, Sparkplug, Maglev, TurboFan), lazy parsing, hidden classes e inline caches, deoptimización, GC generacional y fugas reales, estructuras de datos, por qué los microbenchmarks mienten, el costo de await y cuándo Wasm gana o pierde.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Frontend Senior</a>
+  <a href="../../modulo-00-sillabus/lecture.html">🌐 Curso de Frontend</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">FS2</span>
+  <span class="badge">⏱ 50–115 min</span>
+  <span class="badge">🎯 Pre-req: Curso Frontend M05, M07 · FS1</span>
+  <span class="badge">⚙️ Motor &amp; performance</span>
+</div>
+
+<article>
+
+<h1>FS2 — El motor de JavaScript: V8 por dentro y el costo real del código</h1>
+
+<h2>FS2.0 Por qué este módulo</h2>
+
+<p>En el M05 y el M07 aprendiste JavaScript: sintaxis, closures, prototipos, ES6+, módulos. En el M11 le pusiste tipos con TypeScript. En todo eso, el intérprete fue una caja negra que "ejecuta lo que escribís". Este módulo abre la caja.</p>
+
+<p>No para que escribas JavaScript raro. Para que puedas responder, con evidencia, las preguntas que aparecen cuando una app crece: por qué la misma función tarda 4 ms la primera vez y 0,3 ms la décima; por qué agregar un campo opcional a un objeto degradó un loop un 40 %; por qué la pestaña come 900 MB después de veinte minutos; por qué el microbenchmark decía que la versión nueva era 8× más rápida y en producción no cambió nada.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> JavaScript es rápido <em>cuando el motor puede predecir</em>. V8 apuesta constantemente: "esta función siempre recibe objetos con la misma forma", "esta propiedad siempre está en el mismo offset", "esta suma siempre es entre enteros". Cuando acertás, ejecutás código máquina especializado que compite con C. Cuando le rompés la predicción, el motor tira el trabajo y vuelve a empezar. <strong>Casi todo el mal rendimiento de JavaScript no viene de "hacer demasiadas cosas": viene de hacerlas de formas que impiden predecir.</strong>
+</div>
+
+<p>La contracara, que este módulo repite hasta el cansancio: <strong>el motor casi nunca es tu cuello de botella</strong>. En una app real, el tiempo se va en la red (FS3), en el render (FS4) o en un algoritmo cuadrático que escribiste sin darte cuenta. Saber internals sirve para <em>reconocer el 5 % de los casos</em> en que la culpa sí es del motor, y para no perder dos días optimizando el otro 95 %.</p>
+
+<div class="analogy">
+  <strong>🎭 Analogía.</strong> V8 es un mozo con memoria fotográfica. Si sos habitué y siempre pedís lo mismo, te trae el pedido antes de que abras la boca: eso es una <em>inline cache</em>. Si un día cambiás el pedido, se adapta y recuerda dos variantes. Si cambiás cada vez, deja de intentar adivinar y vuelve a preguntarte todo desde cero, cada vez. El mozo no se volvió lento: vos volviste tu comportamiento impredecible.
+</div>
+
+<h2>FS2.1 El pipeline de V8: cuatro tiers, no dos</h2>
+
+<p>La descripción clásica —"V8 interpreta con Ignition y optimiza con TurboFan"— está desactualizada desde 2023. Hoy V8 tiene <strong>cuatro niveles de ejecución</strong>, y la mayor parte del código de una app nunca llega al último.</p>
+
+<pre><code class="lang-javascript">// El camino de UNA función a través del motor
+//
+//   fuente JS
+//      │  parse (o pre-parse: FS2.2)
+//      ▼
+//     AST
+//      │  compilación a bytecode
+//      ▼
+//   IGNITION      intérprete · arranque instantáneo · junta feedback
+//      │  ~pocas invocaciones
+//      ▼
+//   SPARKPLUG     JIT baseline · compila casi sin pensar · sin optimizar
+//      │  ~500 invocaciones con feedback estable
+//      ▼
+//   MAGLEV        JIT optimizador rápido · código "suficientemente bueno"
+//      │  el código sigue caliente
+//      ▼
+//   TURBOFAN      JIT optimizador pesado · código máquina especializado
+//      │
+//      └─ si una suposición falla → DEOPT → volvés a Ignition</code></pre>
+
+<table>
+<thead><tr><th>Tier</th><th>Qué hace</th><th>Costo de compilar</th><th>Calidad del código</th></tr></thead>
+<tbody>
+<tr><td><strong>Ignition</strong></td><td>Interpreta bytecode y recolecta <em>feedback</em> de tipos</td><td>Nulo (no compila a máquina)</td><td>Base de comparación (1×)</td></tr>
+<tr><td><strong>Sparkplug</strong></td><td>Traduce bytecode a máquina casi 1:1, sin análisis</td><td>Muy bajo, lineal en el tamaño</td><td>~5–15 % mejor que interpretar</td></tr>
+<tr><td><strong>Maglev</strong></td><td>Optimiza con el feedback, en un solo pase (SSA)</td><td>~10× más barato que TurboFan</td><td>Muy cerca de TurboFan en código típico</td></tr>
+<tr><td><strong>TurboFan</strong></td><td>Optimización agresiva: inlining, escape analysis, unboxing</td><td>El más caro; corre en un hilo aparte</td><td>La mejor; código especializado por tipo</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Contexto histórico rápido.</strong> Sparkplug llegó en Chrome 91 (2021) para tapar el hueco entre "interpretar" y "optimizar de verdad". Maglev se activó por defecto en Chrome 117 (2023). Y desde 2024–2025 el <em>backend</em> de TurboFan (selección de instrucciones, asignación de registros, generación de código) migró a una infraestructura nueva llamada <strong>Turboshaft</strong>, que redujo a la mitad el tiempo de compilación con igual o mejor calidad de código. Turboshaft no es un tier: es la cañería interna del último tier.
+</div>
+
+<h3>Qué significa realmente "warm up"</h3>
+
+<p>Una función recién cargada corre interpretada. A medida que se la llama, V8 acumula <em>feedback vectors</em>: qué tipos recibió, qué formas tenían los objetos, qué ramas se tomaron. Recién cuando ese feedback se estabiliza, el motor invierte en compilarla. Ese es el "calentamiento", y tiene consecuencias que se ven todos los días:</p>
+
+<div class="step"><strong>1. La primera ejecución nunca es representativa.</strong> Medir una función una sola vez mide el intérprete, no tu código. Es el error número uno de los microbenchmarks (FS2.7).</div>
+
+<div class="step"><strong>2. El código que corre una vez nunca se optimiza — y está bien.</strong> El handler de un click que se dispara tres veces por sesión vive y muere en Ignition. Optimizarlo sería tirar CPU a la basura. Por eso el <em>tiering</em> es guiado por perfil: subir de tier cuesta.</div>
+
+<div class="step"><strong>3. Tiering guiado por perfil (2024+).</strong> V8 ya no promueve solo por contador de invocaciones: también mira si el feedback es <em>estable</em>. Una función llamada 5.000 veces con formas siempre cambiantes puede quedarse en Sparkplug, porque optimizarla produciría código que se deoptimiza al instante.</div>
+
+<div class="warn">
+  <strong>El costo que nadie cuenta: la compilación también consume CPU.</strong> En un dispositivo de gama media, el trabajo de compilar y recompilar durante el arranque compite con el render del primer frame. Por eso "más optimización" no es gratis, y por eso las estrategias de arranque (FS4, FS7) valen más que cualquier micro-optimización de una función.
+</div>
+
+<h3>Verlo con tus propios ojos</h3>
+
+<p>Node expone las flags de V8 directamente. No hace falta compilar nada:</p>
+
+<pre><code class="lang-bash"># Qué se optimiza y qué se deoptimiza, con motivo
+node --trace-opt --trace-deopt app.js
+
+# Solo las deopts, que es lo que suele importar
+node --trace-deopt app.js 2&gt;&amp;1 | grep -i "deoptimizing"
+
+# Ver el estado exacto de una función (requiere abrir las "natives")
+node --allow-natives-syntax script.js
+
+# Con Deopt Explorer (extensión de VS Code) se lee el log en una UI
+node --prof --log-deopt --log-ic --log-maps app.js</code></pre>
+
+<pre><code class="lang-javascript">// script.js — correr con: node --allow-natives-syntax script.js
+function sumar(a, b) { return a + b; }
+
+console.log(%GetOptimizationStatus(sumar));   // recién nacida: interpretada
+
+for (let i = 0; i &lt; 100000; i++) sumar(i, i + 1);
+%OptimizeFunctionOnNextCall(sumar);
+sumar(1, 2);
+console.log(%GetOptimizationStatus(sumar));   // ahora: optimizada
+
+sumar("a", "b");                              // ← cambio de tipo
+console.log(%GetOptimizationStatus(sumar));   // volvió atrás: deoptimizada</code></pre>
+
+<div class="tip">
+  <code>%GetOptimizationStatus</code> devuelve un bitfield, no un texto legible. En la práctica se usa la librería <code>v8-natives</code> o se lee el log de <code>--trace-deopt</code>, que dice en castellano de máquina qué suposición falló y en qué línea. Eso último es lo que convierte una discusión de opiniones en un hecho.
+</div>
+
+<h2>FS2.2 Lazy parsing: el bundle cuesta antes de ejecutar nada</h2>
+
+<p>Antes de que se ejecute una sola línea, el navegador tiene que <em>leer</em> tu JavaScript. Y parsear no es gratis: en dispositivos móviles de gama media, el análisis y la compilación inicial suelen ser el mayor costo de arranque, por encima de la ejecución.</p>
+
+<div class="rule">
+  <strong>📌 Un byte de JavaScript es mucho más caro que un byte de imagen.</strong> Una imagen se decodifica en un hilo aparte y no bloquea nada. Un byte de JS hay que descargarlo, descomprimirlo, parsearlo, compilarlo y ejecutarlo — y las tres últimas etapas pelean por el hilo principal, el mismo que dibuja la pantalla.
+</div>
+
+<h3>El pre-parser: el truco que hace tolerable un bundle grande</h3>
+
+<p>V8 no parsea todo tu archivo en profundidad. Usa dos parsers: el completo, que construye AST y emite bytecode, y el <strong>pre-parser</strong>, una versión mínima que solo verifica que la sintaxis sea válida y anota lo indispensable (dónde empieza y termina la función, qué variables externas captura). Cuando esa función se llama por primera vez, recién ahí se parsea de verdad.</p>
+
+<pre><code class="lang-javascript">// Este archivo tiene 500 KB. V8 NO parsea las 400 funciones a fondo:
+// pre-parsea, marca los límites, y sigue.
+
+function nuncaSeLlama() {          // pre-parseada: costo mínimo
+  /* 200 líneas */
+}
+
+export function usada(x) {         // pre-parseada al cargar,
+  return x * 2;                    // parseada de verdad al primer llamado
+}
+
+usada(21);                         // ← acá se paga el parse completo</code></pre>
+
+<div class="mistake">
+  <strong>El clásico que rompe el lazy parsing: las IIFE y el código de nivel superior.</strong> Todo lo que está en el <em>top level</em> del módulo se parsea y ejecuta sí o sí. Un <code>const TABLA = [ ...5000 entradas ]</code> o un framework que se inicializa al importarse se pagan completos, aunque la pantalla que los necesita no se muestre nunca. La solución no es micro-optimizar el parser: es <strong>no cargar ese código</strong> (import dinámico, code splitting — FS7).
+</div>
+
+<h3>Los números que sirven para decidir</h3>
+
+<table>
+<thead><tr><th>Etapa</th><th>Dónde corre</th><th>Se puede evitar</th><th>Herramienta</th></tr></thead>
+<tbody>
+<tr><td>Descarga</td><td>Red</td><td>Sí: comprimir, cachear, dividir</td><td>Panel Network, FS3</td></tr>
+<tr><td>Parse / compile</td><td>Hilo principal</td><td>Sí: enviar menos JS</td><td>Performance → "Compile Script"</td></tr>
+<tr><td>Ejecución del top level</td><td>Hilo principal</td><td>A veces: diferir e importar bajo demanda</td><td>Performance → "Evaluate Script"</td></tr>
+<tr><td>Ejecución bajo demanda</td><td>Hilo principal</td><td>Es tu app: acá sí se optimiza código</td><td>Perfil de CPU</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Code cache: la segunda visita es otra historia.</strong> Chrome guarda el bytecode compilado junto al script en el caché de disco. En la segunda carga, V8 deserializa metadata en lugar de compilar. Esto tiene una consecuencia práctica poco conocida: <strong>si cambiás el hash del archivo en cada deploy, tirás a la basura el code cache de todos tus usuarios</strong>. Es un argumento real a favor de separar el vendor bundle (estable) del código de aplicación (volátil).
+</div>
+
+<div class="warn">
+  <strong>El costo de la estrategia.</strong> Dividir en muchos chunks chicos reduce el parse inicial pero multiplica los round-trips y complica el cacheo. La guía histórica de V8 —evitar el bundle único y partirlo cuando pasa unos 50–100 KB— es un punto de partida, no una ley. Con HTTP/2 y HTTP/3 (FS3) el costo por request bajó mucho, pero no es cero. <strong>Se mide con el panel Coverage: cuánto del JS cargado se ejecutó realmente en el primer minuto.</strong>
+</div>
+
+<h2>FS2.3 Hidden classes e inline caches: por qué el orden importa</h2>
+
+<p>Esta es la sección que más cambia cómo escribís código, así que vale la pena entenderla bien.</p>
+
+<p>En JavaScript los objetos son diccionarios: podés agregar y quitar propiedades cuando quieras. Si V8 los implementara literalmente como hash maps, cada <code>obj.nombre</code> sería una búsqueda con hash. Sería correcto y lentísimo. Lo que hace V8 en cambio es asumir que <strong>los objetos vienen en formas repetidas</strong>, y le asigna a cada forma una estructura interna: la <em>hidden class</em>, o <strong>shape</strong> (también <em>map</em> en la jerga de V8).</p>
+
+<pre><code class="lang-javascript">const a = { x: 1, y: 2 };   // shape S1: {x en offset 0, y en offset 1}
+const b = { x: 5, y: 9 };   // MISMA shape S1 → el motor los trata igual
+
+// Agregar una propiedad crea una shape nueva y la encadena
+const c = { x: 1 };         // shape S0  {x}
+c.y = 2;                    // transiciona a S1 {x,y}
+
+// Pero el ORDEN de creación define la cadena de transiciones:
+const d = { y: 2 };         // shape T0  {y}
+d.x = 1;                    // transiciona a T1 {y,x}  ← ¡NO es S1!</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>{x, y}</code> y <code>{y, x}</code> tienen los mismos datos y shapes distintas.</strong> Para vos son el mismo objeto. Para el motor son dos tipos diferentes, y cualquier función que reciba ambos deja de ser monomórfica.
+</div>
+
+<h3>Inline caches: monomórfico, polimórfico, megamórfico</h3>
+
+<p>Cada lugar del código donde accedés a una propiedad (un <em>call site</em>) tiene una cachecita adosada. La primera vez que se ejecuta, V8 anota "cuando el objeto tiene la shape S1, la propiedad <code>x</code> está en el offset 0". Las siguientes veces compara la shape y salta directo al offset: dos instrucciones de máquina.</p>
+
+<table>
+<thead><tr><th>Estado del IC</th><th>Cuántas shapes vio</th><th>Qué hace el motor</th><th>Costo relativo</th></tr></thead>
+<tbody>
+<tr><td><strong>Monomórfico</strong></td><td>1</td><td>Compara shape y lee el offset directo</td><td>1× — el caso ideal</td></tr>
+<tr><td><strong>Polimórfico</strong></td><td>2 a 4</td><td>Compara contra una lista corta de shapes</td><td>~2–5× según el caso</td></tr>
+<tr><td><strong>Megamórfico</strong></td><td>5 o más</td><td>Abandona: consulta un caché global con hash</td><td>~10–20×, y bloquea el inlining</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El umbral es 4.</strong> V8 admite hasta cuatro shapes por call site. La quinta lo vuelve megamórfico, y ahí no solo se pierde el acceso rápido: <strong>TurboFan deja de poder inlinear esa función</strong>, y con el inlining se pierde en cascada todo lo que dependía de él (escape analysis, unboxing de números, eliminación de chequeos). Un solo call site megamórfico en un loop caliente puede costar más que todo lo demás junto.
+</div>
+
+<h3>El ejemplo medible</h3>
+
+<pre><code class="lang-javascript">// benchmark de shapes — correr en Node o en la consola del navegador
+function crear(n, variantes) {
+  const out = [];
+  for (let i = 0; i &lt; n; i++) {
+    const o = { id: i, valor: i * 2 };
+    // agregamos un campo distinto según la variante → shapes distintas
+    if (variantes &gt; 1) o["extra" + (i % variantes)] = 1;
+    out.push(o);
+  }
+  return out;
+}
+
+function sumar(items) {          // ← el call site de items[i].valor
+  let t = 0;
+  for (let i = 0; i &lt; items.length; i++) t += items[i].valor;
+  return t;
+}
+
+function medir(variantes) {
+  const datos = crear(200000, variantes);
+  for (let i = 0; i &lt; 20; i++) sumar(datos);        // warm-up (FS2.7)
+  const t0 = performance.now();
+  let acc = 0;
+  for (let i = 0; i &lt; 50; i++) acc += sumar(datos);
+  const ms = performance.now() - t0;
+  return { variantes, ms: +ms.toFixed(1), acc };    // acc se consume: sin DCE
+}
+
+for (const v of [1, 2, 4, 8, 16]) console.log(medir(v));</code></pre>
+
+<div class="info">
+  <strong>Qué vas a ver.</strong> Los números exactos dependen de tu máquina y de la versión de V8, pero la <em>forma</em> del resultado es siempre la misma: 1 y 2 variantes van parejas; 4 empieza a despegarse; de 5 en adelante hay un escalón claro y después se aplana, porque una vez megamórfico da lo mismo tener 8 shapes que 80. <strong>Ese escalón es el hallazgo: no es un continuo, es un acantilado.</strong>
+</div>
+
+<h3>Cómo se escribe código con shapes estables</h3>
+
+<div class="step"><strong>1. Inicializá todos los campos en el constructor, siempre en el mismo orden</strong>, aunque el valor sea <code>null</code> o <code>undefined</code>. Un campo que a veces existe y a veces no es la fuente número uno de polimorfismo accidental.</div>
+
+<div class="step"><strong>2. No uses <code>delete</code>.</strong> Borrar una propiedad puede empujar al objeto a "modo diccionario" (propiedades lentas), del que no vuelve. Poné <code>obj.campo = null</code>, o usá un <code>Map</code> si de verdad necesitás quitar claves.</div>
+
+<div class="step"><strong>3. Preferí clases o factories con forma fija</strong> a construir objetos literales campo por campo en distintas ramas de un <code>if</code>. Es la misma disciplina que ya te impone TypeScript en el M11 — pero acá el motivo no es la seguridad de tipos, es el rendimiento.</div>
+
+<div class="step"><strong>4. Cuidado con las funciones "genéricas" del núcleo.</strong> Un <code>function get(obj, key) { return obj[key]; }</code> compartido por toda la app ve cientos de shapes: es megamórfico por diseño. Duplicar ese helper en dos módulos suena a mala práctica, y sin embargo, en un camino caliente, dos call sites monomórficos ganan por lejos a uno megamórfico.</div>
+
+<pre><code class="lang-javascript">// ❌ Shapes inestables: el campo opcional bifurca el tipo
+function crearUsuario(datos) {
+  const u = { id: datos.id, nombre: datos.nombre };
+  if (datos.avatar) u.avatar = datos.avatar;      // ← dos shapes distintas
+  if (datos.equipo) u.equipo = datos.equipo;      // ← cuatro combinaciones
+  return u;
+}
+
+// ✅ Shape única: los campos siempre están, aunque valgan null
+function crearUsuario(datos) {
+  return {
+    id: datos.id,
+    nombre: datos.nombre,
+    avatar: datos.avatar ?? null,
+    equipo: datos.equipo ?? null,
+  };
+}</code></pre>
+
+<div class="warn">
+  <strong>El costo de esta regla.</strong> Objetos con campos siempre presentes ocupan un poco más de memoria y ensucian el JSON si los serializás tal cual. Y más importante: <strong>esto solo importa en código caliente</strong>. Aplicar la disciplina de shapes a un formulario que se llena una vez es ruido que hace el código peor sin ganar nada. El criterio es simple: si la función corre miles de veces por segundo o sobre miles de elementos, importa; si no, escribí lo que se lea mejor.
+</div>
+
+<h3>Elements kinds: los arrays también tienen shape</h3>
+
+<p>Menos conocido, e igual de importante: V8 clasifica los arrays según lo que contienen, y las transiciones son <strong>de una sola dirección</strong>.</p>
+
+<pre><code class="lang-javascript">const a = [1, 2, 3];        // PACKED_SMI_ELEMENTS   — enteros chicos, el más rápido
+a.push(4.5);                // → PACKED_DOUBLE_ELEMENTS — doubles sin "cajita"
+a.push("hola");             // → PACKED_ELEMENTS       — punteros genéricos
+a[10] = 1;                  // → HOLEY_ELEMENTS        — con agujeros: el más lento
+
+// Una vez que un array es HOLEY, NUNCA vuelve a PACKED.
+const b = new Array(1000);  // ← nace HOLEY: 1000 agujeros
+const c = [];               // ← nace PACKED y crece bien</code></pre>
+
+<div class="mistake">
+  <strong>El malentendido caro:</strong> "prealoco con <code>new Array(n)</code> para evitar los realocs". En V8 eso te da un array con agujeros, y todo acceso a un array holey paga un chequeo extra por elemento y una consulta al prototipo cuando encuentra un hueco. Si de verdad necesitás preasignar, usá <code>new Array(n).fill(0)</code> (que lo empaqueta) o directamente un <code>TypedArray</code>. Y en la enorme mayoría de los casos, un <code>[]</code> con <code>push</code> es lo correcto.
+</div>
+
+<h2>FS2.4 Deoptimización: cuando el motor tira el trabajo</h2>
+
+<p>TurboFan genera código que solo es válido bajo suposiciones. "Este argumento es siempre un entero de 32 bits." "Este objeto siempre tiene la shape S1." "Este array nunca tiene agujeros." Cada suposición viene con un chequeo barato al principio del código optimizado. Si el chequeo falla, se dispara una <strong>deoptimización</strong>: V8 descarta el código máquina, reconstruye el estado del intérprete a mitad de camino y sigue ejecutando en Ignition.</p>
+
+<div class="analogy">
+  <strong>🎭 Analogía.</strong> Es un cocinero que prepara mise en place para el menú del día. Si entra un pedido fuera del menú, tiene que guardar todo, cocinar a mano ese plato, y recién después decidir si vale la pena rearmar el mise en place. Una vez está bien. Si pasa en cada pedido, hubiera sido mejor no preparar nada.
+</div>
+
+<h3>Qué dispara una deopt</h3>
+
+<table>
+<thead><tr><th>Disparador</th><th>Por qué</th><th>¿Sigue vigente en 2026?</th></tr></thead>
+<tbody>
+<tr><td>Cambiar el tipo de un argumento</td><td>El código asumía <code>number</code> y llegó un <code>string</code></td><td><strong>Sí</strong>, es la causa #1</td></tr>
+<tr><td>Una shape nueva en un call site optimizado</td><td>Falla el chequeo de map</td><td><strong>Sí</strong></td></tr>
+<tr><td>Overflow de entero (Smi → double)</td><td>El resultado ya no entra en un Smi</td><td><strong>Sí</strong>, pero se reoptimiza rápido</td></tr>
+<tr><td>Leer más allá del final de un array</td><td><code>a[i]</code> fuera de rango devuelve <code>undefined</code> y consulta el prototipo</td><td><strong>Sí</strong></td></tr>
+<tr><td>Usar <code>arguments</code> de formas no estándar</td><td>Rompe el escape analysis del objeto arguments</td><td>Sí, pero es raro hoy: usá <em>rest params</em></td></tr>
+<tr><td><code>try/catch</code> en una función caliente</td><td>Los optimizadores viejos no sabían compilarlo</td><td><strong>No — es un mito heredado</strong></td></tr>
+<tr><td><code>eval</code> / <code>with</code></td><td>Vuelven el scope indecidible en tiempo de compilación</td><td>Sí, y además son un problema de seguridad</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Corrección de un mito que todavía circula.</strong> "No uses <code>try/catch</code> en código caliente porque impide la optimización" fue <strong>cierto en la era de Crankshaft</strong> (hasta 2017 aproximadamente). TurboFan compila <code>try/catch</code> y <code>try/finally</code> sin problemas desde entonces. Si leés ese consejo en un blog, mirá la fecha. La forma correcta de decidirlo hoy no es citar una regla de 2015: es correr <code>--trace-deopt</code> y ver qué dice el motor <em>tuyo</em>, en <em>tu</em> versión.
+</div>
+
+<h3>Leer una deopt de verdad</h3>
+
+<pre><code class="lang-bash">node --trace-deopt --trace-opt tu-script.js 2&gt;&amp;1 | grep -E "deoptimizing|optimizing"</code></pre>
+
+<pre><code class="lang-javascript">// Salida típica, simplificada:
+//
+// [marking 0x... &lt;JSFunction procesar&gt; for optimization, reason: hot and stable]
+// [compiling method 0x... &lt;JSFunction procesar&gt; using TurboFan]
+// [deoptimizing (DEOPT eager): begin 0x... procesar (opt id 3) @2, FP to SP delta: 96,
+//    caller sp: 0x...]
+//   ;;; deoptimize at &lt;script.js:14:18&gt;, reason: wrong map
+//
+// Traducción:
+//   "wrong map"        → llegó un objeto con otra shape (FS2.3)
+//   "not a Smi"        → esperaba entero chico, llegó double u objeto
+//   "wrong call target"→ la función llamada cambió de identidad
+//   "insufficient type feedback" → el call site nunca vio suficientes tipos</code></pre>
+
+<div class="rule">
+  <strong>📌 Una deopt aislada no es un problema; un ciclo de deopts sí.</strong> Lo que hay que buscar en el log es la misma función deoptimizándose una y otra vez: eso significa que V8 la reoptimiza, ella se cae, la reoptimiza… y estás pagando la compilación repetidamente además de correr sin optimizar. V8 tiene un límite: después de varias deopts en el mismo punto marca el código como <em>deopt loop</em> y deja de intentar optimizarlo. Cuando eso pasa, esa función se quedó lenta para siempre en esa sesión.
+</div>
+
+<h2>FS2.5 Memoria y GC: la pausa que se ve en pantalla</h2>
+
+<p>V8 nunca te devuelve memoria cuando vos querés: la devuelve cuando el recolector decide. Entender cuándo decide es lo que separa "la app se pone lenta después de un rato" de un diagnóstico.</p>
+
+<h3>Generacional: la mayoría de los objetos mueren jóvenes</h3>
+
+<p>El heap se parte en dos. La <strong>generación joven</strong> es chica (del orden de decenas de MB) y se recolecta seguido con el <strong>Scavenger</strong>, un algoritmo de copia con dos semi-espacios: recorre solo los objetos vivos, los copia al otro semi-espacio y descarta el resto de un saque. Como la mayoría de los objetos mueren jóvenes, casi nunca hay mucho que copiar, y las pausas son de <strong>menos de un milisegundo a unos pocos</strong>.</p>
+
+<p>El objeto que sobrevive dos scavenges se <em>promueve</em> a la <strong>generación vieja</strong>, que se recolecta con <strong>Mark-Sweep-Compact</strong>: mucho más caro, porque tiene que recorrer todo el grafo de objetos alcanzables. V8 hace la mayor parte del marcado <em>concurrentemente</em>, en hilos aparte mientras tu JavaScript sigue corriendo, y el barrido también. Lo que queda como pausa real ("stop-the-world") son pasos incrementales cortos y una pausa final de unos pocos milisegundos en un heap sano.</p>
+
+<div class="rule">
+  <strong>📌 Por qué las pausas importan tanto en el frontend.</strong> A 60 fps tenés <strong>16,7 ms por frame</strong> para hacer todo: ejecutar JS, calcular estilos, layout, paint, composite (FS4). Un scavenge de 1 ms se pierde en el ruido. Un major GC de 40 ms se come dos frames y medio y el usuario lo <em>ve</em> como un tirón. En un servidor Node, esos mismos 40 ms son latencia p99 pura.
+</div>
+
+<pre><code class="lang-javascript">// Ver la presión de GC en tiempo real, sin herramientas
+// (memory.usedJSHeapSize requiere Chrome; es aproximado y está redondeado)
+let anterior = performance.memory?.usedJSHeapSize ?? 0;
+setInterval(() =&gt; {
+  const actual = performance.memory?.usedJSHeapSize ?? 0;
+  const deltaMB = ((actual - anterior) / 1048576).toFixed(2);
+  console.log(`heap ${(actual / 1048576).toFixed(1)} MB · Δ ${deltaMB} MB`);
+  anterior = actual;
+}, 2000);</code></pre>
+
+<pre><code class="lang-bash"># En Node: ver cada recolección con su duración y el tamaño antes/después
+node --trace-gc app.js
+
+# Salida:
+# [12345:0x...]   1820 ms: Scavenge 45.2 (58.1) -&gt; 12.3 (58.1) MB, 0.8 / 0.0 ms
+# [12345:0x...]   9412 ms: Mark-Compact 210.4 (256.0) -&gt; 88.1 (200.0) MB, 41.2 / 0.0 ms
+#                                        ↑antes  ↑límite  ↑después        ↑pausa</code></pre>
+
+<div class="warn">
+  <strong>El costo del "no generes basura".</strong> Es un consejo real pero se aplica mal. Reusar objetos y armar <em>object pools</em> a mano complica el código, introduce bugs de estado compartido y, en la mayoría de las apps, no cambia nada medible: el Scavenger es <em>muy</em> bueno recogiendo objetos efímeros. La regla razonable es: <strong>en un loop que corre 60 veces por segundo o sobre cientos de miles de elementos, evitá alocar; en el resto del código, escribí normal.</strong>
+</div>
+
+<h3>Qué es una fuga real en JavaScript</h3>
+
+<p>En un lenguaje con GC no hay "olvidarse de liberar". Una fuga es siempre lo mismo: <strong>algo que ya no usás sigue siendo alcanzable desde una raíz</strong>. Las raíces son las globales, la pila y los closures activos. Estas cuatro cubren el 95 % de los casos reales:</p>
+
+<div class="step"><strong>1. Listeners no removidos.</strong> Un <code>addEventListener</code> sobre <code>window</code> o <code>document</code> desde un componente que se desmonta mantiene vivo el handler, su closure, y todo lo que ese closure captura — incluido, muchas veces, el árbol de estado del componente entero.</div>
+
+<div class="step"><strong>2. Closures que capturan más de lo que necesitan.</strong> Una función que solo usa <code>datos.id</code> pero cierra sobre <code>datos</code> mantiene vivo el objeto completo. Y si varias funciones comparten un mismo <em>context</em>, la que sobrevive mantiene vivas las capturas de todas.</div>
+
+<div class="step"><strong>3. DOM desprendido (detached).</strong> Guardás una referencia a un nodo en un array o un mapa, después removés el nodo del documento. El nodo sale de la pantalla pero no de la memoria: y con él viene <em>todo su subárbol</em>, que puede ser gigante.</div>
+
+<div class="step"><strong>4. Cachés sin límite.</strong> Un <code>Map</code> que crece con cada request y nunca se poda no es un caché: es una fuga con buena prensa. Un caché necesita una política de expulsión (LRU, TTL, tamaño máximo) o no es un caché.</div>
+
+<pre><code class="lang-javascript">// ❌ Fuga clásica: listener global + DOM detached
+class Panel {
+  constructor(root) {
+    this.root = root;
+    this.filas = [];
+    window.addEventListener("resize", () =&gt; this.reajustar());  // nunca se quita
+  }
+  render(items) {
+    this.filas = items.map(i =&gt; {                 // guarda nodos...
+      const el = document.createElement("div");
+      el.textContent = i.nombre;
+      this.root.appendChild(el);
+      return el;
+    });
+  }
+  limpiar() { this.root.innerHTML = ""; }         // ...que quedan detached
+}
+
+// ✅ Con ciclo de vida explícito
+class Panel {
+  constructor(root) {
+    this.root = root;
+    this.filas = [];
+    this.onResize = () =&gt; this.reajustar();
+    window.addEventListener("resize", this.onResize);
+  }
+  limpiar() {
+    this.root.replaceChildren();
+    this.filas.length = 0;                        // soltar las referencias
+  }
+  destruir() {
+    window.removeEventListener("resize", this.onResize);
+    this.limpiar();
+    this.root = null;
+  }
+}</code></pre>
+
+<div class="tip">
+  <strong><code>AbortController</code> resuelve esto de una.</strong> <code>addEventListener(tipo, fn, { signal })</code> desregistra el listener cuando abortás la señal. Un <code>controller.abort()</code> en el desmontaje limpia todos los listeners del componente sin que tengas que guardar cada referencia. Y <code>WeakMap</code>/<code>WeakRef</code> sirven para asociar datos a un objeto sin impedir que se recolecte — pero son la excepción, no el patrón por defecto.
+</div>
+
+<h3>Cazarlas: la técnica de los tres snapshots</h3>
+
+<p>Esta es la herramienta que hay que saber usar de memoria, porque es la única que da una respuesta concluyente.</p>
+
+<div class="step"><strong>Snapshot 1 — línea de base.</strong> Abrí DevTools → Memory → Heap snapshot. Poné la app en el estado inicial de la acción que sospechás (por ejemplo: la lista cerrada). Tomá el snapshot.</div>
+
+<div class="step"><strong>Ejecutá la acción sospechosa varias veces.</strong> Abrí y cerrá el panel 10 o 20 veces. Repetir importa: distingue una fuga real del ruido de un caché que se llenó una sola vez.</div>
+
+<div class="step"><strong>Snapshot 2.</strong> Volvé al mismo estado inicial. Tomá el segundo snapshot.</div>
+
+<div class="step"><strong>Repetí y tomá el Snapshot 3.</strong> Ahora seleccioná el snapshot 3 y en el selector de arriba elegí <strong>"Comparison"</strong> contra el snapshot 2, o filtrá por <em>Objects allocated between Snapshot 1 and Snapshot 2</em>. Lo que sobrevivió a dos ciclos completos y sigue creciendo linealmente es tu fuga.</div>
+
+<div class="rule">
+  <strong>📌 La columna que importa es <em>Retained Size</em>, no <em>Shallow Size</em>.</strong> Shallow es lo que ocupa el objeto en sí (casi siempre irrelevante). Retained es <strong>cuánta memoria se liberaría si ese objeto desapareciera</strong> — es decir, todo lo que él mantiene vivo. Un objeto de 40 bytes con un retained size de 12 MB es exactamente lo que estás buscando. Después, el panel <em>Retainers</em> te muestra la cadena desde la raíz: ahí está el culpable, con nombre y apellido.
+</div>
+
+<div class="info">
+  Para DOM detached hay un atajo: en el buscador del heap snapshot escribí <code>Detached</code> y vas a ver directamente los <code>Detached HTMLDivElement</code> y compañía. Chrome también tiene un panel <strong>Detached Elements</strong> dedicado. Y para diferenciar "fuga" de "el heap creció y se estabilizó", el <strong>Allocation instrumentation on timeline</strong> muestra barras por asignación: las que quedan azules al final son las que no se liberaron.
+</div>
+
+<h2>FS2.6 Estructuras de datos: cuándo gana cada una</h2>
+
+<h3>Object vs Map</h3>
+
+<table>
+<thead><tr><th>Criterio</th><th>Object</th><th>Map</th></tr></thead>
+<tbody>
+<tr><td>Claves fijas y conocidas al escribir el código</td><td>✅ Gana: shape estable + IC monomórfico</td><td>Innecesario</td></tr>
+<tr><td>Claves dinámicas que entran y salen</td><td>❌ Cae a modo diccionario; <code>delete</code> es veneno</td><td>✅ Gana con claridad</td></tr>
+<tr><td>Claves que no son string</td><td>❌ Las convierte a string (<code>obj[1]</code> ≡ <code>obj["1"]</code>)</td><td>✅ Cualquier valor, comparado por identidad</td></tr>
+<tr><td>Saber cuántos elementos hay</td><td><code>Object.keys(o).length</code> — O(n) y aloca</td><td><code>map.size</code> — O(1)</td></tr>
+<tr><td>Iteración</td><td>Orden con reglas raras (índices enteros primero)</td><td>✅ Orden de inserción, garantizado</td></tr>
+<tr><td>Serializar a JSON</td><td>✅ Directo</td><td>❌ Hay que convertirlo a mano</td></tr>
+<tr><td>Riesgo de colisión con <code>__proto__</code>, <code>constructor</code></td><td>⚠️ Real (usá <code>Object.create(null)</code>)</td><td>✅ Ninguno</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La regla corta:</strong> si las claves las escribiste vos en el código fuente, usá un objeto. Si las claves vienen de datos en tiempo de ejecución, usá un <code>Map</code>. Es una regla de <em>corrección y claridad</em> antes que de velocidad — y da la casualidad de que también suele ser la más rápida.
+</div>
+
+<h3>Array vs TypedArray</h3>
+
+<p>Acá hay un matiz que casi todo el mundo se saltea. Se suele decir "los arrays de JS guardan punteros y los typed arrays guardan valores crudos". Es cierto <em>a medias</em>: si un array de V8 contiene únicamente doubles y no tiene agujeros (<code>PACKED_DOUBLE_ELEMENTS</code>), V8 guarda los números <strong>sin caja, contiguos, a 8 bytes cada uno</strong>, igual que un <code>Float64Array</code>.</p>
+
+<pre><code class="lang-javascript">const a = [1.5, 2.5, 3.5];          // PACKED_DOUBLE: 8 bytes por valor, contiguo
+const b = new Float64Array([1.5, 2.5, 3.5]);   // idem, pero con garantía
+
+a.push("x");                         // ← se rompe: ahora son punteros a objetos
+// b.push(...)                       // ← no existe: los TypedArray no crecen</code></pre>
+
+<table>
+<thead><tr><th>Elegí</th><th>Cuándo</th><th>Qué pagás</th></tr></thead>
+<tbody>
+<tr><td><code>Array</code> normal</td><td>Colecciones heterogéneas, tamaño variable, la vida normal</td><td>Podés perder el layout rápido sin darte cuenta</td></tr>
+<tr><td><code>Float64Array</code> / <code>Int32Array</code></td><td>Cálculo numérico denso, señales, píxeles, geometría, ML</td><td>Tamaño fijo, un solo tipo, API pobre (sin <code>push</code>)</td></tr>
+<tr><td><code>SharedArrayBuffer</code></td><td>Compartir datos con un Worker sin copiar</td><td>Requiere cabeceras COOP/COEP; concurrencia real, con sus bugs</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  El valor grande de un <code>TypedArray</code> no es que sea "más rápido": es que el layout está <strong>garantizado por el estándar</strong>, no sujeto a que V8 mantenga una heurística. Y es la moneda de cambio con Wasm (FS2.9), con WebGL/WebGPU y con los Workers. Si tu dato es intrínsecamente numérico y de tamaño conocido, empezá ahí.
+</div>
+
+<h3>Strings: el mito de la concatenación</h3>
+
+<p>"Nunca concatenes strings en un loop, usá <code>array.join('')</code>" es otro consejo heredado que en V8 ya casi nunca aplica. V8 no copia los bytes cuando hacés <code>a + b</code>: crea un <strong>ConsString</strong> (una <em>rope</em>), un nodo con dos punteros. La concatenación es O(1). El costo se paga después, una sola vez, cuando alguien necesita los caracteres de verdad (una comparación, un <code>indexOf</code>, insertarlo en el DOM): ahí V8 <em>aplana</em> el árbol en un string contiguo.</p>
+
+<pre><code class="lang-javascript">let s = "";
+for (let i = 0; i &lt; 100000; i++) s += "x";   // 100.000 ConsStrings encadenados
+s.length;                                     // O(1): la rope conoce su longitud
+s.charCodeAt(50000);                          // ← acá se aplana, UNA vez</code></pre>
+
+<div class="mistake">
+  <strong>Dónde sí duele.</strong> Si dentro del loop <em>leés</em> el string parcial (un <code>.length</code> está bien, pero un <code>.includes()</code>, un <code>.slice()</code> o un <code>.replace()</code> no), forzás un aplanado por iteración y ahí sí tenés el O(n²) que el consejo viejo intentaba evitar. La regla real no es "no concatenes": es <strong>construí sin leer, y leé al final</strong>.
+</div>
+
+<h2>FS2.7 Los microbenchmarks mienten</h2>
+
+<p>Si algo de este módulo te tenés que llevar por encima del resto, es esto. La mayoría de las "optimizaciones" que circulan en internet son artefactos de mediciones mal hechas.</p>
+
+<div class="danger">
+  <strong>⚠️ Las cuatro formas en que tu benchmark te miente.</strong>
+  <br><strong>1. Dead code elimination.</strong> Si no consumís el resultado, TurboFan puede probar que el cálculo no tiene efecto y borrarlo entero. Medís 0,001 ms y creés que descubriste algo.
+  <br><strong>2. El motor optimiza <em>lo que medís</em>, no lo que corre en producción.</strong> Un loop que llama siempre a la misma función con los mismos tipos se vuelve monomórfico y se inlinea. En tu app esa función ve seis tipos y es megamórfica. Medís el caso ideal y desplegás el caso real.
+  <br><strong>3. Falta de warm-up.</strong> Sin iteraciones previas medís Ignition o Sparkplug, no el código optimizado. Con demasiadas, medís un caso especializado que no existe fuera del banco.
+  <br><strong>4. Varianza.</strong> Frecuencia dinámica de la CPU, otras pestañas, GC en el medio, resolución limitada de <code>performance.now()</code> (del orden de microsegundos, y más grosera sin <em>cross-origin isolation</em>). Una diferencia del 10 % entre dos corridas es ruido, no un resultado.
+</div>
+
+<pre><code class="lang-javascript">// ❌ Benchmark que no mide nada
+console.time("a");
+for (let i = 0; i &lt; 1e7; i++) Math.sqrt(i);      // resultado descartado → DCE
+console.timeEnd("a");
+
+// ✅ Benchmark defendible
+function bench(nombre, fn, { warmup = 5, corridas = 15, iter = 1e6 } = {}) {
+  let sumidero = 0;
+  for (let w = 0; w &lt; warmup; w++) sumidero += fn(iter);   // calentar los 4 tiers
+  const tiempos = [];
+  for (let r = 0; r &lt; corridas; r++) {
+    const t0 = performance.now();
+    sumidero += fn(iter);                                   // resultado consumido
+    tiempos.push(performance.now() - t0);
+  }
+  tiempos.sort((x, y) =&gt; x - y);
+  const mediana = tiempos[Math.floor(tiempos.length / 2)];
+  const p10 = tiempos[Math.floor(tiempos.length * 0.1)];
+  const p90 = tiempos[Math.floor(tiempos.length * 0.9)];
+  console.log(
+    `${nombre}: mediana ${mediana.toFixed(2)} ms · p10 ${p10.toFixed(2)} · ` +
+    `p90 ${p90.toFixed(2)} · dispersión ${((p90 - p10) / mediana * 100).toFixed(0)}%`
+  );
+  if (sumidero === Infinity) console.log("");   // ancla: impide el DCE
+}
+
+bench("sqrt", (n) =&gt; {
+  let acc = 0;
+  for (let i = 0; i &lt; n; i++) acc += Math.sqrt(i);
+  return acc;
+});</code></pre>
+
+<div class="rule">
+  <strong>📌 Reportá mediana y dispersión, no el promedio ni el mejor tiempo.</strong> El promedio lo destroza un GC en el medio. El "mejor de N" mide condiciones ideales que el usuario no tiene. Y si la dispersión entre p10 y p90 es mayor que la diferencia entre las dos variantes que comparás, <strong>no medisté nada</strong>: repetí con más corridas o aceptá que son equivalentes.
+</div>
+
+<div class="warn">
+  <strong>El paso que casi nadie da: confirmarlo en la app real.</strong> Un microbenchmark, en el mejor caso, te dice qué hipótesis vale la pena probar. La única medición que cuenta es la de tu aplicación, con tus datos, en el perfil de CPU del panel Performance — y mejor todavía, en datos de campo con usuarios reales (RUM, FS4). Es habitual que un cambio con 3× en el banco mueva la aguja un 2 % en producción porque esa función era el 0,7 % del tiempo total. Ese 2 % puede seguir valiendo la pena; lo que no vale es haberlo asumido.
+</div>
+
+<h2>FS2.8 Async: <code>await</code> no es gratis</h2>
+
+<p><code>async</code>/<code>await</code> es azúcar sintáctica sobre promesas, y las promesas son objetos. Cada llamada a una función <code>async</code> asigna, como mínimo, la promesa que devuelve y la estructura que guarda el estado suspendido de la función. Además, cada <code>await</code> agenda un <em>microtask</em>: el resto de la función se ejecuta más tarde, cuando la cola de microtasks corre (el detalle del event loop está en FS1).</p>
+
+<pre><code class="lang-javascript">// Estas dos NO son equivalentes en costo
+function sync(x)        { return x * 2; }
+async function asincro(x) { return x * 2; }   // aloca una promesa siempre
+
+// En un loop de 100.000 elementos, la diferencia es medible:
+// 100.000 promesas + 100.000 microtasks + presión sobre el Scavenger.</code></pre>
+
+<div class="info">
+  <strong>Justicia con V8:</strong> el costo de <code>await</code> bajó muchísimo. Hubo una época en que cada <code>await</code> gastaba <em>tres</em> ticks de microtask y varias promesas intermedias; V8 lo redujo a lo mínimo indispensable y además hizo gratis los stack traces asincrónicos. Hoy <code>await</code> es barato. <strong>Barato no es gratis</strong>, y "barato × 100.000 en un loop caliente" vuelve a ser caro.
+</div>
+
+<h3>Dónde "async everywhere" se vuelve contraproducente</h3>
+
+<div class="step"><strong>1. Marcar <code>async</code> una función que no espera nada.</strong> Convertís un retorno directo en una promesa que hay que crear, resolver y agendar. Si la función es un helper llamado en un loop, es puro overhead. Si tiene que devolver una promesa por contrato, devolvela sin <code>async</code>: <code>return Promise.resolve(x)</code> o mejor, devolvé el valor y que el llamador decida.</div>
+
+<div class="step"><strong>2. <code>await</code> dentro de un <code>for</code> cuando las operaciones son independientes.</strong> Serializás lo que podría ir en paralelo. <code>Promise.all</code> (o <code>allSettled</code>) es la respuesta — con el matiz de que N peticiones simultáneas contra el mismo servidor puede ser peor que 8: ahí necesitás un pool con límite de concurrencia.</div>
+
+<div class="step"><strong>3. Cadenas largas de <code>await</code> para valores ya disponibles.</strong> Cada <code>await</code> sobre un valor que ya está resuelto igual cuesta un turno de microtask. Diez capas de abstracción asincrónicas retrasan el resultado diez microtasks, y en un camino que corre por cada fila de una tabla eso se nota.</div>
+
+<pre><code class="lang-javascript">// ❌ Serial sin necesidad: N × latencia
+const resultados = [];
+for (const id of ids) resultados.push(await traer(id));
+
+// ⚠️ Paralelo sin límite: N peticiones simultáneas — puede tumbar al servidor
+const resultados = await Promise.all(ids.map(traer));
+
+// ✅ Paralelo con límite de concurrencia
+async function mapConLimite(items, limite, fn) {
+  const salida = new Array(items.length);
+  let cursor = 0;
+  async function obrero() {
+    while (cursor &lt; items.length) {
+      const i = cursor++;
+      salida[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: limite }, obrero));
+  return salida;
+}
+const resultados = await mapConLimite(ids, 8, traer);</code></pre>
+
+<div class="rule">
+  <strong>📌 El criterio.</strong> <code>async</code> es para operaciones que <em>de verdad esperan algo</em>: red, disco, temporizadores, otro hilo. Para transformar datos que ya tenés en memoria, el código sincrónico es más simple, más rápido y más fácil de razonar. Y si esa transformación sincrónica bloquea el hilo principal demasiado tiempo, la solución no es <code>async</code> —que no libera nada— sino un <strong>Web Worker</strong> o partir el trabajo en fragmentos (FS4).
+</div>
+
+<h2>FS2.9 WebAssembly: cuándo vale la pena escaparse</h2>
+
+<p>Cuando el motor de JavaScript ya no alcanza, la salida es Wasm: un bytecode de bajo nivel, con tipos estáticos, que se compila a código máquina de forma predecible. Sin warm-up, sin deopts, sin GC en el camino caliente (salvo que uses WasmGC), sin sorpresas.</p>
+
+<table>
+<thead><tr><th>Wasm <strong>gana</strong> cuando…</th><th>Wasm <strong>pierde</strong> cuando…</th></tr></thead>
+<tbody>
+<tr><td>Cómputo denso y sostenido: códecs, criptografía, física, compresión, inferencia</td><td>La función es corta y se llama muchísimas veces: el cruce de frontera domina</td></tr>
+<tr><td>Ya existe una implementación probada en C/C++/Rust que querés portar</td><td>El trabajo real es manipular el DOM: Wasm no lo toca directo, va por JS</td></tr>
+<tr><td>Necesitás rendimiento <em>predecible</em>, sin picos por JIT o GC</td><td>Estás en el camino de arranque: descargar y compilar el módulo cuesta</td></tr>
+<tr><td>Podés trabajar sobre buffers grandes de números (TypedArrays)</td><td>Los datos son strings u objetos JS: hay que serializar en cada cruce</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El costo que hunde la mayoría de los intentos: el cruce de frontera.</strong> Llamar a una función Wasm no es gratis, y sobre todo <strong>pasar datos no triviales sí es caro</strong>: los strings y los objetos hay que copiarlos dentro de la memoria lineal del módulo y volver a leerlos del otro lado. Si tu función Wasm es un <code>toLowerCase()</code> llamado un millón de veces, vas a ser más lento que JavaScript puro, por mucho margen. <strong>La regla es: cruzá pocas veces, con mucho trabajo por cruce.</strong>
+</div>
+
+<div class="info">
+  <strong>Estado en 2026, en corto.</strong> <strong>WasmGC</strong> está disponible en los tres motores desde fines de 2024, y permite que lenguajes con recolector (Java, Kotlin, Dart) reusen el GC del navegador en vez de empaquetar el suyo — lo que recortó binarios de megabytes. <strong>JSPI</strong> (llamar APIs asincrónicas de JS desde Wasm sincrónico sin bloquear) llegó a Fase 4 y está en Chrome y Firefox. <strong>Memory64</strong> rompe la barrera de los 4 GB y viene detrás. Nada de esto cambia la regla del cruce de frontera. <strong>El tratamiento completo está en FS8</strong>; acá solo importa saber cuándo la respuesta correcta a "esto es lento" deja de ser "optimizá el JavaScript".
+</div>
+
+<h2>FS2.10 Cuándo NO micro-optimizar (o sea: casi siempre)</h2>
+
+<p>Todo lo anterior es cierto y casi nunca es tu problema. Vale la pena decirlo con números.</p>
+
+<table>
+<thead><tr><th>Síntoma</th><th>Causa probable</th><th>Orden de magnitud</th><th>Dónde se ataca</th></tr></thead>
+<tbody>
+<tr><td>La página tarda en aparecer</td><td>Red, JS que no se usa, render bloqueado</td><td>Cientos de ms a segundos</td><td>FS3, FS4, FS7</td></tr>
+<tr><td>La interacción se siente pegajosa</td><td>Layout thrashing, tareas largas, re-renders</td><td>Decenas a cientos de ms</td><td>FS4, FS5</td></tr>
+<tr><td>Todo se frena con muchos datos</td><td>Un algoritmo O(n²) escondido en un <code>find</code> dentro de un <code>map</code></td><td>Segundos, y crece</td><td>Estructuras de datos</td></tr>
+<tr><td>Se degrada con el tiempo de uso</td><td>Fuga de memoria (FS2.5)</td><td>Progresivo</td><td>Heap snapshots</td></tr>
+<tr><td>Un loop numérico específico es lento</td><td><strong>Acá sí</strong>: shapes, ICs, deopts, elements kinds</td><td>2× a 20×</td><td>Este módulo</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El orden de ataque, y no es negociable.</strong> <strong>(1)</strong> ¿Se puede no hacer el trabajo? (cachear, paginar, virtualizar, hacerlo en el servidor). <strong>(2)</strong> ¿El algoritmo es el correcto? Pasar de O(n²) a O(n) con un <code>Map</code> le gana a cualquier truco de motor por varios órdenes de magnitud. <strong>(3)</strong> ¿Se puede sacar del hilo principal? (Worker, <code>requestIdleCallback</code>, fragmentar). <strong>(4)</strong> Recién ahora, micro-optimizar el motor. Si empezás por el 4, vas a escribir código feo para ganar un 15 % de algo que se podía eliminar por completo.
+</div>
+
+<div class="mistake">
+  <strong>El costo real de micro-optimizar de más</strong> no es el tiempo que perdés: es el código que queda. Un helper duplicado "por las ICs", campos <code>null</code> que nadie entiende, un pool de objetos con bugs de estado. Todo eso lo va a leer alguien en dos años sin el contexto de la medición que lo justificó. <strong>Si micro-optimizás, dejá el número en un comentario</strong>: qué medías, con qué carga, cuánto ganaste. Sin eso, la próxima persona lo va a "limpiar" —con razón— y vas a volver al punto de partida.
+</div>
+
+<h2>🧑‍🎓 Worked Example — 50.000 registros en 2,3 segundos</h2>
+
+<blockquote>Una vista de reportes procesa 50.000 registros que vienen de la API y arma un resumen por categoría. Tarda 2.310 ms y congela la pestaña. El equipo propone: "pasémoslo a un Worker" y "reescribámoslo en Rust con Wasm". Antes de nada, medimos.</blockquote>
+
+<h3>Paso 0 — El código como está</h3>
+
+<pre><code class="lang-javascript">function construirResumen(registros, categorias) {
+  let filas = [];
+  for (const r of registros) {
+    const cat = categorias.find(c =&gt; c.id === r.categoriaId);   // (a)
+    const fila = { id: r.id, monto: r.monto, categoria: cat.nombre };
+    if (r.descuento) fila.descuento = r.descuento;              // (b)
+    if (r.nota) fila.nota = r.nota;                             // (b)
+    filas = filas.concat([fila]);                               // (c)
+  }
+  return filas.reduce((acc, f) =&gt; {
+    acc[f.categoria] = (acc[f.categoria] ?? 0) + leer(f, "monto");  // (d)
+    return acc;
+  }, {});
+}
+function leer(obj, campo) { return obj[campo]; }                 // (d)</code></pre>
+
+<h3>Paso 1 — Perfilar, no adivinar</h3>
+
+<pre><code class="lang-bash"># En el navegador: DevTools → Performance → grabar la acción → pestaña Bottom-Up
+# En Node, para el mismo código:
+node --cpu-prof --cpu-prof-dir=./perfiles reporte.js
+# y se abre el .cpuprofile en DevTools → Performance → Load profile
+
+# En paralelo, ver si el motor se está peleando consigo mismo:
+node --trace-deopt reporte.js 2&gt;&amp;1 | grep -c "deoptimizing"</code></pre>
+
+<p>El Bottom-Up ordenado por <em>self time</em> dice esto:</p>
+
+<table>
+<thead><tr><th>Función</th><th>Self time</th><th>Lectura</th></tr></thead>
+<tbody>
+<tr><td><code>Array.prototype.concat</code></td><td>1.480 ms (64 %)</td><td>Copia el array entero en cada vuelta</td></tr>
+<tr><td><code>construirResumen</code></td><td>390 ms (17 %)</td><td>El loop propio</td></tr>
+<tr><td><code>Array.prototype.find</code></td><td>310 ms (13 %)</td><td>Búsqueda lineal por registro</td></tr>
+<tr><td><code>leer</code></td><td>95 ms (4 %)</td><td>Sospechosamente caro para un <code>obj[campo]</code></td></tr>
+<tr><td>GC (Scavenge)</td><td>~50 ms</td><td>Presión de alocación</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Antes de tocar una línea, el perfil ya destruyó las dos propuestas del equipo.</strong> Un Worker movería los 2,3 s a otro hilo pero seguirían siendo 2,3 s. Wasm no ayuda: acá no hay cómputo numérico denso, hay copias de arrays y accesos a propiedades. <strong>Lo que hay es un O(n²) y dos problemas de motor.</strong>
+</div>
+
+<h3>Paso 2 — El O(n²) obvio: <code>concat</code> (c)</h3>
+
+<p><code>filas = filas.concat([fila])</code> crea un array nuevo y copia todo lo anterior, en cada una de las 50.000 vueltas. Son ~1.250 millones de copias de puntero y 50.000 arrays descartados.</p>
+
+<pre><code class="lang-javascript">const filas = [];
+// ...
+filas.push(fila);        // O(1) amortizado, sin alocar un array por vuelta</code></pre>
+
+<p><strong>Medición: 2.310 ms → 795 ms.</strong> Una línea, 2,9×. Y las pausas de GC bajaron a ~8 ms porque dejamos de generar 50.000 arrays basura.</p>
+
+<h3>Paso 3 — El otro O(n²): <code>find</code> (a)</h3>
+
+<p>Con 200 categorías, cada registro recorre en promedio 100 elementos: 5 millones de comparaciones. La solución no tiene nada que ver con el motor, es estructura de datos.</p>
+
+<pre><code class="lang-javascript">const porId = new Map(categorias.map(c =&gt; [c.id, c]));   // una vez, O(n)
+// ...
+const cat = porId.get(r.categoriaId);                     // O(1) por registro</code></pre>
+
+<p><strong>Medición: 795 ms → 470 ms.</strong></p>
+
+<h3>Paso 4 — Ahora sí el motor: el polimorfismo del campo opcional (b)</h3>
+
+<p>Con los dos algoritmos arreglados, el perfil cambia de forma: ahora el 60 % del tiempo está en el loop propio, y <code>--trace-deopt</code> muestra <code>reason: wrong map</code> repetido en la línea del <code>reduce</code>.</p>
+
+<p>La causa son las dos líneas <code>if (r.descuento)</code> / <code>if (r.nota)</code>. Producen <strong>cuatro shapes distintas</strong> según qué combinación de campos opcionales trae cada registro: <code>{id,monto,categoria}</code>, <code>{...,descuento}</code>, <code>{...,nota}</code>, <code>{...,descuento,nota}</code>. El call site que lee <code>f.categoria</code> en el <code>reduce</code> queda polimórfico al borde del umbral, y como el orden de los registros mezcla las cuatro variantes, TurboFan optimiza y se deoptimiza en ciclos.</p>
+
+<pre><code class="lang-javascript">// Shape ÚNICA para las 50.000 filas
+const fila = {
+  id: r.id,
+  monto: r.monto,
+  categoria: cat.nombre,
+  descuento: r.descuento ?? null,
+  nota: r.nota ?? null,
+};</code></pre>
+
+<p><strong>Medición: 470 ms → 210 ms.</strong> Y las deopts en esa línea pasaron de 340 a 0.</p>
+
+<div class="info">
+  <strong>Por qué este paso vino cuarto y no primero.</strong> Si hubiéramos empezado por acá —que es lo que uno hace cuando acaba de leer sobre hidden classes— habríamos ganado unos 260 ms sobre 2.310: un 11 %, sobre un problema que en realidad era 90 % algorítmico. Habríamos declarado victoria y dejado el O(n²) intacto. <strong>El orden del FS2.10 no es una formalidad: es lo que evita optimizar la parte equivocada.</strong>
+</div>
+
+<h3>Paso 5 — El helper megamórfico (d)</h3>
+
+<p><code>leer(obj, campo)</code> es un helper compartido: en la app entera lo llaman con veinte tipos de objeto distintos, así que su call site interno es megamórfico y TurboFan no puede inlinearlo. Acá no hace falta un helper genérico:</p>
+
+<pre><code class="lang-javascript">acc[f.categoria] = (acc[f.categoria] ?? 0) + f.monto;   // acceso directo</code></pre>
+
+<p><strong>Medición: 210 ms → 155 ms.</strong> Y el código quedó más corto y más claro que antes, que es la única micro-optimización que uno querría siempre.</p>
+
+<h3>Resultado y la parte incómoda</h3>
+
+<table>
+<thead><tr><th>Paso</th><th>Cambio</th><th>Tiempo</th><th>Ganancia acumulada</th><th>Naturaleza</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>Código original</td><td>2.310 ms</td><td>—</td><td>—</td></tr>
+<tr><td>2</td><td><code>concat</code> → <code>push</code></td><td>795 ms</td><td>2,9×</td><td>Algorítmica (O(n²))</td></tr>
+<tr><td>3</td><td><code>find</code> → <code>Map</code></td><td>470 ms</td><td>4,9×</td><td>Estructura de datos</td></tr>
+<tr><td>4</td><td>Shape única</td><td>210 ms</td><td>11×</td><td><strong>Motor</strong> (polimorfismo)</td></tr>
+<tr><td>5</td><td>Sin helper genérico</td><td>155 ms</td><td><strong>14,9×</strong></td><td><strong>Motor</strong> (megamórfico)</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Y ahora la parte que no aparece en los blogs.</strong> La vista tardaba 3,1 s en total. Después de todo esto tarda 1,0 s — porque los otros 850 ms son la respuesta de la API, que no tocamos. El trabajo de motor (pasos 4 y 5) aportó 315 ms de los 2.155 ms ahorrados: un <strong>15 % de la mejora</strong>. Los pasos 2 y 3, que son algoritmos de primer año, aportaron el 85 %. <strong>Ese reparto es lo típico, no la excepción.</strong> Y el siguiente paso obvio ya no es este módulo: es paginar la respuesta, o traer el resumen ya calculado del servidor — o sea, no hacer el trabajo (FS2.10, punto 1).
+</div>
+
+<div class="tip">
+  <strong>Cerralo con una prueba, no con un commit.</strong> Un test que falla si <code>construirResumen</code> tarda más de, digamos, 400 ms sobre un fixture de 50.000 filas convierte esta tarde de trabajo en una garantía. Sin eso, dentro de seis meses alguien agrega un campo opcional "porque es más limpio" y volvés a 470 ms sin que nadie se entere.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Una función procesa objetos que vienen de cinco endpoints distintos, cada uno con su forma. Corre 200.000 veces. ¿Qué le está pasando y qué se hace?</summary>
+<p>El call site que lee propiedades vio cinco shapes distintas, así que pasó el umbral de cuatro y se volvió <strong>megamórfico</strong>: V8 abandona la inline cache y consulta un caché global con hash, y además <strong>TurboFan pierde la capacidad de inlinear esa función</strong>, lo que arrastra otras optimizaciones que dependían del inlining. Hay dos salidas. La primera y preferible es <strong>normalizar en el borde</strong>: convertir las cinco respuestas a una forma única apenas entran a la app, lo que además es mejor diseño porque el resto del código deja de conocer los formatos externos. La segunda, si por alguna razón no se pueden normalizar, es <strong>especializar el camino caliente</strong> con una función por forma, aunque duplique código: cinco call sites monomórficos ganan por lejos a uno megamórfico. Y en ambos casos se verifica con <code>--trace-deopt</code> o con el perfil de CPU, no por fe.</p></details>
+
+<details><summary>Tu benchmark dice que la versión nueva es 8× más rápida, pero en producción no cambió nada. Enumerá las causas posibles, en orden de probabilidad.</summary>
+<p><strong>(1) Esa función no era el cuello de botella.</strong> Si representaba el 3 % del tiempo total, un 8× te da un 2,6 % de mejora global — indetectable. Es lo más frecuente y se descarta mirando el perfil <em>antes</em> de optimizar. <strong>(2) Dead code elimination:</strong> el benchmark no consumía el resultado y V8 borró el cálculo, así que medía la nada. <strong>(3) El banco creó condiciones que no existen en producción:</strong> tipos siempre iguales, shapes estables, todo monomórfico e inlineado; en la app real la función es polimórfica y no se inlinea. <strong>(4) Falta de warm-up o exceso de warm-up:</strong> mediste Ignition, o mediste un caso ultra-especializado. <strong>(5) Varianza no controlada:</strong> reportaste un promedio o un mejor-de-N en lugar de mediana y dispersión, y la "mejora" está dentro del ruido. La verificación honesta es siempre la misma: medir el flujo completo en la app, antes y después, con la misma carga.</p></details>
+
+<details><summary>Una SPA arranca en 180 MB y después de veinte minutos de navegación está en 900 MB. ¿Cómo lo diagnosticás?</summary>
+<p>Primero hay que distinguir <em>crecimiento</em> de <em>fuga</em>: un caché que se llena y se estabiliza no es una fuga. Se abre DevTools → Memory y se aplica la <strong>técnica de los tres snapshots</strong>: snapshot en el estado base, repetir la navegación sospechosa 10–20 veces volviendo siempre al mismo estado, snapshot, repetir, snapshot. Si el heap crece linealmente con las repeticiones, es una fuga. Después se compara el tercer snapshot contra el segundo y se ordena por <strong>Retained Size</strong> —no Shallow—, porque lo que importa es cuánta memoria mantiene vivo cada objeto, no cuánto pesa él. El panel <em>Retainers</em> da la cadena desde la raíz hasta el objeto, y ahí aparece el culpable. Los sospechosos habituales, en orden: listeners sobre <code>window</code>/<code>document</code> que no se removieron al desmontar, nodos del DOM guardados en arrays o mapas después de sacarlos del documento (buscar <code>Detached</code> en el filtro), closures que capturan objetos grandes, y cachés sin política de expulsión. La prevención estructural es <code>AbortController</code> con <code>{ signal }</code> en todos los listeners de un componente y un <code>destroy()</code> explícito que suelte las referencias.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>V8 tiene <strong>cuatro tiers</strong> (Ignition → Sparkplug → Maglev → TurboFan), no dos, y promueve según <em>estabilidad</em> del feedback, no solo por contador. Turboshaft es el backend moderno del último tier, no un tier nuevo.</li>
+  <li><strong>Parsear cuesta antes de ejecutar.</strong> El pre-parser hace tolerable un bundle grande, pero el top level y las IIFE se pagan completos. La optimización que gana no es escribir mejor JavaScript: es enviar menos.</li>
+  <li><strong>Shapes e inline caches</strong> son el mecanismo central. Monomórfico → polimórfico (hasta 4) → <strong>megamórfico</strong>, que es un acantilado, no una pendiente: se pierde el acceso rápido y también el inlining.</li>
+  <li>Los <strong>arrays también tienen tipo</strong> (elements kinds) y las transiciones son de una sola dirección: de PACKED a HOLEY no se vuelve. <code>new Array(n)</code> sin <code>fill</code> nace holey.</li>
+  <li><strong>Deopt</strong> = falló una suposición. Lo grave no es una deopt: es el ciclo optimizar–deoptimizar. Se lee con <code>--trace-deopt</code>. El "<code>try/catch</code> impide optimizar" es un mito de la era Crankshaft, muerto desde ~2017.</li>
+  <li><strong>GC generacional</strong>: Scavenger sub-milisegundo en la generación joven, Mark-Sweep-Compact con marcado concurrente en la vieja. Con 16,7 ms por frame, una pausa mayor se <em>ve</em>. Una fuga en JS siempre es alcanzabilidad: listeners, closures, DOM detached, cachés sin límite. Se caza con tres snapshots y la columna <strong>Retained Size</strong>.</li>
+  <li><strong>Estructuras</strong>: objeto para claves fijas, <code>Map</code> para claves dinámicas; <code>TypedArray</code> cuando el layout tiene que estar garantizado; y la concatenación de strings es O(1) en V8 gracias a las ropes — el problema es leer el string parcial dentro del loop.</li>
+  <li><strong>Los microbenchmarks mienten</strong> por DCE, por crear condiciones que no existen en producción, por warm-up mal hecho y por varianza. Reportá mediana y dispersión, consumí el resultado, y confirmá en la app real.</li>
+  <li><strong><code>await</code> es barato, no gratis.</strong> Marcar <code>async</code> una función que no espera nada aloca una promesa y un microtask por llamada. Para trabajo sincrónico pesado la respuesta no es <code>async</code>, es un Worker.</li>
+  <li><strong>Wasm</strong> gana con cómputo denso y pocos cruces de frontera; pierde con funciones cortas, mucho DOM o mucho string. Detalle completo en FS8.</li>
+  <li><strong>El 95 % de las veces el cuello no es el motor.</strong> Orden de ataque: no hacer el trabajo → arreglar el algoritmo → sacarlo del hilo principal → recién ahí, micro-optimizar. Y si micro-optimizás, dejá el número medido en un comentario.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Corré el benchmark de shapes de FS2.3 con 1, 2, 4, 8 y 16 variantes y armá una tabla con <em>tus</em> números. Identificá en qué cantidad de variantes aparece el escalón y explicá por qué después se aplana.</li>
+  <li>Escribí una función que sume los elementos de un array y llamala primero con 100.000 enteros, después con 100.000 strings numéricos. Corré con <code>node --trace-deopt</code> y transcribí el <code>reason</code> exacto que reporta V8.</li>
+  <li>Comprobá los elements kinds: creá <code>[]</code>, <code>new Array(1000)</code> y <code>new Array(1000).fill(0)</code>, llenalos igual, y cronometrá una suma sobre cada uno con el <code>bench()</code> de FS2.7. Explicá el resultado.</li>
+  <li>Tomá el benchmark roto de FS2.7 (el que sufre DCE) y arreglalo paso a paso: consumir el resultado, agregar warm-up, reportar mediana y dispersión. Documentá cómo cambia el número reportado en cada paso.</li>
+  <li>Fabricá una fuga: un componente que agrega un listener a <code>window</code> y guarda 5.000 nodos del DOM en un array, y un botón que lo "destruye" sin limpiar nada. Cazala con la técnica de los tres snapshots y capturá la cadena de <em>Retainers</em>. Después arreglala con <code>AbortController</code> y demostrá con snapshots que el heap vuelve a la línea de base.</li>
+  <li>Medí el costo de <code>async</code>: una función sincrónica y una <code>async</code> que devuelven lo mismo, llamadas 200.000 veces. Reportá la diferencia en tiempo y, con <code>--trace-gc</code>, en cantidad de scavenges.</li>
+  <li>Comprobá el mito de la concatenación: construí un string de 200.000 caracteres con <code>+=</code>, con <code>array.join("")</code>, y con <code>+=</code> pero leyendo <code>s.includes("x")</code> dentro del loop. Explicá por qué el tercero es catastrófico y los dos primeros no.</li>
+  <li>Reproducí el Worked Example completo con datos sintéticos y verificá los cinco pasos con tus propias mediciones. Después respondé: si solo pudieras hacer <em>un</em> cambio, ¿cuál elegís y por qué?</li>
+  <li>Elegí una vista lenta de un proyecto tuyo, perfilala con el panel Performance y clasificá el tiempo según la tabla de FS2.10. Escribí en dos párrafos dónde está el cuello real y por qué las técnicas de este módulo sirven o no sirven en ese caso concreto.</li>
+</ol>
+
+<section class="quiz" id="quizFS2">
+  <style>
+    #quizFS2{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizFS2 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizFS2 .q{margin-bottom:1.5rem}
+    #quizFS2 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizFS2 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizFS2 .opt:hover{border-color:var(--accent)}
+    #quizFS2 .opt:disabled{cursor:default}
+    #quizFS2 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizFS2 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizFS2 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizFS2 .exp.show{display:block}
+    #quizFS2 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Una función que lee <code>item.precio</code> en un loop pasa de recibir objetos de 4 formas distintas a recibir objetos de 5 formas. El tiempo se dispara mucho más de lo que sugeriría "una forma más". ¿Por qué?</p>
+    <button class="opt">Porque cada shape nueva obliga a V8 a re-parsear la función desde el código fuente</button>
+    <button class="opt">Porque el recolector de basura tiene que copiar las 5 variantes entre semi-espacios</button>
+    <button class="opt">Porque el umbral polimórfico de V8 es 4: con la quinta el call site se vuelve megamórfico, pierde la inline cache y además TurboFan deja de poder inlinear la función</button>
+    <div class="exp">Es un acantilado, no una pendiente. Hasta 4 shapes V8 mantiene una lista corta y compara contra ella. Con la quinta abandona la IC y pasa a un caché global con hash — y lo caro no es solo ese acceso: al perder la inline cache se pierde el <strong>inlining</strong>, y con él caen en cascada el escape analysis, el unboxing de números y la eliminación de chequeos que dependían de tener la función inlineada. Por eso el salto de 4 a 5 cuesta mucho más que el de 3 a 4, y por eso de 5 en adelante se aplana: una vez megamórfico da igual tener 5 shapes que 50.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu microbenchmark reporta que la versión B es 8× más rápida que la A. ¿Cuál es la primera cosa que verificás antes de creerle?</p>
+    <button class="opt">Que el benchmark consuma el resultado y tenga warm-up — y, sobre todo, que esa función represente una fracción significativa del tiempo real de la app</button>
+    <button class="opt">Que las dos versiones estén escritas con la misma cantidad de líneas para que la comparación sea justa</button>
+    <button class="opt">Que el navegador tenga habilitado el JIT, porque si no las dos corren interpretadas</button>
+    <div class="exp">Sin consumir el resultado, TurboFan puede eliminar el cálculo entero (dead code elimination) y estarías midiendo la nada. Sin warm-up medís Ignition o Sparkplug, no el código optimizado. Pero incluso con un banco impecable, el motivo más frecuente de que un 8× no se note en producción es que esa función era el 3 % del tiempo total: un 8× sobre el 3 % es un 2,6 % global, indetectable. Por eso el perfil de la app real va <em>antes</em> del benchmark, no después.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Una vista procesa 50.000 filas en 2,3 s. El perfil muestra 64 % en <code>Array.prototype.concat</code> y 13 % en <code>Array.prototype.find</code>. ¿Por dónde empezás?</p>
+    <button class="opt">Por normalizar las shapes de los objetos, porque el polimorfismo es la causa raíz de todo mal rendimiento en JavaScript</button>
+    <button class="opt">Por los dos O(n²): reemplazar <code>concat</code> por <code>push</code> y <code>find</code> por un <code>Map</code>; el trabajo de motor viene después, si el perfil todavía lo justifica</button>
+    <button class="opt">Por mover todo a un Web Worker, así el hilo principal deja de bloquearse</button>
+    <div class="exp">El perfil ya dijo que el 77 % del tiempo está en dos algoritmos cuadráticos: <code>concat</code> copia el array completo en cada vuelta y <code>find</code> recorre la lista de categorías por registro. Arreglar eso da ~5× con dos líneas. Empezar por las shapes hubiera dado un 11 % y hubiera dejado el O(n²) intacto — el error clásico de aplicar lo último que uno leyó. Y el Worker no achica el trabajo: mueve 2,3 s a otro hilo y siguen siendo 2,3 s, con el costo extra de serializar los datos para cruzarlos.</div>
+  </div>
+
+  <div class="score" id="scoreFS2"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizFS2');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreFS2').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con FS3.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../fs1-navegador-interno/lecture.html">← FS1: El navegador por dentro</a>
+  <a href="../fs3-red-protocolos/lecture.html">FS3: Red y protocolos →</a>
+</nav>
+
+</div>
+</body>
+</html>

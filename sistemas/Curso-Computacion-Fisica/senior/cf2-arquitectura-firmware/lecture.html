@@ -1,0 +1,1280 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CF2 — Arquitectura de firmware: código que corre 5 años sin reiniciarse · Computación Física Senior</title>
+  <meta name="description" content="Capas HAL/drivers/servicios/app, máquinas de estados, por qué no hay malloc en firmware serio, mapa de memoria y linker script, watchdog por tareas, errores sin excepciones, logging sin consola, bootloader y OTA A/B con MCUboot, configuración persistente atómica y testing en el host.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física Senior</a>
+  <a href="../../index.html">⚡ Curso de Computación Física</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CF2</span>
+  <span class="badge">⏱ 60–140 min</span>
+  <span class="badge">🎯 Pre-req: E03–E04 + CF1</span>
+  <span class="badge">🏗 Arquitectura &amp; confiabilidad</span>
+</div>
+
+<article>
+
+<h1>CF2 — Arquitectura de firmware: código que corre 5 años sin reiniciarse</h1>
+
+<h2>CF2.0 Por qué este módulo</h2>
+
+<p>En <a href="../../e03-microcontroladores-1/lecture.html">E03</a> y <a href="../../e04-microcontroladores-2/lecture.html">E04</a> aprendiste a hacer que un microcontrolador <em>haga</em> cosas: leer un pin, mover un servo, hablar por I²C. Este módulo no trata de eso. Trata de la pregunta que aparece después, cuando ese código deja tu escritorio y se mete adentro de una caja atornillada a una pared: <strong>¿va a seguir funcionando dentro de tres años, sin que nadie lo mire?</strong></p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El software que escribís para un servidor vive en un mundo donde el error es barato: si algo se rompe, reiniciás el proceso; si hay un bug, desplegás en veinte minutos; si te queda una fuga de memoria chica, el reinicio nocturno la limpia. <strong>El firmware no tiene nada de eso.</strong> No hay quien reinicie, no hay F5, no hay <code>kubectl rollout restart</code>, y la memoria que fragmentaste el martes sigue fragmentada el martes del año que viene. Toda la arquitectura de firmware que vas a ver acá es una consecuencia lógica de esas tres ausencias.
+</div>
+
+<p>La diferencia se ve en un solo número. Un servicio web con un <em>uptime</em> de 99,9% pierde 8,7 horas por año y nadie se entera demasiado. Un equipo embebido con ese mismo 99,9% se reinicia solo unas <strong>525 veces por año</strong> si cada caída dura un minuto — y si es un caudalímetro que factura, o una bomba de infusión, o el controlador de una barrera de peaje, esas 525 veces son 525 incidentes. El objetivo del firmware de campo no es "casi siempre". Es <strong>que el contador de <em>uptime</em> no se resetee nunca</strong>, y que cuando se resetee, sepas exactamente por qué.</p>
+
+<div class="rule">
+  <strong>📌 La regla que ordena todo el módulo.</strong> En firmware, cualquier recurso cuyo consumo dependa del historial de ejecución es una bomba de tiempo. Memoria del heap, entradas de una tabla que crece, handles que se piden y no se devuelven, contadores que no saturan. <strong>Si no podés calcular el peor caso en papel, no lo podés poner en campo.</strong>
+</div>
+
+<p>Un aviso de alcance: CF2 es sobre <strong>estructura y confiabilidad</strong>. El <em>timing</em> —prioridades, jitter, análisis de planificabilidad— lo cubrió <a href="../cf1-tiempo-real-rtos/lecture.html">CF1</a>, y voy a apoyarme en eso sin repetirlo. La criptografía del arranque seguro y la firma de imágenes se ve en <a href="../cf6-seguridad-embebida/lecture.html">CF6</a>: acá tratamos la <em>integridad</em> del update (que no quede a medias) y ahí se trata la <em>autenticidad</em> (que sea tuyo).</p>
+
+<h2>CF2.1 Las cuatro capas: HAL, drivers, servicios, aplicación</h2>
+
+<p>La arquitectura por capas en firmware no es una moda de arquitectos. Es la respuesta a un problema muy concreto: <strong>el silicio se te muere debajo del producto</strong>. Un STM32 que elegiste en 2023 puede entrar en <em>Not Recommended for New Designs</em> en 2027, y tu producto todavía se fabrica. La escasez de semiconductores de 2021–2022 le enseñó eso a la industria entera de la peor manera: equipos que tuvieron que migrar de familia de MCU en semanas.</p>
+
+<table>
+<thead><tr><th>Capa</th><th>Qué contiene</th><th>Depende de</th><th>¿Testeable en tu PC?</th></tr></thead>
+<tbody>
+<tr><td><strong>HAL</strong> (Hardware Abstraction Layer)</td><td>Escrituras a registros, configuración de reloj, GPIO, timers, DMA</td><td>El chip específico</td><td>❌ No — se reemplaza por un doble</td></tr>
+<tr><td><strong>Drivers</strong></td><td>Un sensor, una pantalla, una memoria flash externa: protocolo del componente</td><td>La HAL, no el chip</td><td>✅ Sí, con HAL simulada</td></tr>
+<tr><td><strong>Servicios</strong></td><td>Máquina de estados de conexión, gestor de configuración, planificador de muestreo</td><td>Drivers por interfaz</td><td>✅ Sí, casi todo</td></tr>
+<tr><td><strong>Aplicación</strong></td><td>La lógica del producto: cuándo abrir la válvula, qué reportar</td><td>Servicios</td><td>✅ Sí, todo</td></tr>
+</tbody>
+</table>
+
+<p>La regla operativa es una sola: <strong>las dependencias apuntan siempre hacia abajo, nunca hacia arriba</strong>. La HAL no sabe que existe un sensor de presión. El driver del sensor no sabe qué hace la aplicación con la lectura. En C esto se implementa con estructuras de punteros a función — el equivalente pobre pero perfectamente funcional de una interfaz:</p>
+
+<pre><code class="lang-c">/* hal_i2c.h — el contrato. Nadie arriba de esta línea sabe qué chip hay abajo. */
+#include &lt;stdint.h&gt;
+#include &lt;stddef.h&gt;
+
+typedef enum {
+    HAL_OK = 0,
+    HAL_ERR_TIMEOUT,
+    HAL_ERR_NACK,
+    HAL_ERR_BUSY,
+    HAL_ERR_ARG,
+} hal_status_t;
+
+typedef struct hal_i2c_s {
+    hal_status_t (*write)(struct hal_i2c_s *self, uint8_t addr,
+                          const uint8_t *buf, size_t len, uint32_t timeout_ms);
+    hal_status_t (*read )(struct hal_i2c_s *self, uint8_t addr,
+                          uint8_t *buf, size_t len, uint32_t timeout_ms);
+    void *ctx;              /* el periférico concreto: I2C1, I2C2, un bit-bang... */
+} hal_i2c_t;</code></pre>
+
+<pre><code class="lang-c">/* drv_bmp280.c — el driver del sensor NO incluye stm32f4xx.h. Nunca. */
+#include "hal_i2c.h"
+
+#define BMP280_ADDR      0x76
+#define BMP280_REG_ID    0xD0
+#define BMP280_CHIP_ID   0x58
+
+typedef struct {
+    hal_i2c_t *bus;         /* inyectado: el driver no lo crea, lo recibe */
+    int32_t    t_fine;
+} bmp280_t;
+
+hal_status_t bmp280_init(bmp280_t *dev, hal_i2c_t *bus)
+{
+    if (dev == NULL || bus == NULL) return HAL_ERR_ARG;
+    dev-&gt;bus = bus;
+
+    uint8_t reg = BMP280_REG_ID, id = 0;
+    hal_status_t st = bus-&gt;write(bus, BMP280_ADDR, &amp;reg, 1, 50);
+    if (st != HAL_OK) return st;
+    st = bus-&gt;read(bus, BMP280_ADDR, &amp;id, 1, 50);
+    if (st != HAL_OK) return st;
+
+    return (id == BMP280_CHIP_ID) ? HAL_OK : HAL_ERR_NACK;
+}</code></pre>
+
+<div class="tip">
+  Ese <code>hal_i2c_t *bus</code> que entra por parámetro en vez de ser una variable global es lo que te va a permitir, en CF2.10, correr los tests de este driver en tu notebook con un bus falso que devuelve bytes de un array. Sin esa inyección, para probar el cálculo de compensación del BMP280 necesitás la placa. Con ella, necesitás <code>gcc</code>.
+</div>
+
+<h3>El costo de las capas</h3>
+
+<p>Nada de esto es gratis, y el nivel senior consiste en saber cuánto cuesta:</p>
+
+<table>
+<thead><tr><th>Costo</th><th>Magnitud típica</th><th>Cómo se mitiga</th></tr></thead>
+<tbody>
+<tr><td>Llamada indirecta por puntero a función</td><td>2–5 ciclos extra vs. llamada directa en Cortex-M4; sin <em>inlining</em> posible</td><td>No usar la indirección en el camino de datos caliente (ISR, DMA); sí en la de configuración</td></tr>
+<tr><td>Flash de las tablas de vtable</td><td>4 bytes por puntero, decenas de bytes por interfaz</td><td>Irrelevante salvo en MCUs de 16 KB</td></tr>
+<tr><td>RAM por instancia de contexto</td><td>8–32 bytes por objeto driver</td><td>Instancias estáticas, una por periférico real</td></tr>
+<tr><td>Complejidad cognitiva</td><td>Alta: "¿dónde está la implementación de esto?"</td><td>Un solo nivel de indirección, nunca dos</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Medí antes de asustarte.</strong> El costo de una llamada indirecta en un Cortex-M4 a 168 MHz es del orden de <strong>20–30 ns</strong>. Si tu driver de sensor se llama 10 veces por segundo, estás gastando 300 nanosegundos por segundo — 0,00003% de la CPU — a cambio de poder testear en el host y cambiar de chip. Si en cambio la llamada indirecta está adentro de un lazo que corre a 100 kHz, ahí sí hacés la cuenta: 30 ns × 100.000 = 3 ms por segundo, 0,3% de la CPU, y probablemente todavía valga la pena.
+</div>
+
+<h2>CF2.2 Máquinas de estados: la columna vertebral</h2>
+
+<p>Abrí cualquier firmware viejo que haya sobrevivido a tres programadores y vas a encontrar lo mismo: un <code>while(1)</code> con un <code>if</code> anidado seis niveles, banderas booleanas con nombres como <code>flag_ok2</code>, y un comentario que dice <code>/* no tocar */</code>. Ese es el olor característico del firmware sin arquitectura, y siempre nace igual: <strong>alguien modeló un proceso secuencial con condicionales en vez de con estados</strong>.</p>
+
+<p>Un equipo embebido casi nunca es secuencial. Es <em>reactivo</em>: llega un evento (un timeout, un byte, un botón, una lectura fuera de rango) y el sistema tiene que responder distinto según en qué situación esté. Eso es literalmente la definición de una máquina de estados finitos, y modelarla como tal no es elegancia: es la única forma de poder <strong>enumerar todas las combinaciones y demostrar que ninguna quedó sin manejar</strong>.</p>
+
+<h3>Las tres implementaciones, con su costo</h3>
+
+<pre><code class="lang-c">/* OPCIÓN 1 — switch. La que se escribe primero, y la correcta el 80% de las veces. */
+typedef enum { ST_INIT, ST_IDLE, ST_MIDIENDO, ST_ENVIANDO, ST_FALLA, ST_COUNT } estado_t;
+typedef enum { EV_TICK, EV_DATO_LISTO, EV_TX_OK, EV_TIMEOUT, EV_ERROR, EV_COUNT } evento_t;
+
+static estado_t st = ST_INIT;
+
+void fsm_paso(evento_t ev)
+{
+    switch (st) {
+    case ST_IDLE:
+        if (ev == EV_TICK) { sensor_disparar(); st = ST_MIDIENDO; }
+        break;
+
+    case ST_MIDIENDO:
+        if      (ev == EV_DATO_LISTO) { radio_enviar(); st = ST_ENVIANDO; }
+        else if (ev == EV_TIMEOUT)    { st = ST_FALLA; }
+        break;
+
+    case ST_ENVIANDO:
+        if      (ev == EV_TX_OK)   { st = ST_IDLE; }
+        else if (ev == EV_TIMEOUT) { st = ST_FALLA; }
+        break;
+
+    default:
+        /* Nunca dejes un default vacío: un estado imposible es un bug, no un no-evento */
+        log_err("estado invalido %d con evento %d", (int)st, (int)ev);
+        st = ST_FALLA;
+        break;
+    }
+}</code></pre>
+
+<pre><code class="lang-c">/* OPCIÓN 2 — tabla de transición. Los estados dejan de ser código y pasan a ser datos. */
+typedef struct {
+    estado_t destino;
+    void   (*accion)(void);
+} transicion_t;
+
+/* [estado][evento] -&gt; a dónde voy y qué hago. La tabla vive en flash: 0 bytes de RAM. */
+static const transicion_t TABLA[ST_COUNT][EV_COUNT] = {
+/*                EV_TICK                    EV_DATO_LISTO              EV_TX_OK                EV_TIMEOUT             EV_ERROR        */
+/* ST_INIT   */ {{ST_IDLE,     NULL       }, {ST_INIT,  NULL},          {ST_INIT, NULL},        {ST_INIT, NULL},       {ST_FALLA, NULL}},
+/* ST_IDLE   */ {{ST_MIDIENDO, sensor_disparar}, {ST_IDLE, NULL},       {ST_IDLE, NULL},        {ST_IDLE, NULL},       {ST_FALLA, NULL}},
+/* ST_MIDIENDO*/{{ST_MIDIENDO, NULL       }, {ST_ENVIANDO, radio_enviar},{ST_MIDIENDO, NULL},   {ST_FALLA, marcar_fallo},{ST_FALLA, NULL}},
+/* ST_ENVIANDO*/{{ST_ENVIANDO, NULL       }, {ST_ENVIANDO, NULL},       {ST_IDLE, NULL},        {ST_FALLA, marcar_fallo},{ST_FALLA, NULL}},
+/* ST_FALLA  */ {{ST_FALLA,    NULL       }, {ST_FALLA, NULL},          {ST_FALLA, NULL},       {ST_FALLA, NULL},      {ST_FALLA, NULL}},
+};
+
+void fsm_paso(evento_t ev)
+{
+    if (st &gt;= ST_COUNT || ev &gt;= EV_COUNT) { st = ST_FALLA; return; }
+    const transicion_t *t = &amp;TABLA[st][ev];
+    if (t-&gt;accion) t-&gt;accion();
+    st = t-&gt;destino;
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Lo que gana la tabla no es velocidad: es completitud.</strong> Si tenés 5 estados y 5 eventos, hay <strong>25 casillas</strong>, y el compilador te obliga a llenarlas todas o a declarar explícitamente el default. Con un <code>switch</code> podés escribir 9 casos y nunca enterarte de los 16 que faltan hasta que uno aparece en campo. Esa es toda la diferencia, y en un producto que corre años es enorme.
+</div>
+
+<pre><code class="lang-c">/* OPCIÓN 3 — punteros a función por estado (state pattern). Para jerarquías y estados con
+   entry/exit propios. Es la más flexible y también la más difícil de seguir leyendo. */
+typedef struct estado_s {
+    const char *nombre;
+    void (*on_entry)(void);
+    const struct estado_s *(*on_event)(evento_t ev);
+    void (*on_exit)(void);
+} estado_desc_t;
+
+static const estado_desc_t *actual = &amp;ST_DESC_INIT;
+
+void fsm_paso(evento_t ev)
+{
+    const estado_desc_t *siguiente = actual-&gt;on_event(ev);
+    if (siguiente != NULL &amp;&amp; siguiente != actual) {
+        if (actual-&gt;on_exit)     actual-&gt;on_exit();
+        actual = siguiente;
+        if (actual-&gt;on_entry)    actual-&gt;on_entry();
+        log_info("estado -&gt; %s", actual-&gt;nombre);
+    }
+}</code></pre>
+
+<table>
+<thead><tr><th>Enfoque</th><th>Costo RAM/flash</th><th>Cuándo usarlo</th><th>Cuándo NO</th></tr></thead>
+<tbody>
+<tr><td><code>switch</code></td><td>~0 RAM; código proporcional a los casos escritos</td><td>Hasta ~6 estados y ~6 eventos</td><td>Cuando ya no entra en una pantalla</td></tr>
+<tr><td>Tabla de transición</td><td><code>N_estados × N_eventos × 8 B</code> en <strong>flash</strong> (5×5 = 200 B)</td><td>Estados y eventos bien acotados; querés exhaustividad</td><td>Si la tabla queda 90% vacía (matriz dispersa: desperdiciás flash)</td></tr>
+<tr><td>Punteros a función</td><td>4–16 B de RAM por instancia + descriptores en flash</td><td>Jerarquías, entry/exit, varias instancias de la misma FSM</td><td>Debug: seguir un puntero en un core dump es incómodo</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error clásico: estados implícitos en variables sueltas.</strong> Tres booleanos (<code>conectado</code>, <code>midiendo</code>, <code>enviando</code>) son 2³ = <strong>8 combinaciones</strong>, de las cuales quizás 4 son válidas. Las otras 4 son estados imposibles que van a ocurrir igual, porque una interrupción cambió uno de los flags entre dos líneas. Un <code>enum</code> de 4 valores hace que los estados imposibles <em>no se puedan representar</em>. Es la misma idea que "make illegal states unrepresentable" del mundo de los tipos, aplicada con un <code>enum</code> de C.
+</div>
+
+<h2>CF2.3 Memoria dinámica: por qué no</h2>
+
+<p>Este es probablemente el punto donde más se separa el firmware amateur del profesional, y el que más resistencia genera, porque en cualquier otro lenguaje pedir memoria es tan normal como respirar.</p>
+
+<div class="danger">
+  <strong>⚠️ El escenario que hay que entender.</strong> Tu equipo tiene 64 KB de RAM y usa <code>malloc</code> para un buffer que crece y se achica según el tamaño de los mensajes que llegan. Funciona perfecto en el banco de pruebas. En campo, después de <strong>siete meses</strong> y unos 30 millones de ciclos de alocación, un <code>malloc(2048)</code> devuelve <code>NULL</code>: hay 18 KB libres, pero repartidos en 140 huecos de los cuales el más grande es de 1.900 bytes. <strong>No hay fuga de memoria.</strong> Hay fragmentación externa, y no se cura sola. Un equipo que reinicia todos los días nunca la habría visto.
+</div>
+
+<p>Los tres problemas son independientes entre sí y cada uno alcanza para descartar el heap en un sistema serio:</p>
+
+<div class="step"><strong>1. Fragmentación externa.</strong> Alocaciones de tamaños distintos dejan huecos que no se pueden reusar. Es acumulativa, depende del historial, y <strong>no se puede acotar analíticamente</strong> para un patrón de uso arbitrario. En un servidor no importa porque el proceso se recicla; acá no se recicla nada.</div>
+
+<div class="step"><strong>2. No determinismo temporal.</strong> <code>malloc</code> recorre listas libres. Su tiempo depende del estado del heap, y ese estado depende del pasado. Un <code>malloc</code> que tarda 3 µs en el minuto 1 puede tardar 90 µs en el mes 6. Si eso pasa adentro de una tarea con deadline (ver <a href="../cf1-tiempo-real-rtos/lecture.html">CF1</a>), rompiste el análisis de planificabilidad sin escribir una línea nueva.</div>
+
+<div class="step"><strong>3. El fallo no tiene salida.</strong> ¿Qué hacés cuando <code>malloc</code> devuelve <code>NULL</code>? En un servidor, tirás una excepción y que el supervisor reinicie. En un controlador de riego a 40 km, ¿reiniciás? ¿Seguís con menos funcionalidad? La mayoría del código embebido con heap simplemente <em>no chequea el retorno</em>, y ahí el <code>NULL</code> se convierte en un HardFault por desreferenciar dirección 0.</div>
+
+<div class="info">
+  Esto no es una opinión de nicho: <strong>MISRA C:2012, reglas 21.3 y 21.4</strong>, prohíben directamente <code>malloc</code>, <code>calloc</code>, <code>realloc</code> y <code>free</code>, y esa prohibición es obligatoria en desarrollos bajo <strong>ISO 26262</strong> (automotriz) e <strong>IEC 61508</strong> (seguridad funcional industrial). Si alguna vez tu producto tiene que certificar, el heap ya está descartado por norma, no por gusto.
+</div>
+
+<h3>Alternativa 1 — Asignación estática (la que resuelve el 80%)</h3>
+
+<pre><code class="lang-c">/* Todo lo que el sistema puede llegar a necesitar existe desde el arranque.
+   El linker te dice en tiempo de compilación si no entra: el mejor momento para enterarse. */
+#define MAX_SENSORES     8
+#define MAX_MSG_LEN    256
+#define COLA_PROFUNDIDAD 16
+
+static sensor_t   sensores[MAX_SENSORES];
+static uint8_t    rx_buffer[MAX_MSG_LEN];
+static mensaje_t  cola[COLA_PROFUNDIDAD];
+
+/* Regla de oro: si el sistema no soporta el peor caso, tiene que rechazarlo
+   EXPLÍCITAMENTE, no quedarse sin memoria. */
+bool sensor_registrar(const sensor_cfg_t *cfg)
+{
+    if (n_sensores &gt;= MAX_SENSORES) {
+        log_warn("rechazo sensor: limite %u alcanzado", (unsigned)MAX_SENSORES);
+        return false;                 /* degradación controlada, no crash */
+    }
+    sensores[n_sensores++] = sensor_crear(cfg);
+    return true;
+}</code></pre>
+
+<h3>Alternativa 2 — Pool de bloques de tamaño fijo</h3>
+
+<p>Cuando de verdad necesitás alocar y liberar en tiempo de ejecución —paquetes de red que llegan y se procesan, por ejemplo— la solución es un pool: <strong>todos los bloques del mismo tamaño</strong>. Si todos los bloques son iguales, la fragmentación externa es imposible por construcción, y alocar/liberar es <code>O(1)</code> determinista.</p>
+
+<pre><code class="lang-c">/* pool.h — pool de bloques fijos con free-list intrusiva.
+   Costo total de RAM: N * TAM + sizeof(pool_t). Nada más, y calculable en papel. */
+#include &lt;stdint.h&gt;
+#include &lt;stdbool.h&gt;
+#include &lt;stddef.h&gt;
+
+typedef struct bloque_s { struct bloque_s *sig; } bloque_t;
+
+typedef struct {
+    bloque_t *libres;
+    uint8_t  *arena;
+    size_t    tam_bloque;
+    uint16_t  n_bloques;
+    uint16_t  en_uso;
+    uint16_t  pico;          /* HIGH WATER MARK: el dato que te salva la vida */
+} pool_t;
+
+void pool_init(pool_t *p, void *arena, size_t tam_bloque, uint16_t n)
+{
+    p-&gt;arena = (uint8_t *)arena;
+    p-&gt;tam_bloque = tam_bloque;
+    p-&gt;n_bloques = n;
+    p-&gt;en_uso = 0;
+    p-&gt;pico = 0;
+    p-&gt;libres = NULL;
+
+    /* Encadeno todos los bloques en la free-list, hacia atrás */
+    for (uint16_t i = n; i &gt; 0; i--) {
+        bloque_t *b = (bloque_t *)(p-&gt;arena + (size_t)(i - 1) * tam_bloque);
+        b-&gt;sig = p-&gt;libres;
+        p-&gt;libres = b;
+    }
+}
+
+void *pool_alloc(pool_t *p)          /* O(1), siempre, para toda la vida del equipo */
+{
+    if (p-&gt;libres == NULL) return NULL;
+    bloque_t *b = p-&gt;libres;
+    p-&gt;libres = b-&gt;sig;
+    p-&gt;en_uso++;
+    if (p-&gt;en_uso &gt; p-&gt;pico) p-&gt;pico = p-&gt;en_uso;
+    return (void *)b;
+}
+
+void pool_free(pool_t *p, void *ptr)
+{
+    if (ptr == NULL) return;
+    /* Chequeo de cordura barato: ¿este puntero es realmente mío y está alineado? */
+    uint8_t *q = (uint8_t *)ptr;
+    ptrdiff_t off = q - p-&gt;arena;
+    if (off &lt; 0 || (size_t)off &gt;= (size_t)p-&gt;n_bloques * p-&gt;tam_bloque
+                || ((size_t)off % p-&gt;tam_bloque) != 0) {
+        fault_registrar(FAULT_POOL_FREE_INVALIDO);   /* corrupción: no lo escondas */
+        return;
+    }
+    bloque_t *b = (bloque_t *)ptr;
+    b-&gt;sig = p-&gt;libres;
+    p-&gt;libres = b;
+    p-&gt;en_uso--;
+}</code></pre>
+
+<pre><code class="lang-c">/* Uso: la arena es estática, y el tamaño total queda escrito en el binario. */
+#define PKT_TAM   128
+#define PKT_N      12                 /* 12 * 128 = 1536 bytes. Fijo. Para siempre. */
+
+static uint8_t pkt_arena[PKT_N * PKT_TAM] __attribute__((aligned(8)));
+static pool_t  pkt_pool;
+
+void red_init(void) { pool_init(&amp;pkt_pool, pkt_arena, PKT_TAM, PKT_N); }</code></pre>
+
+<div class="tip">
+  <strong>Ese campo <code>pico</code> es el más importante de la estructura.</strong> Publicalo por el canal de telemetría o mostralo en el log de arranque: te dice cuánto margen real te queda. Si un equipo lleva un año con <code>pico = 4</code> de 12, sabés que podés recortar el pool y liberar 1 KB. Si <code>pico = 12</code> de 12, estuviste a un paquete de perder datos y no te enteraste.
+</div>
+
+<h3>Alternativa 3 — Arena / bump allocator</h3>
+
+<p>Para cosas que se alocan una vez y se liberan todas juntas (parsear un mensaje, construir un reporte), una arena es imbatible: un puntero que avanza, y un reset que lo pone en cero.</p>
+
+<pre><code class="lang-c">typedef struct { uint8_t *base; size_t cap, usado, pico; } arena_t;
+
+void *arena_alloc(arena_t *a, size_t n, size_t align)
+{
+    size_t p = (a-&gt;usado + (align - 1)) &amp; ~(align - 1);   /* alineo hacia arriba */
+    if (p + n &gt; a-&gt;cap) return NULL;                       /* no entra: falla explícita */
+    a-&gt;usado = p + n;
+    if (a-&gt;usado &gt; a-&gt;pico) a-&gt;pico = a-&gt;usado;
+    return a-&gt;base + p;
+}
+
+void arena_reset(arena_t *a) { a-&gt;usado = 0; }   /* libera TODO en 1 instrucción */</code></pre>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Fragmentación</th><th>Tiempo</th><th>Cuándo NO usarla</th></tr></thead>
+<tbody>
+<tr><td>Estática</td><td>Imposible</td><td>0</td><td>Cuando el peor caso es 100× el caso típico y no te entra en RAM</td></tr>
+<tr><td>Pool fijo</td><td>Imposible (externa); interna = <code>tam_bloque − usado</code></td><td><code>O(1)</code> determinista</td><td>Cuando los objetos varían mucho de tamaño (desperdiciás medio pool)</td></tr>
+<tr><td>Arena</td><td>Imposible mientras el ciclo sea alocar-todo / liberar-todo</td><td><code>O(1)</code></td><td>Cuando los objetos tienen vidas entrelazadas</td></tr>
+<tr><td><code>malloc</code>/<code>free</code></td><td><strong>Acumulativa e ilimitada</strong></td><td>No determinista</td><td>Casi siempre. Ver excepción abajo</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La única excepción aceptable.</strong> <code>malloc</code> <em>solo</em> durante la inicialización, antes de que arranque el planificador, y sin <code>free</code> nunca. Eso convierte al heap en un asignador estático con sintaxis dinámica: no hay liberación, no hay fragmentación, y el consumo queda fijo desde el arranque. Es exactamente el patrón que usan varias pilas de red embebidas. Todo lo que venga después del <code>scheduler_start()</code> va a pool o a memoria estática.
+</div>
+
+<h2>CF2.4 El mapa de memoria de verdad</h2>
+
+<p>Para tomar cualquiera de las decisiones anteriores necesitás un dato que la mayoría de los programadores embebidos nunca miran: <strong>cuánta RAM te queda realmente</strong>. Y "realmente" no es lo que dice el IDE en la barrita verde.</p>
+
+<table>
+<thead><tr><th>Sección</th><th>Qué guarda</th><th>Dónde vive</th><th>¿Se puede calcular en compilación?</th></tr></thead>
+<tbody>
+<tr><td><code>.text</code></td><td>Código y constantes</td><td>Flash</td><td>✅ Exacto</td></tr>
+<tr><td><code>.rodata</code></td><td><code>const</code>, literales de string, tablas</td><td>Flash</td><td>✅ Exacto</td></tr>
+<tr><td><code>.data</code></td><td>Globales inicializadas a algo ≠ 0</td><td>RAM (copiadas de flash al arrancar)</td><td>✅ Exacto</td></tr>
+<tr><td><code>.bss</code></td><td>Globales en cero</td><td>RAM (puestas a 0 al arrancar)</td><td>✅ Exacto</td></tr>
+<tr><td><strong>Stack</strong></td><td>Locales, argumentos, direcciones de retorno</td><td>RAM</td><td>⚠️ Solo con análisis estático o instrumentación</td></tr>
+<tr><td><strong>Heap</strong></td><td>Lo que pidas con <code>malloc</code></td><td>RAM</td><td>❌ Nunca. Por eso CF2.3</td></tr>
+</tbody>
+</table>
+
+<p>El linker script (<code>.ld</code>) es el archivo que decide dónde va cada cosa. Vale la pena leerlo una vez en la vida y entenderlo:</p>
+
+<pre><code class="lang-c">/* stm32f411.ld — recortado. 512 KB de flash, 128 KB de RAM. */
+MEMORY
+{
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
+  RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 128K
+}
+
+_Min_Stack_Size = 0x1000;   /* 4 KB reservados para el stack principal */
+_Min_Heap_Size  = 0x0;      /* heap = 0. Si alguien llama a malloc, no linkea. */
+
+SECTIONS
+{
+  .text : { *(.text*) *(.rodata*) } &gt;FLASH
+
+  /* .data se guarda en flash y se copia a RAM en el reset handler */
+  _sidata = LOADADDR(.data);
+  .data : { _sdata = .; *(.data*) _edata = .; } &gt;RAM AT&gt; FLASH
+
+  .bss  : { _sbss = .; *(.bss*) *(COMMON) _ebss = .; } &gt;RAM
+
+  /* Esta sección NO existe: solo verifica que quede lugar para el stack.
+     Si no entra, el LINKER FALLA. Mejor un error de build que un HardFault en campo. */
+  ._user_heap_stack :
+  {
+    . = ALIGN(8);
+    . = . + _Min_Heap_Size;
+    . = . + _Min_Stack_Size;
+    . = ALIGN(8);
+  } &gt;RAM
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error que comete todo el mundo la primera vez.</strong> Mirás el reporte del build, ves <code>RAM: 42 KB / 128 KB (33%)</code> y respirás tranquilo. Ese número es <code>.data + .bss</code> <strong>y nada más</strong>: no incluye el stack que se va a consumir en tiempo de ejecución, ni el de cada tarea del RTOS, ni el que usa una llamada anidada a <code>vsnprintf</code>. Tenés 86 KB "libres" que en realidad son el terreno donde el stack va a crecer hacia abajo hasta chocar. El 33% es una foto de la RAM <em>en reposo</em>.
+</div>
+
+<pre><code class="lang-bash"># Los tres comandos que deberías correr en cada build. Los tres vienen con el toolchain.
+
+# 1. Tamaño por sección. text=flash, data+bss=RAM en reposo.
+arm-none-eabi-size -A build/firmware.elf
+#    section      size         addr
+#    .text       98432    0x8000000
+#    .rodata      6144    0x8018080
+#    .data         912   0x20000000
+#    .bss        41216   0x20000390
+
+# 2. Los 20 símbolos que más RAM ocupan. Casi siempre hay una sorpresa acá.
+arm-none-eabi-nm --size-sort --print-size --radix=d build/firmware.elf \
+  | grep -iE ' [bBdD] ' | tail -20
+
+# 3. El .map: quién arrastró qué. Buscá "printf" acá si el flash se te fue de golpe.
+grep -n -A3 'vfprintf\|_printf_float' build/firmware.map | head -40</code></pre>
+
+<h3>Cuánto stack usás de verdad</h3>
+
+<p>El stack es el recurso que más silenciosamente te mata, porque su desbordamiento no produce un error: produce <strong>corrupción de la variable de al lado</strong>. Hay tres formas de acotarlo, de menos a más rigurosa:</p>
+
+<pre><code class="lang-bash"># A) Análisis estático del peor camino. GCC emite un .su por archivo con el uso de cada función.
+arm-none-eabi-gcc -fstack-usage -c src/*.c
+cat build/*.su | sort -t$'\t' -k2 -n -r | head
+#   src/proto.c:88:12:proto_parsear   472   static
+#   src/log.c:41:6:log_fmt            288   dynamic,bounded   &lt;-- ojo con "dynamic"
+
+# B) Herramienta de peor camino sobre el grafo de llamadas (hay varias; puma-trace, worst-case).
+#    Suma el stack a lo largo de la cadena más profunda. NO ve las llamadas indirectas:
+#    los punteros a función de CF2.1 hay que anotarlos a mano.</code></pre>
+
+<pre><code class="lang-c">/* C) Patrón centinela (stack painting). Lo que hace FreeRTOS con uxTaskGetStackHighWaterMark.
+   Se pinta el stack entero con un patrón al arrancar y después se cuenta cuánto quedó virgen. */
+#define PATRON  0xA5A5A5A5u
+
+extern uint32_t _sstack, _estack;
+
+void stack_pintar(void)      /* se llama ANTES de main, desde el reset handler */
+{
+    for (uint32_t *p = &amp;_sstack; p &lt; (uint32_t *)__get_MSP() - 16; p++)
+        *p = PATRON;
+}
+
+uint32_t stack_libre_bytes(void)
+{
+    uint32_t *p = &amp;_sstack;
+    while (p &lt; &amp;_estack &amp;&amp; *p == PATRON) p++;
+    return (uint32_t)((uint8_t *)p - (uint8_t *)&amp;_sstack);
+}
+
+/* Publicalo con la telemetría. Un equipo que reporta 96 bytes libres de 4096
+   te está avisando con meses de anticipación que va a fallar. */</code></pre>
+
+<div class="danger">
+  <strong>⚠️ La detección real se hace con la MPU, no con el centinela.</strong> El patrón centinela te dice <em>después</em> que estuviste cerca; no impide nada, y si el desborde salta por arriba de la zona pintada (una función que reserva 512 bytes de una) no lo detecta. La <strong>Memory Protection Unit</strong> de cualquier Cortex-M con MPU te deja poner una región de "guarda" sin permisos justo debajo del stack: cualquier escritura ahí dispara un <code>MemManage_Handler</code> <em>en el instante exacto del desborde</em>, con el PC apuntando a la función culpable. Costo: una región de MPU (de 8 o 16 disponibles) y ~32 bytes de RAM desperdiciados por el alineamiento. Es la mejor relación costo/beneficio de todo este módulo.
+</div>
+
+<h2>CF2.5 Watchdog: el que se patea en un timer no sirve</h2>
+
+<p>El watchdog es un contador en hardware que resetea el chip si no lo refrescás a tiempo. Es la última red de seguridad del equipo: si el firmware se cuelga, el watchdog lo revive. Y es, de lejos, <strong>el mecanismo peor implementado de la industria</strong>.</p>
+
+<div class="mistake">
+  <strong>El antipatrón.</strong> Alguien pone el <em>kick</em> del watchdog en una interrupción de timer, o en el <code>while(1)</code> del <code>main</code>. A partir de ese momento el watchdog ya no vigila que el sistema <strong>funcione</strong>: vigila que el timer siga corriendo. Y el timer va a seguir corriendo aunque la tarea de red esté trabada en un semáforo desde hace cuarenta minutos, aunque la máquina de estados haya quedado en un estado inválido, aunque el sensor no responda desde ayer. <strong>Un watchdog que se patea solo es un watchdog apagado con pasos extra.</strong>
+</div>
+
+<p>El patrón correcto invierte la responsabilidad: <strong>cada tarea reporta su propia salud, y el watchdog se patea únicamente si todas reportaron</strong>. La tarea de menor prioridad —la <em>idle</em> o una tarea supervisora— es la que hace la verificación, porque si el sistema está saturado esa tarea no corre, y entonces el reset ocurre: exactamente lo que querés.</p>
+
+<pre><code class="lang-c">/* wdt_super.c — watchdog supervisado por tareas. Patrón de bitmask, sin locks. */
+#include &lt;stdint.h&gt;
+#include &lt;stdatomic.h&gt;
+
+typedef enum {
+    WDT_TAREA_SENSOR   = (1u &lt;&lt; 0),
+    WDT_TAREA_RED      = (1u &lt;&lt; 1),
+    WDT_TAREA_CONTROL  = (1u &lt;&lt; 2),
+    WDT_TAREA_UI       = (1u &lt;&lt; 3),
+    WDT_TODAS          = 0x0Fu,
+} wdt_tarea_t;
+
+static atomic_uint checkin;      /* bits reportados desde la última ronda */
+
+/* Cada tarea llama a esto al COMPLETAR una iteración útil, no al empezar. */
+void wdt_checkin(wdt_tarea_t quien)
+{
+    atomic_fetch_or(&amp;checkin, (unsigned)quien);
+}
+
+/* Corre en la tarea de menor prioridad, cada 500 ms. */
+void wdt_supervisor_paso(void)
+{
+    unsigned vistos = atomic_exchange(&amp;checkin, 0u);
+
+    if (vistos == WDT_TODAS) {
+        hal_iwdg_kick();                    /* SOLO acá se patea el perro */
+        return;
+    }
+
+    /* Alguien no reportó. Antes de morir, dejo escrito QUIÉN, en RAM no inicializada
+       para que sobreviva al reset (ver CF2.7). */
+    fault_ctx.faltantes = WDT_TODAS &amp; ~vistos;
+    fault_ctx.magia     = FAULT_MAGIA;
+    fault_ctx.causa     = CAUSA_WDT_TAREA;
+    /* No pateo: dejo que el hardware me resetee en el próximo vencimiento. */
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 El punto sutil que casi nadie implementa.</strong> No basta con "la tarea sigue viva": la tarea tiene que haber hecho <strong>trabajo útil</strong>. Una tarea de red trabada reintentando la misma conexión fallida en un lazo cerrado está viva, corre, y reporta felizmente. Por eso el <code>wdt_checkin()</code> va después del trabajo real —dato publicado, comando procesado— y no arriba del lazo. Una variante más estricta agrega un plazo por tarea: cada una declara cada cuánto <em>debería</em> reportar, y el supervisor exige que ninguna exceda su plazo.
+</div>
+
+<h3>El dato que casi nadie guarda: por qué se reinició</h3>
+
+<p>Todo MCU moderno tiene un registro que dice la causa del último reset y sobrevive al reinicio. Leerlo en el arranque y registrarlo cuesta diez líneas y es la diferencia entre "se cuelga cada tanto" y un diagnóstico:</p>
+
+<pre><code class="lang-c">typedef enum {
+    RST_POR,        /* power-on: se cortó la luz */
+    RST_PIN,        /* alguien apretó reset */
+    RST_WDT,        /* el watchdog nos mató  &lt;-- este es el interesante */
+    RST_SOFT,       /* NVIC_SystemReset() nuestro */
+    RST_BROWNOUT,   /* la tensión cayó por debajo del umbral (ver CF3) */
+    RST_DESCONOCIDO,
+} reset_causa_t;
+
+reset_causa_t reset_causa_leer(void)   /* STM32: registro RCC-&gt;CSR */
+{
+    uint32_t csr = RCC-&gt;CSR;
+    RCC-&gt;CSR |= RCC_CSR_RMVF;          /* limpiar flags para el próximo arranque */
+
+    if (csr &amp; RCC_CSR_IWDGRSTF) return RST_WDT;
+    if (csr &amp; RCC_CSR_BORRSTF)  return RST_BROWNOUT;
+    if (csr &amp; RCC_CSR_PINRSTF)  return RST_PIN;
+    if (csr &amp; RCC_CSR_SFTRSTF)  return RST_SOFT;
+    if (csr &amp; RCC_CSR_PORRSTF)  return RST_POR;
+    return RST_DESCONOCIDO;
+}</code></pre>
+
+<table>
+<thead><tr><th>Decisión de watchdog</th><th>Costo</th><th>Riesgo si te equivocás</th></tr></thead>
+<tbody>
+<tr><td>Timeout muy corto (&lt; 1 s)</td><td>Menor tiempo de caída</td><td>Resets espurios en operaciones legítimamente lentas (borrar un sector de flash puede tardar 1–2 s)</td></tr>
+<tr><td>Timeout muy largo (&gt; 30 s)</td><td>Tolera operaciones lentas</td><td>El equipo queda muerto medio minuto en cada cuelgue</td></tr>
+<tr><td>Watchdog independiente (IWDG)</td><td>Su propio oscilador interno (~32 kHz con ±50% de tolerancia)</td><td>Deriva grande: dimensioná con el peor caso del datasheet, no con el típico</td></tr>
+<tr><td>Watchdog por ventana (WWDG)</td><td>Detecta también <em>patear de más</em> (código descontrolado en un lazo)</td><td>Configuración más delicada; ventana mal calculada = resets fantasma</td></tr>
+</tbody>
+</table>
+
+<h2>CF2.6 Manejo de errores sin excepciones</h2>
+
+<p>En C no hay excepciones, y en firmware tampoco querrías tenerlas: el desenrollado de pila no es determinista y el binario crece. Lo que sí necesitás es una <strong>disciplina uniforme</strong>, porque el problema real no es la falta de <code>try/catch</code>: es que cada módulo inventa su propia convención (uno devuelve <code>0</code> en éxito, otro <code>1</code>, otro <code>-1</code>, otro pone <code>errno</code>) y el código que los combina se vuelve ilegible.</p>
+
+<pre><code class="lang-c">/* UNA convención para todo el proyecto. 0 = éxito, negativos = error. Y se respeta. */
+typedef int32_t err_t;
+
+#define ERR_OK             0
+#define ERR_ARG          (-1)
+#define ERR_TIMEOUT      (-2)
+#define ERR_NO_MEM       (-3)
+#define ERR_CRC          (-4)
+#define ERR_NO_DISPOSITIVO (-5)
+#define ERR_ESTADO       (-6)
+
+/* El macro que hace que el código de arriba sea legible. Sin él, todo es un if anidado. */
+#define TRY(expr)  do { err_t _e = (expr); if (_e != ERR_OK) return _e; } while (0)</code></pre>
+
+<pre><code class="lang-c">/* El patrón goto cleanup. En C ES la construcción correcta: es el único
+   mecanismo del lenguaje para un único punto de salida con liberación ordenada. */
+err_t medicion_ciclo(medicion_t *out)
+{
+    err_t st = ERR_OK;
+    bool  bus_tomado = false;
+    bool  sensor_on  = false;
+
+    st = bus_lock(&amp;i2c1, 100);
+    if (st != ERR_OK) goto cleanup;
+    bus_tomado = true;
+
+    st = sensor_power(true);
+    if (st != ERR_OK) goto cleanup;
+    sensor_on = true;
+
+    st = sensor_leer(out);
+    if (st != ERR_OK) goto cleanup;
+
+    st = validar_rango(out);
+    if (st != ERR_OK) goto cleanup;
+
+cleanup:
+    /* Se deshace en orden inverso, y solo lo que llegó a hacerse */
+    if (sensor_on)  sensor_power(false);
+    if (bus_tomado) bus_unlock(&amp;i2c1);
+    if (st != ERR_OK) stats_err_inc(st);
+    return st;
+}</code></pre>
+
+<div class="info">
+  El <code>goto</code> tiene mala fama por el artículo de Dijkstra de 1968, que hablaba de saltos arbitrarios en lenguajes sin bloques estructurados. <strong>El salto hacia adelante a una única etiqueta de limpieza es otra cosa</strong>: es el idioma estándar del kernel de Linux, de OpenSSL y de prácticamente todo el firmware serio en C. La alternativa —anidar seis <code>if</code> y repetir la liberación en cada rama— es medible y objetivamente peor: más caminos, más código, más chances de olvidarte un <code>unlock</code>.
+</div>
+
+<h3>Assert: dos modos, dos comportamientos</h3>
+
+<pre><code class="lang-c">/* En desarrollo: parar en seco, con el debugger enganchado, en la línea exacta.
+   En producción: NO podés parar. Registrás y reiniciás de forma controlada. */
+#ifdef DEBUG
+  #define ASSERT(c)  do { if (!(c)) { __asm volatile("bkpt #0"); } } while (0)
+#else
+  #define ASSERT(c)  do { if (!(c)) { fault_fatal(__FILE__, __LINE__); } } while (0)
+#endif
+
+/* Y para las condiciones que SÍ pueden pasar (entrada externa, ruido en el bus),
+   NO uses assert: usá un chequeo normal que devuelve error. */
+err_t frame_parsear(const uint8_t *buf, size_t len, frame_t *out)
+{
+    ASSERT(buf != NULL);              /* bug del programador: nunca debería pasar */
+    ASSERT(out != NULL);
+
+    if (len &lt; FRAME_MIN || len &gt; FRAME_MAX) return ERR_ARG;   /* ruido: pasa siempre */
+    if (crc16(buf, len - 2) != leer_u16(&amp;buf[len - 2])) return ERR_CRC;
+    ...
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La línea que separa assert de error.</strong> <code>ASSERT</code> es para <strong>invariantes internos</strong>: cosas que si son falsas, tu código tiene un bug. Un <code>return ERR_x</code> es para <strong>condiciones del mundo</strong>: un bus que no responde, un frame corrupto, un usuario que mandó basura. Meter un assert en un dato que viene de afuera es convertir un paquete malformado en un reinicio del equipo — y le acabás de dar a cualquiera un ataque de denegación de servicio de un solo paquete.
+</div>
+
+<h3>Qué hacer ante un error irrecuperable</h3>
+
+<pre><code class="lang-c">/* La secuencia. Cada paso importa y el orden también. */
+void fault_fatal(const char *archivo, int linea)
+{
+    __disable_irq();                       /* 1. Nada más va a interferir */
+
+    seguridad_a_estado_seguro();           /* 2. LO PRIMERO: válvulas cerradas,
+                                                 motores frenados, calefactor apagado.
+                                                 Antes que loguear. Antes que nada. */
+
+    fault_ctx.magia   = FAULT_MAGIA;       /* 3. Dejo el rastro en RAM .noinit */
+    fault_ctx.causa   = CAUSA_ASSERT;
+    fault_ctx.pc      = (uint32_t)__builtin_return_address(0);
+    fault_ctx.linea   = (uint32_t)linea;
+    str_copiar(fault_ctx.archivo, archivo, sizeof fault_ctx.archivo);
+
+    log_flush_bloqueante();                /* 4. Si hay flash, bajo lo que tenga */
+
+    NVIC_SystemReset();                    /* 5. Reset limpio. NO while(1). */
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Nunca <code>while(1);</code> en un fallo de producción.</strong> Un equipo trabado en un lazo infinito es un equipo muerto que además <em>no reporta</em> que está muerto y que no vuelve solo. Reiniciar es casi siempre mejor: el equipo tiene una chance de volver a operar, el registro de causa de reset queda escrito, y el contador de reinicios te avisa que hay un problema. La única excepción es cuando reiniciar es <em>físicamente peligroso</em> (un actuador que vuelve a energizarse en medio de un ciclo); ahí el estado seguro se mantiene en hardware, no en un <code>while(1)</code> del firmware.
+</div>
+
+<h2>CF2.7 Logging en un sistema sin consola</h2>
+
+<p>El equipo está adentro de un tablero. No hay terminal, no hay pantalla, y cuando falla te lo devuelven en una caja con la nota "no anda". Todo lo que vas a tener para diagnosticar es lo que el firmware haya guardado antes de morir.</p>
+
+<div class="danger">
+  <strong>⚠️ <code>printf</code> bloqueante es la forma más elegante de arruinar el timing.</strong> Un <code>printf("%.2f\n", v)</code> por un UART a 115.200 baudios manda ~10 bytes = <strong>~870 µs bloqueando</strong>. Adentro de una ISR, eso son 870 µs de latencia agregada a <em>todas</em> las interrupciones de igual o menor prioridad — el problema de jitter que <a href="../cf1-tiempo-real-rtos/lecture.html">CF1</a> analiza en detalle. Y encima el <code>%f</code> arrastra <code>_printf_float</code> de newlib: entre <strong>4 y 10 KB de flash</strong> y unos 200–400 bytes de stack, en un chip donde peleás por cada KB. El <code>printf</code> de debug que dejaste "temporalmente" en la ISR de captura es la causa raíz de una cantidad no menor de bugs de timing.
+</div>
+
+<p>La arquitectura correcta separa <strong>producir</strong> el log de <strong>transmitirlo</strong>. El productor solo copia bytes a un buffer circular en RAM y vuelve; una tarea de baja prioridad vacía ese buffer cuando el sistema tiene tiempo.</p>
+
+<pre><code class="lang-c">/* log_ring.c — buffer circular lock-free para un productor y un consumidor.
+   Con potencia de 2 no hace falta módulo, y el wrap de los índices es automático. */
+#include &lt;stdint.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdatomic.h&gt;
+
+#define LOG_CAP   2048u                 /* 2 KB. Potencia de 2 obligatoria. */
+#define LOG_MASK  (LOG_CAP - 1u)
+
+static uint8_t             buf[LOG_CAP];
+static atomic_uint_least32_t w = 0, r = 0;
+static atomic_uint_least32_t perdidos = 0;
+
+/* Llamable desde una ISR: no toma locks, no bloquea, tiempo acotado. */
+void log_push(const uint8_t *datos, uint32_t n)
+{
+    uint32_t wi = atomic_load_explicit(&amp;w, memory_order_relaxed);
+    uint32_t ri = atomic_load_explicit(&amp;r, memory_order_acquire);
+
+    if ((LOG_CAP - (wi - ri)) &lt; n) {     /* no entra */
+        atomic_fetch_add(&amp;perdidos, 1);  /* CUENTO lo que tiro. Nunca lo escondo. */
+        return;
+    }
+    for (uint32_t i = 0; i &lt; n; i++)
+        buf[(wi + i) &amp; LOG_MASK] = datos[i];
+
+    atomic_store_explicit(&amp;w, wi + n, memory_order_release);
+}
+
+/* Corre en la tarea de menor prioridad. Puede bloquear todo lo que quiera. */
+void log_drenar(void)
+{
+    uint32_t ri = atomic_load_explicit(&amp;r, memory_order_relaxed);
+    uint32_t wi = atomic_load_explicit(&amp;w, memory_order_acquire);
+
+    while (ri != wi) {
+        uint32_t chunk = wi - ri;
+        if (chunk &gt; 64u) chunk = 64u;
+        uint8_t tmp[64];
+        for (uint32_t i = 0; i &lt; chunk; i++) tmp[i] = buf[(ri + i) &amp; LOG_MASK];
+        uart_tx_dma(tmp, chunk);         /* DMA: la CPU queda libre */
+        ri += chunk;
+    }
+    atomic_store_explicit(&amp;r, ri, memory_order_release);
+}</code></pre>
+
+<h3>Logs que sobreviven al reset</h3>
+
+<pre><code class="lang-c">/* Una sección de RAM que el arranque NO pone en cero. En el .ld:
+     .noinit (NOLOAD) : { *(.noinit*) } &gt;RAM
+   El contenido sobrevive a un reset por watchdog o por software (no a un corte de energía). */
+typedef struct {
+    uint32_t magia;            /* si vale FAULT_MAGIA, el contenido es válido */
+    uint32_t causa;
+    uint32_t pc, lr, psr;
+    uint32_t faltantes;        /* bitmask del watchdog de CF2.5 */
+    uint32_t reinicios;
+    char     archivo[24];
+    uint32_t linea;
+} fault_ctx_t;
+
+__attribute__((section(".noinit"))) fault_ctx_t fault_ctx;
+
+void arranque_reportar_fallo_previo(void)
+{
+    if (fault_ctx.magia != FAULT_MAGIA) { memset(&amp;fault_ctx, 0, sizeof fault_ctx); return; }
+
+    fault_ctx.reinicios++;
+    log_err("REINICIO #%lu causa=%lu pc=0x%08lx %s:%lu faltantes=0x%lx",
+            fault_ctx.reinicios, fault_ctx.causa, fault_ctx.pc,
+            fault_ctx.archivo, fault_ctx.linea, fault_ctx.faltantes);
+    fault_ctx.magia = 0;       /* consumido */
+}</code></pre>
+
+<div class="analogy">
+  <strong>La caja negra de un avión.</strong> No graba todo lo que pasó en el vuelo: graba los últimos minutos en un anillo, y lo hace en un soporte que sobrevive al impacto. Tu <code>.noinit</code> más el ring buffer son exactamente eso, con la misma lógica de diseño: barato de escribir en el momento crítico, y lo suficientemente resistente como para que el que abra la caja después entienda qué pasó.
+</div>
+
+<table>
+<thead><tr><th>Destino del log</th><th>Costo</th><th>Sobrevive a</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td>UART + DMA</td><td>~0 CPU, 1 pin, 1 canal DMA</td><td>Nada (se pierde si nadie escucha)</td><td>Desarrollo y banco de pruebas</td></tr>
+<tr><td>RAM circular</td><td>1–8 KB de RAM</td><td>Nada</td><td>Siempre, como capa de captura</td></tr>
+<tr><td>RAM <code>.noinit</code></td><td>64–256 B</td><td>Reset por WDT y por software</td><td>Contexto de fallo. Imprescindible</td></tr>
+<tr><td>Flash interna</td><td>Ciclos de borrado (~10.000 típicos); pausas de 1–2 s al borrar sector</td><td>Corte de energía</td><td>Eventos raros: fallos, updates, calibraciones</td></tr>
+<tr><td>Flash externa (SPI NOR)</td><td>Un chip más (~USD 0,30), un bus</td><td>Corte de energía</td><td>Cuando querés historial largo</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Logging binario en vez de texto.</strong> En vez de formatear <code>"temperatura=23.45 sensor=3"</code> (28 bytes + el costo de <code>printf</code>), emitís un ID de mensaje de 16 bits y los argumentos crudos: <code>{0x0142, 2345, 3}</code> = 6 bytes, y el formateo se hace en la PC con un diccionario extraído del binario en tiempo de compilación. Ahorrás flash (los literales de string desaparecen del <code>.rodata</code>), ahorrás ancho de banda y ahorrás CPU. El costo: necesitás la herramienta del lado del host y el diccionario <em>de esa versión exacta</em> del firmware, así que versionalo junto con la imagen.
+</div>
+
+<h2>CF2.8 Bootloader y actualización de firmware (OTA)</h2>
+
+<p>Si tu producto va a estar cinco años en campo, va a necesitar actualizarse. No es opcional ni una feature de lujo: es un requisito regulatorio. El <strong>Cyber Resilience Act</strong> de la Unión Europea obliga a proveer actualizaciones de seguridad por un mínimo de cinco años o la vida del producto, y su calendario ya está corriendo — la obligación de <strong>reportar vulnerabilidades explotadas activamente en 24 horas</strong> entra en vigor el <strong>11 de septiembre de 2026</strong>, y el resto de las obligaciones (diseño seguro, evaluación de conformidad, SBOM) el <strong>11 de diciembre de 2027</strong>, con multas de hasta 15 millones de euros o el 2,5% de la facturación global. Un producto sin OTA no va a poder llevar marcado CE.</p>
+
+<div class="concept">
+  <strong>💡 El invariante no negociable del OTA.</strong> Un update interrumpido —se cortó la luz, se cayó el enlace, la imagen llegó corrupta— <strong>no puede dejar el equipo muerto</strong>. Si un corte de energía en el peor instante posible convierte tu producto en un ladrillo que hay que ir a buscar con una camioneta, no tenés un sistema de actualización: tenés una ruleta rusa con 2.000 equipos instalados. Todo el diseño de esta sección existe para garantizar ese único invariante.
+</div>
+
+<h3>Particiones A/B</h3>
+
+<pre><code class="lang-yaml"># Mapa de flash típico con MCUboot en un chip de 1 MB.
+# El bootloader NO se actualiza por OTA: es el único código que tiene que ser infalible.
+flash:
+  - name:   bootloader        # MCUboot
+    origen: 0x08000000
+    tam:    32K               # ~32 KB con criptografía; menos sin ella
+    ota:    false             # inmutable en campo
+
+  - name:   slot_primario     # la imagen que corre AHORA
+    origen: 0x08008000
+    tam:    448K
+
+  - name:   slot_secundario   # donde se descarga la NUEVA imagen
+    origen: 0x08078000
+    tam:    448K
+
+  - name:   scratch           # área de intercambio para el swap atómico
+    origen: 0x080E8000
+    tam:    32K
+
+  - name:   config            # CF2.9: no se toca en un update
+    origen: 0x080F0000
+    tam:    64K</code></pre>
+
+<div class="warn">
+  <strong>El costo de A/B es brutal y hay que presupuestarlo desde el día uno.</strong> Duplicás el slot de aplicación: si tu firmware pesa 400 KB, necesitás 800 KB más el bootloader más el scratch. En un chip de 512 KB, <strong>A/B directamente no entra</strong>, y esa es una decisión de <em>selección de componente</em>, no de software. La alternativa —descargar a una flash SPI externa de 2 MB por USD 0,30 y copiar sobre el slot único al reiniciar— cambia el costo de silicio por una ventana de vulnerabilidad durante la copia, que se cubre con un modo de recuperación en el bootloader.
+</div>
+
+<h3>La secuencia completa, con el punto de no retorno</h3>
+
+<div class="step"><strong>1. Descarga.</strong> La imagen nueva se escribe en el slot secundario. El equipo sigue corriendo normalmente con el primario. Si se corta acá, no pasó nada: el secundario queda a medias y se descarta.</div>
+
+<div class="step"><strong>2. Verificación.</strong> Antes de tocar nada, se valida la imagen completa: tamaño, CRC/hash, magic, versión, e ID de producto (<strong>que un firmware de otro modelo no entre nunca</strong> — es la causa más común de <em>bricking</em> masivo). La firma criptográfica que verifica que la imagen es realmente tuya se ve en <a href="../cf6-seguridad-embebida/lecture.html">CF6</a>; acá nos ocupa la integridad.</div>
+
+<div class="step"><strong>3. Marcado y reinicio.</strong> Se escribe un flag "hay imagen candidata" y se reinicia. <strong>Este es el punto de no retorno</strong>, y por eso ese flag tiene que escribirse de forma atómica (CF2.9).</div>
+
+<div class="step"><strong>4. El bootloader decide.</strong> Verifica de nuevo la imagen candidata —no confía en la verificación que hizo la app— y hace el swap. Si algo falla, arranca la vieja.</div>
+
+<div class="step"><strong>5. Confirmación.</strong> La imagen nueva arranca en modo <em>de prueba</em>. Si llega a un estado sano —conectó a la red, leyó los sensores, pasó sus autotests— llama a <code>image_confirm()</code>. <strong>Si no confirma y el watchdog la mata, el bootloader revierte automáticamente a la anterior.</strong></div>
+
+<pre><code class="lang-c">/* El paso 5 es el que separa un OTA que funciona de uno que te deja 2.000 ladrillos.
+   La confirmación NO va al final del arranque: va después del PRIMER trabajo útil. */
+void app_main(void)
+{
+    sistema_init();
+
+    if (ota_estado() == OTA_EN_PRUEBA) {
+        log_warn("imagen en prueba, version %s: hay que confirmarla", VERSION);
+        /* NO confirmo todavía. Si me cuelgo antes del check, el bootloader revierte. */
+    }
+
+    for (;;) {
+        ciclo_principal();
+
+        if (ota_estado() == OTA_EN_PRUEBA &amp;&amp; autotest_completo_ok()) {
+            ota_confirmar();                 /* recién ACÁ. Punto de no retorno #2 */
+            log_info("imagen %s confirmada", VERSION);
+        }
+    }
+}
+
+/* autotest_completo_ok() tiene que probar lo que ROMPE un update malo:
+   - ¿el enlace de red se estableció? (si no, no vas a poder mandar el próximo update)
+   - ¿los sensores responden?
+   - ¿la configuración persistente se leyó y validó?
+   - ¿pasaron N minutos sin resets?  &lt;-- el criterio más útil y el más olvidado */</code></pre>
+
+<div class="rule">
+  <strong>📌 Un rollback automático que no cubre "el equipo arranca pero no se puede volver a actualizar" no sirve.</strong> El peor escenario del OTA no es la imagen que no bootea —esa se revierte sola—: es la imagen que bootea perfecto, confirma, y tiene roto el cliente de actualización. Ahí perdiste el único canal para arreglarlo. Por eso el autotest tiene que incluir <strong>la capacidad de recibir el próximo update</strong>, y por eso se despliega en oleadas: 1% de la flota, 24 horas de observación, 10%, 50%, resto.
+</div>
+
+<div class="info">
+  <strong>Estado de la herramienta en 2026.</strong> <a href="https://docs.mcuboot.com/">MCUboot</a>, bajo el paraguas de Trusted Firmware, es el bootloader seguro de referencia para MCUs de 32 bits: firma y validación de imágenes, anti-rollback, estrategias de swap y de <em>overwrite</em>, y una capa de abstracción de flash. Es el bootloader por defecto de <strong>Zephyr</strong> y está integrado en el SDK de NXP MCUXpresso, en ESP-IDF y en Microchip Harmony. Para Linux embebido el equivalente es U-Boot con esquemas A/B (SWUpdate, RAUC, Mender). El consenso de la industria en 2026 es explícito: <strong>escribir tu propio bootloader casi nunca es la decisión correcta</strong>. El costo de mantener y auditar código que, si tiene un bug, deja la flota entera inalcanzable, supera cualquier ahorro.
+</div>
+
+<h2>CF2.9 Configuración persistente sin corromperse</h2>
+
+<p>Tu equipo guarda una dirección de servidor, unos coeficientes de calibración, un umbral. Esos datos tienen que sobrevivir al corte de energía. Y ahí aparece un problema que la mayoría descubre en campo: <strong>si se corta la luz en el medio de la escritura, la config queda a medias</strong>, y en el próximo arranque el equipo lee basura.</p>
+
+<p>Tres particularidades de la flash embebida hacen esto difícil:</p>
+
+<table>
+<thead><tr><th>Restricción</th><th>Consecuencia práctica</th></tr></thead>
+<tbody>
+<tr><td>Solo se puede pasar de 1 a 0 escribiendo; para volver a 1 hay que <strong>borrar un sector entero</strong></td><td>No podés "actualizar un campo": tenés que borrar y reescribir todo el bloque</td></tr>
+<tr><td>El borrado tarda <strong>de decenas de ms a ~2 s</strong> según el tamaño del sector</td><td>La ventana de vulnerabilidad a un corte es enorme comparada con una escritura</td></tr>
+<tr><td>Resistencia limitada: <strong>~10.000 ciclos</strong> de borrado por sector en flash de programa (más en <em>data flash</em> dedicada)</td><td>Guardar un contador cada minuto quema el sector en <strong>7 días</strong></td></tr>
+</tbody>
+</table>
+
+<h3>Escritura atómica: dos copias más un secuencial</h3>
+
+<pre><code class="lang-c">/* El patrón ping-pong. Nunca se borra el bloque que contiene la config válida. */
+typedef struct {
+    uint32_t magia;        /* CFG_MAGIA */
+    uint32_t version;      /* del esquema: permite migrar formatos viejos */
+    uint32_t secuencia;    /* el MÁS ALTO gana. Así se sabe cuál es la última */
+    /* ---- payload ---- */
+    char     servidor[64];
+    uint32_t intervalo_s;
+    float    cal_offset;
+    float    cal_ganancia;
+    /* ---- fin payload ---- */
+    uint32_t crc;          /* CRC32 de todo lo anterior. SIEMPRE el último campo */
+} cfg_t;
+
+#define CFG_SLOT_A  ((const cfg_t *)0x080F0000)
+#define CFG_SLOT_B  ((const cfg_t *)0x080F8000)
+
+static bool cfg_valida(const cfg_t *c)
+{
+    return c-&gt;magia == CFG_MAGIA
+        &amp;&amp; c-&gt;crc == crc32((const uint8_t *)c, offsetof(cfg_t, crc));
+}
+
+err_t cfg_cargar(cfg_t *out)
+{
+    bool a_ok = cfg_valida(CFG_SLOT_A);
+    bool b_ok = cfg_valida(CFG_SLOT_B);
+
+    if (a_ok &amp;&amp; b_ok) {
+        /* Resta con wraparound: sobrevive al desborde del contador de secuencia */
+        *out = ((int32_t)(CFG_SLOT_A-&gt;secuencia - CFG_SLOT_B-&gt;secuencia) &gt; 0)
+             ? *CFG_SLOT_A : *CFG_SLOT_B;
+        return ERR_OK;
+    }
+    if (a_ok) { *out = *CFG_SLOT_A; return ERR_OK; }
+    if (b_ok) { *out = *CFG_SLOT_B; return ERR_OK; }
+
+    *out = CFG_POR_DEFECTO;        /* ambos corruptos: arranco igual, degradado */
+    log_err("config corrupta en ambos slots, usando defaults");
+    return ERR_CRC;
+}
+
+err_t cfg_guardar(const cfg_t *nueva)
+{
+    /* Escribo SIEMPRE en el slot que NO está vigente. Si se corta la luz
+       en cualquier punto de esta función, el slot vigente sigue intacto. */
+    bool usar_a = !(cfg_valida(CFG_SLOT_A)
+                    &amp;&amp; (!cfg_valida(CFG_SLOT_B)
+                        || (int32_t)(CFG_SLOT_A-&gt;secuencia - CFG_SLOT_B-&gt;secuencia) &gt; 0));
+
+    cfg_t tmp = *nueva;
+    tmp.magia     = CFG_MAGIA;
+    tmp.version   = CFG_VERSION;
+    tmp.secuencia = cfg_secuencia_actual() + 1u;
+    tmp.crc       = crc32((const uint8_t *)&amp;tmp, offsetof(cfg_t, crc));
+
+    const cfg_t *destino = usar_a ? CFG_SLOT_A : CFG_SLOT_B;
+    TRY(flash_borrar_sector((uint32_t)destino));
+    TRY(flash_escribir((uint32_t)destino, (const uint8_t *)&amp;tmp, sizeof tmp));
+
+    /* Verificación de lectura: la flash puede aceptar la escritura y guardar mal */
+    if (!cfg_valida(destino)) return ERR_CRC;
+    return ERR_OK;
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 El CRC va último y se calcula sobre todo lo anterior, por una razón física.</strong> La flash se escribe en orden ascendente de direcciones. Si el corte ocurre a mitad de la escritura, el CRC —que está al final— nunca llegó a escribirse, y el registro queda inválido por construcción. Poner el CRC primero rompe esta garantía: podrías tener un CRC correcto sobre datos que se escribieron a medias.
+</div>
+
+<h3>Wear leveling: cuando escribís seguido</h3>
+
+<p>El ping-pong resuelve la atomicidad pero no el desgaste: alterna entre dos sectores, así que duplica la vida útil y nada más. Si escribís cada minuto, 10.000 ciclos por sector × 2 sectores = <strong>13 días</strong>. La solución es un log circular de registros dentro de un sector: escribís registros nuevos consecutivamente sin borrar, y solo cuando el sector se llena borrás y arrancás de nuevo.</p>
+
+<pre><code class="lang-c">/* Sector de 2 KB, registros de 32 bytes = 64 registros por borrado.
+   Escribiendo 1 vez por minuto: 64 min por ciclo de borrado.
+   10.000 ciclos * 64 min = 640.000 min = 1,2 AÑOS.  Sigue sin alcanzar.
+   Con 2 sectores alternados: 2,4 años. Con 8 sectores: casi 10 años. */
+
+/* El registro válido es el ÚLTIMO cuyo CRC cierra. Buscar desde el final es O(n)
+   con n = 64; a 3 µs por lectura son 200 µs en el arranque. Aceptable. */
+static const registro_t *ultimo_valido(const uint8_t *sector, size_t n_regs)
+{
+    for (size_t i = n_regs; i &gt; 0; i--) {
+        const registro_t *r = (const registro_t *)(sector + (i - 1) * sizeof(registro_t));
+        if (r-&gt;magia == REG_MAGIA &amp;&amp; reg_crc_ok(r)) return r;
+    }
+    return NULL;
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error de diseño de fondo: guardar en flash algo que no lo necesita.</strong> Antes de pelear con el <em>wear leveling</em>, preguntate qué estás escribiendo tan seguido. Un contador de horas de funcionamiento no necesita persistirse cada minuto: mantenelo en RAM y escribilo cada hora, o —mucho mejor— aprovechá la detección de <em>brownout</em> (ver <a href="../cf3-energia/lecture.html">CF3</a>) para escribirlo <em>cuando se está yendo la energía</em>, con el capacitor de la fuente como reserva. Pasás de 525.600 escrituras por año a 4, y el problema desaparece en vez de administrarse.
+</div>
+
+<h2>CF2.10 Testing de firmware</h2>
+
+<p>"No se puede testear firmware sin la placa" es falso, y creerlo es lo que hace que los equipos embebidos tengan una fracción de la cobertura de cualquier proyecto de software. Con la arquitectura por capas de CF2.1, la enorme mayoría de tu lógica es C portable que compila y corre en tu notebook con <code>gcc</code>.</p>
+
+<table>
+<thead><tr><th>Nivel</th><th>Dónde corre</th><th>Qué prueba</th><th>Velocidad</th><th>Qué NO ve</th></tr></thead>
+<tbody>
+<tr><td><strong>Unitario en host</strong></td><td>Tu PC, <code>gcc</code> nativo</td><td>Parsers, FSM, cálculos, validaciones, drivers con HAL falsa</td><td>Miles en segundos</td><td>Timing real, registros, endianness del target</td></tr>
+<tr><td><strong>Simulación</strong></td><td><a href="https://renode.io/">Renode</a>, QEMU</td><td>El binario real del target, con periféricos y fallas guionadas</td><td>Segundos a minutos</td><td>Analógica, tolerancias eléctricas, ruido</td></tr>
+<tr><td><strong>HIL</strong> (hardware-in-the-loop)</td><td>Placa real + banco automatizado</td><td>Todo, incluido lo eléctrico y el timing</td><td>Minutos; requiere hardware dedicado</td><td>Casos raros que no supiste provocar</td></tr>
+<tr><td><strong>Campo</strong></td><td>Equipos instalados</td><td>La realidad</td><td>Meses</td><td>—</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-c">/* test_bmp280.c — el driver de CF2.1 testeado en el host, sin placa.
+   Framework: Unity (de ThrowTheSwitch), el estándar de facto en C embebido. */
+#include "unity.h"
+#include "drv_bmp280.h"
+
+/* Doble de la HAL: un I2C de mentira con respuestas guionadas */
+static uint8_t  fake_respuesta[16];
+static size_t   fake_len;
+static int      fake_fallar_en = -1;   /* -1 = no fallar */
+static int      fake_llamada;
+
+static hal_status_t fake_write(hal_i2c_t *s, uint8_t a, const uint8_t *b, size_t n, uint32_t t)
+{
+    (void)s; (void)a; (void)b; (void)n; (void)t;
+    return (fake_llamada++ == fake_fallar_en) ? HAL_ERR_NACK : HAL_OK;
+}
+static hal_status_t fake_read(hal_i2c_t *s, uint8_t a, uint8_t *b, size_t n, uint32_t t)
+{
+    (void)s; (void)a; (void)t;
+    if (fake_llamada++ == fake_fallar_en) return HAL_ERR_TIMEOUT;
+    for (size_t i = 0; i &lt; n &amp;&amp; i &lt; fake_len; i++) b[i] = fake_respuesta[i];
+    return HAL_OK;
+}
+
+static hal_i2c_t bus = { .write = fake_write, .read = fake_read, .ctx = NULL };
+
+void setUp(void)    { fake_llamada = 0; fake_fallar_en = -1; fake_len = 0; }
+void tearDown(void) { }
+
+void test_init_ok_con_chip_id_correcto(void)
+{
+    fake_respuesta[0] = 0x58; fake_len = 1;
+    bmp280_t dev;
+    TEST_ASSERT_EQUAL(HAL_OK, bmp280_init(&amp;dev, &amp;bus));
+}
+
+void test_init_rechaza_chip_id_ajeno(void)   /* alguien soldó un BME280 */
+{
+    fake_respuesta[0] = 0x60; fake_len = 1;
+    bmp280_t dev;
+    TEST_ASSERT_EQUAL(HAL_ERR_NACK, bmp280_init(&amp;dev, &amp;bus));
+}
+
+void test_init_propaga_timeout_del_bus(void)  /* el test que casi nadie escribe */
+{
+    fake_fallar_en = 1;
+    bmp280_t dev;
+    TEST_ASSERT_EQUAL(HAL_ERR_TIMEOUT, bmp280_init(&amp;dev, &amp;bus));
+}
+
+void test_init_rechaza_punteros_nulos(void)
+{
+    bmp280_t dev;
+    TEST_ASSERT_EQUAL(HAL_ERR_ARG, bmp280_init(NULL, &amp;bus));
+    TEST_ASSERT_EQUAL(HAL_ERR_ARG, bmp280_init(&amp;dev, NULL));
+}</code></pre>
+
+<pre><code class="lang-bash"># Corre en tu PC en menos de un segundo. Sin placa, sin programador, sin cable.
+gcc -std=c11 -Wall -Wextra -Werror -O0 -g \
+    -I src -I test/unity \
+    src/drv_bmp280.c test/test_bmp280.c test/unity/unity.c \
+    -o build/test_bmp280 &amp;&amp; ./build/test_bmp280
+
+# Cobertura: qué ramas de tu driver nunca ejecutó ningún test
+gcc --coverage ... &amp;&amp; ./build/test_bmp280 &amp;&amp; gcovr -r . --html-details -o cov.html
+
+# Sanitizers: en el host SÍ los tenés, y encuentran lo que en el target es un HardFault mudo
+gcc -fsanitize=address,undefined -fno-omit-frame-pointer ...</code></pre>
+
+<div class="tip">
+  <strong>El sanitizer en el host es el arma secreta del firmware.</strong> Un desborde de array que en el Cortex-M corrompe la variable vecina y produce un bug fantasma tres semanas después, en tu PC bajo <strong>AddressSanitizer</strong> se reporta al instante, con la línea exacta y el stack completo. Compilá tu lógica portable para el host aunque solo sea para pasarle ASan y UBSan una vez por semana en CI. No cuesta nada y encuentra clases enteras de bugs que en el target son indetectables.
+</div>
+
+<div class="info">
+  <strong>Herramientas 2026.</strong> Del lado de C embebido, el ecosistema de <strong>ThrowTheSwitch</strong> (Unity como framework, CMock para generar dobles automáticamente a partir de los headers, Ceedling como orquestador) sigue siendo el más usado; <strong>CppUTest</strong> es la alternativa cuando el proyecto es C++. Para simulación, <strong>Renode</strong> ganó terreno frente a QEMU en el nicho embebido porque modela periféricos y plataformas multi-nodo, y permite guionar fallas (un sensor que deja de responder, un enlace que se corta) de forma reproducible en CI. La práctica que se consolidó: <em>unitarios en host en cada commit, simulación en cada PR, HIL en cada merge a main y antes de cada release</em>.
+</div>
+
+<h2>CF2.11 Cuándo NO sobre-arquitecturar</h2>
+
+<p>Todo lo anterior tiene un costo, y aplicarlo sin criterio produce un desastre distinto pero igual de real: 200 líneas de lógica repartidas en 14 archivos con tres niveles de indirección, donde entender qué pasa cuando se aprieta un botón lleva media hora.</p>
+
+<div class="rule">
+  <strong>📌 La arquitectura se paga con complejidad, y la complejidad también es un modo de falla.</strong> Un sistema que nadie entiende completo es un sistema donde nadie puede razonar sobre sus estados. Cada capa, cada indirección y cada abstracción tiene que estar comprada por un beneficio concreto que puedas nombrar.
+</div>
+
+<table>
+<thead><tr><th>Situación</th><th>Arquitectura adecuada</th><th>Lo que sería un exceso</th></tr></thead>
+<tbody>
+<tr><td>Sensor que lee y prende un LED. 200 líneas. Una persona, un año de vida útil</td><td>Un archivo, superloop, sin capas</td><td>HAL + drivers + servicios + FSM en tabla</td></tr>
+<tr><td>Datalogger con 3 sensores y SD. 2.000 líneas. Se actualiza a mano</td><td>Drivers separados de la app, FSM con <code>switch</code>, memoria estática, watchdog simple</td><td>OTA A/B, pools, logging binario</td></tr>
+<tr><td>Producto conectado, 500 unidades, 5 años, updates remotos</td><td><strong>Todo este módulo</strong></td><td>—</td></tr>
+<tr><td>Equipo certificado (médico, automotriz, seguridad funcional)</td><td>Todo esto + MISRA + trazabilidad de requisitos + análisis de peor caso documentado</td><td>—</td></tr>
+</tbody>
+</table>
+
+<div class="step"><strong>Las tres preguntas que deciden.</strong> (1) <em>¿Alguien va a poder llegar físicamente al equipo?</em> Si sí, el costo de un fallo baja un orden de magnitud y podés simplificar. (2) <em>¿Cuánto tiempo va a correr entre reinicios?</em> Un equipo que se apaga cada noche perdona la fragmentación; uno que corre tres años no. (3) <em>¿Cuánta gente va a tocar este código y por cuánto tiempo?</em> La arquitectura es, sobre todo, comunicación con el que venga después — incluido vos mismo dentro de dos años.</div>
+
+<div class="mistake">
+  <strong>El error simétrico, y el más caro de los dos.</strong> Arrancar con el superloop de 200 líneas "porque es un prototipo", y que ese prototipo se convierta en el producto sin que nadie tome la decisión de reescribirlo. Retrofitear capas, pools y OTA sobre 8.000 líneas de firmware acoplado cuesta entre <strong>tres y diez veces más</strong> que haberlo diseñado así desde el principio. El punto de decisión no es "cuando el código crezca": es <strong>el día que alguien dice "esto lo vamos a vender"</strong>.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "se cuelga cada tres semanas"</h2>
+
+<blockquote>Un controlador de riego industrial, 140 unidades instaladas, firmware en un STM32F411 con 128 KB de RAM. El cliente reporta que "algunos equipos se cuelgan cada dos o tres semanas". No hay patrón por sitio, ni por hora, ni por clima. En el banco de pruebas nunca pasó. Nadie tiene un log de nada.</blockquote>
+
+<p><strong>Paso 0 — Lo que NO se hace.</strong> No se empieza a leer código buscando el bug, ni se agrega un <code>printf</code> "por las dudas", ni se sube el timeout del watchdog. Con un fallo de tres semanas de período, cada iteración de prueba a ciegas cuesta tres semanas.</p>
+
+<p><strong>Paso 1 — Instrumentar antes de diagnosticar.</strong> Se despliega una versión con lo mínimo para que el equipo <em>se explique solo</em>: causa de reset desde <code>RCC-&gt;CSR</code>, contexto de fallo en <code>.noinit</code>, contador de reinicios, y publicación de <code>pico</code> de cada pool y del <em>high water mark</em> de stack en la telemetría de cada hora. Son unas 120 líneas y no cambia ninguna lógica.</p>
+
+<div class="rule">
+  <strong>📌 La instrumentación no es un paso previo al diagnóstico: es el diagnóstico.</strong> Un bug que aparece cada tres semanas en 140 equipos no se caza mirando código; se caza haciendo que los 140 equipos cuenten qué les pasó. Con 140 unidades y un período de 3 semanas, tenés unos <strong>6 eventos por día</strong> a nivel flota: de "irreproducible" pasás a tener muestras diarias.</div>
+
+<p><strong>Paso 2 — La primera revelación, a las 48 horas.</strong> Nueve equipos reportaron reinicio con <code>causa = RST_WDT</code>. <strong>Los equipos nunca se "colgaban": el watchdog los reiniciaba y volvían a operar en dos segundos.</strong> El operador solo veía un hueco en los datos y lo reportaba como "se colgó". El problema real no era un cuelgue: era un reinicio silencioso que nadie estaba registrando.</p>
+
+<p><strong>Paso 3 — Quién no reportaba.</strong> El bitmask <code>faltantes</code> del watchdog por tareas apuntaba siempre al mismo bit: <code>WDT_TAREA_RED</code>. La tarea de red se quedaba sin llegar a completar su ciclo. Y en la telemetría de la hora previa aparecía el dato que cerraba el caso:</p>
+
+<pre><code class="lang-bash"># Telemetría de un equipo, últimas 4 horas antes del reset
+# t     heap_libre  heap_bloque_max  pool_pkt_pico  stack_hwm
+14:00      21440           9216            4/12         1712
+15:00      21440           6144            5/12         1712
+16:00      21432           3072            7/12         1704
+17:00      21432           1536            9/12         1704   &lt;-- reset a las 17:14
+
+# heap_libre casi constante -&gt; NO hay fuga.
+# heap_bloque_max se derrumba -&gt; el heap se está FRAGMENTANDO.</code></pre>
+
+<p><strong>Paso 4 — La causa raíz.</strong> El cliente de red hacía <code>realloc</code> del buffer de recepción según el tamaño anunciado en cada mensaje: de 512 bytes para un ACK a 4.096 para un bloque de configuración. Cada <code>realloc</code> que no podía crecer en el lugar dejaba un hueco del tamaño viejo. Tras ~3 semanas de tráfico variable, el bloque contiguo más grande caía por debajo de 4.096 bytes, el <code>realloc</code> devolvía <code>NULL</code>, y el código —que no chequeaba el retorno— desreferenciaba <code>NULL</code>. El <code>HardFault_Handler</code> por defecto era un <code>while(1);</code>, así que la tarea de red quedaba muerta y el watchdog reiniciaba el equipo. <strong>Nunca hubo una fuga de memoria: hubo fragmentación, que es otra cosa y no se cura sola.</strong></p>
+
+<p><strong>Paso 5 — El arreglo, en tres commits separados.</strong></p>
+
+<table>
+<thead><tr><th>Cambio</th><th>Qué resuelve</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td>Pool fijo de 12 × 4.096 B para recepción; se elimina <code>realloc</code></td><td>La causa raíz: fragmentación imposible por construcción</td><td>49 KB de RAM fijos (vs. 21 KB de heap "variable"). Entra, y ahora es <em>calculable</em></td></tr>
+<tr><td><code>-Wl,--wrap=malloc</code> que aborta si alguien aloca después del arranque</td><td>Que el problema no vuelva por otra puerta</td><td>~20 líneas; falla ruidosamente en desarrollo</td></tr>
+<tr><td><code>HardFault_Handler</code> real: guarda PC/LR/PSR en <code>.noinit</code> y hace <code>NVIC_SystemReset()</code></td><td>Que el próximo fallo desconocido se diagnostique en horas, no en semanas</td><td>~60 líneas, 40 bytes de RAM</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 6 — Lo que reveló cada paso.</strong> Esta es la tabla que conviene guardar, porque el método se reusa entero en el próximo bug de campo:</p>
+
+<table>
+<thead><tr><th>Paso</th><th>Costo</th><th>Qué reveló</th></tr></thead>
+<tbody>
+<tr><td>Causa de reset (<code>RCC-&gt;CSR</code>)</td><td>10 líneas</td><td>No era un cuelgue: era el watchdog. <strong>Cambió el problema entero</strong></td></tr>
+<tr><td>Contexto en <code>.noinit</code></td><td>60 líneas, 64 B de RAM</td><td>El fallo era un HardFault, no un deadlock ni un timeout</td></tr>
+<tr><td>Bitmask del watchdog por tareas</td><td>40 líneas</td><td>Aisló el culpable a <em>una</em> tarea de cinco</td></tr>
+<tr><td>Telemetría de bloque contiguo máximo</td><td>15 líneas</td><td>Distinguió fragmentación de fuga. Sin esto se buscaba una fuga que no existía</td></tr>
+<tr><td><code>stack_hwm</code> en telemetría</td><td>20 líneas</td><td>Descartó desborde de stack en 5 minutos. <strong>Descartar también es información</strong></td></tr>
+<tr><td>Pool fijo</td><td>1 día de trabajo</td><td>Cerró la clase entera de bugs, no solo esta instancia</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La lección real del ejercicio.</strong> No es "no uses <code>realloc</code>" —eso ya lo sabías desde CF2.3—. Es que <strong>el equipo no podía explicar su propia muerte</strong>, y ese era el bug más caro de todos. Tres semanas de período por 140 equipos son cientos de eventos que ocurrieron sin dejar rastro. El firmware de campo no se debuggea con un debugger: se debuggea con la evidencia que vos decidiste, meses antes, guardar. Y esa decisión se toma cuando escribís el arranque, no cuando te llaman por teléfono.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu <code>malloc</code> nunca falló en dos meses de pruebas en el banco. ¿Por qué no alcanza como evidencia?</summary>
+<p>Porque la fragmentación es acumulativa y depende del <strong>historial completo</strong> de alocaciones y liberaciones, no del tiempo transcurrido. Un banco de pruebas casi siempre ejercita un patrón de tráfico uniforme —el mismo mensaje, el mismo tamaño, el mismo ritmo— que no produce huecos de tamaños variados. En campo el patrón es irregular por naturaleza: mensajes de 40 bytes mezclados con bloques de 4 KB, ráfagas y silencios. Además, dos meses de banco pueden ser dos órdenes de magnitud menos ciclos de alocación que dos meses de campo. La única evidencia que sirve no es "no falló": es <strong>poder acotar el peor caso en papel</strong>, y con <code>malloc</code> de propósito general eso es imposible. Con un pool de bloques fijos el peor caso es <code>N × TAM</code> y se conoce en tiempo de compilación.</p></details>
+
+<details><summary>¿Por qué un watchdog pateado desde una interrupción de timer es peor que no tener watchdog?</summary>
+<p>Porque te da una falsa sensación de seguridad, que es peor que la ausencia declarada de una protección. El timer del sistema es lo <em>último</em> que deja de funcionar: sigue corriendo aunque todas las tareas estén trabadas en un semáforo, aunque la máquina de estados haya caído en un estado inválido, aunque el sensor no responda desde hace un día. El watchdog termina vigilando su propio mecanismo de pateo en vez del sistema. El patrón correcto invierte la responsabilidad: cada tarea reporta que completó <strong>trabajo útil</strong> (no que "está viva"), un supervisor de baja prioridad verifica que <em>todas</em> reportaron, y solo entonces patea. Que el supervisor sea de baja prioridad es parte del diseño: si el sistema está saturado no llega a correr, y el reset ocurre — que es exactamente lo que querés.</p></details>
+
+<details><summary>Un update OTA se interrumpe justo cuando el bootloader está copiando la imagen nueva sobre el slot primario. ¿Por qué el equipo no queda muerto?</summary>
+<p>Porque la copia no es el punto de no retorno: el estado del proceso vive en metadatos persistentes, fuera de la imagen. Al reiniciar, el bootloader —que es inmutable y nunca se actualiza por OTA— vuelve a leer esos metadatos, ve que había un swap en curso y lo <strong>reanuda desde donde quedó</strong>, usando el área de scratch como memoria intermedia. Si en cambio la imagen candidata no valida (hash, versión, ID de producto), la descarta y arranca la anterior, que sigue íntegra en el otro slot. Y si la nueva imagen sí arranca pero no confirma dentro de su ventana de prueba, el watchdog la mata y el bootloader revierte solo. Son tres redes independientes, y la clave de todas es la misma: <strong>siempre existe una imagen íntegra y arrancable en el dispositivo</strong>, en todo instante del proceso.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Las cuatro capas</strong> (HAL / drivers / servicios / app) se pagan con 2–5 ciclos por llamada indirecta y compran dos cosas caras: poder testear en el host y poder cambiar de MCU cuando el chip se discontinúe — que pasa siempre.</li>
+  <li><strong>Máquinas de estados explícitas.</strong> El <code>switch</code> alcanza hasta ~6 estados; la tabla de transición cuesta <code>N×M×8</code> bytes de flash y compra <strong>exhaustividad</strong>. Tres booleanos son ocho estados, de los cuales la mitad son imposibles y van a ocurrir igual.</li>
+  <li><strong>No hay <code>malloc</code> después del arranque.</strong> Fragmentación acumulativa, tiempo no determinista y un fallo sin salida. MISRA C:2012 21.3/21.4 lo prohíbe, y es obligatorio bajo ISO 26262 e IEC 61508. Alternativas: estático, pool <code>O(1)</code>, arena. Y siempre registrá el <em>high water mark</em>.</li>
+  <li><strong>El "33% de RAM usada" del build es <code>.data + .bss</code>: no incluye el stack.</strong> Acotalo con <code>-fstack-usage</code>, con patrón centinela para la tendencia, y detectá el desborde de verdad con una región de guarda en la <strong>MPU</strong> — la mejor relación costo/beneficio del módulo.</li>
+  <li><strong>Watchdog por tareas, nunca por timer.</strong> Cada tarea reporta trabajo <em>completado</em>; un supervisor de baja prioridad patea solo si reportaron todas. Y leé siempre el registro de causa de reset.</li>
+  <li><strong>Errores:</strong> una convención única en todo el proyecto, <code>goto cleanup</code> (que en C es lo correcto), <code>ASSERT</code> solo para invariantes internos y <code>return ERR_x</code> para datos del mundo. Ante un fallo fatal: estado seguro primero, rastro después, y <code>NVIC_SystemReset()</code> — nunca <code>while(1)</code>.</li>
+  <li><strong>Logging diferido.</strong> Ring buffer en RAM más una tarea de baja prioridad; contexto de fallo en <code>.noinit</code> para que sobreviva al reset. Un <code>printf</code> bloqueante en una ISR son ~870 µs de jitter a 115.200 baudios y hasta 10 KB de flash por el <code>%f</code>.</li>
+  <li><strong>OTA A/B con rollback automático.</strong> El invariante: siempre hay una imagen íntegra y arrancable. Confirmá recién <em>después</em> del primer trabajo útil, y que el autotest incluya la capacidad de recibir el próximo update. Usá MCUboot; escribir tu propio bootloader casi nunca es la decisión correcta. El <strong>CRA</strong> lo vuelve obligatorio: reporte de vulnerabilidades explotadas desde el <strong>11-sep-2026</strong>, resto de obligaciones el <strong>11-dic-2027</strong>.</li>
+  <li><strong>Config persistente:</strong> dos slots, número de secuencia, CRC al final (porque la flash se escribe en orden ascendente), y verificación por lectura. Y antes de pelear con el <em>wear leveling</em>, preguntate por qué escribís tan seguido.</li>
+  <li><strong>Testing:</strong> unitarios en el host con HAL falsa (con ASan y UBSan, que en el target no tenés), simulación con Renode en cada PR, HIL antes de cada release.</li>
+  <li><strong>No sobre-arquitecturés.</strong> Un sensor de 200 líneas no necesita cinco capas. Pero el error simétrico —dejar que el prototipo se convierta en producto sin rediseñarlo— cuesta entre 3 y 10 veces más.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un proyecto embebido tuyo y corré <code>arm-none-eabi-size -A</code> y <code>arm-none-eabi-nm --size-sort</code>. Armá una tabla con los 10 símbolos que más RAM ocupan. ¿Hay alguno que no esperabas? Calculá qué porcentaje de la RAM total queda realmente libre para el stack.</li>
+  <li>Implementá el pool de bloques fijos de CF2.3 completo, incluyendo el <em>high water mark</em>, y escribí tests en el host que verifiquen: agotamiento (el bloque N+1 devuelve <code>NULL</code>), doble <code>free</code> del mismo puntero, y <code>free</code> de un puntero ajeno al pool. Corrélos bajo AddressSanitizer.</li>
+  <li>Convertí una máquina de estados escrita con <code>if</code> anidados (buscá una en cualquier ejemplo de Arduino) a tabla de transición. Contá cuántas casillas de la tabla quedaron sin cubrir en la versión original: esos son los bugs latentes que tenía.</li>
+  <li>Implementá el watchdog supervisado por tareas de CF2.5 con al menos tres tareas. Después provocá deliberadamente que una se trabe y verificá que (a) el equipo se reinicia, y (b) el bitmask en <code>.noinit</code> identifica correctamente cuál falló.</li>
+  <li>Medí el costo real de <code>printf</code>: compilá el mismo programa con y sin una llamada que use <code>%f</code> y compará el tamaño del <code>.text</code>. Después medí con un osciloscopio (o con un GPIO y un contador de ciclos) cuánto bloquea un <code>printf</code> de 10 caracteres por UART a 115.200 baudios.</li>
+  <li>Implementá el esquema de configuración de doble slot de CF2.9. Después escribí un test que simule un corte de energía interrumpiendo la escritura en 10 puntos distintos del proceso, y verificá que en los 10 casos el sistema arranca con una configuración válida.</li>
+  <li>Diseñá en papel el mapa de flash para un producto con OTA A/B en un MCU de 512 KB, con una aplicación de 200 KB. ¿Entra? ¿Qué tenés que sacrificar? Compará el costo contra agregar una flash SPI externa y justificá la decisión con números.</li>
+  <li>Tomá un driver de sensor que ya tengas escrito y refactorizalo para que reciba la interfaz de bus por parámetro en vez de llamar directamente a la HAL del fabricante. Escribí cuatro tests en el host: camino feliz, ID de chip incorrecto, timeout del bus, y punteros nulos.</li>
+  <li>Instalá <a href="https://renode.io/">Renode</a> y corré el binario real de un proyecto tuyo en la plataforma simulada. Guioná una falla —que un sensor I²C deje de responder a partir del segundo 30— y verificá que tu firmware la maneja como esperabas en vez de trabarse.</li>
+</ol>
+
+<section class="quiz" id="quizCF_S2">
+  <style>
+    #quizCF_S2{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCF_S2 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCF_S2 .q{margin-bottom:1.5rem}
+    #quizCF_S2 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCF_S2 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCF_S2 .opt:hover{border-color:var(--accent)}
+    #quizCF_S2 .opt:disabled{cursor:default}
+    #quizCF_S2 .opt.ok{background:rgba(63,185,80,.16);border-color:var(--success, #3fb950)}
+    #quizCF_S2 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCF_S2 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCF_S2 .exp.show{display:block}
+    #quizCF_S2 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un equipo lleva 7 meses en campo. La telemetría muestra que la memoria libre total del heap se mantiene estable en ~21 KB, pero el bloque contiguo más grande bajó de 9 KB a 1,5 KB. ¿Qué está pasando?</p>
+    <button class="opt">Hay una fuga de memoria: algo pide y no libera</button>
+    <button class="opt">El stack creció hacia abajo y se está comiendo el heap</button>
+    <button class="opt">Fragmentación externa: la memoria libre está partida en huecos chicos y no reusables</button>
+    <button class="opt">Es normal y no requiere acción hasta que la memoria libre total baje</button>
+    <div class="exp">La firma de la fragmentación es exactamente esa: <strong>total estable, bloque máximo en caída</strong>. Si fuera una fuga, el total bajaría. Si fuera el stack invadiendo el heap, ya habría corrupción y HardFaults. La fragmentación externa es acumulativa, depende del historial de alocaciones y <strong>no se cura sola</strong>: el próximo pedido grande va a devolver <code>NULL</code> aunque "sobre" memoria. Por eso la única solución real no es un heap mejor, sino no tener heap: pool de bloques de tamaño fijo, donde la fragmentación externa es imposible por construcción.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Estás por poner en producción un firmware con OTA A/B. ¿En qué momento debería la imagen nueva llamar a <code>ota_confirmar()</code>?</p>
+    <button class="opt">Después de completar el primer ciclo de trabajo útil, incluyendo verificar que puede recibir el próximo update</button>
+    <button class="opt">Al principio del <code>main()</code>, apenas arranca, para no olvidarse</button>
+    <button class="opt">Nunca: si arrancó es porque funciona, y confirmar es redundante</button>
+    <button class="opt">Lo confirma el bootloader automáticamente antes de saltar a la aplicación</button>
+    <div class="exp">Confirmar al principio del <code>main()</code> anula todo el mecanismo: le estás diciendo al bootloader "esta imagen está bien" antes de tener ninguna evidencia de que lo esté, y perdés el rollback automático justo cuando más lo necesitás. El peor escenario del OTA no es la imagen que no bootea —esa se revierte sola por watchdog—, es la que <strong>bootea perfecto pero tiene roto el cliente de actualización</strong>: ahí perdiste el único canal para arreglarla y hay que ir físicamente. Por eso el autotest previo a la confirmación tiene que incluir la capacidad de recibir el próximo update.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Estás decidiendo dónde llamar a <code>ASSERT()</code> y dónde devolver un código de error. Llega un frame por el puerto serie con un CRC que no cierra. ¿Qué corresponde?</p>
+    <button class="opt"><code>ASSERT(crc_ok)</code>: un CRC malo indica corrupción y el sistema debe detenerse</button>
+    <button class="opt"><code>return ERR_CRC</code>: es una condición del mundo externo, esperable, y debe manejarse sin reiniciar</button>
+    <button class="opt">Depende de si el build es DEBUG o RELEASE: assert en debug, ignorarlo en release</button>
+    <button class="opt">Loguear el frame completo en flash para análisis posterior y continuar</button>
+    <div class="exp">Un CRC que no cierra es <strong>ruido eléctrico, un cable flojo, un vecino con un variador de frecuencia</strong>: pasa todos los días y el sistema tiene que seguir funcionando. <code>ASSERT</code> es para invariantes internos —cosas que si son falsas, tu código tiene un bug—, y en producción termina en un reset. Meter un assert sobre datos que vienen de afuera convierte un frame corrupto en un reinicio del equipo, y le regala a cualquiera una denegación de servicio de un solo paquete mal formado. La opción de loguear cada frame malo en flash es además un buen camino para quemar el sector de flash en semanas.</div>
+  </div>
+
+  <div class="score" id="scoreCF_S2"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCF_S2');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCF_S2').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CF3.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cf1-tiempo-real-rtos/lecture.html">← CF1: Tiempo real y RTOS</a>
+  <a href="../cf3-energia/lecture.html">CF3: Energía →</a>
+</nav>
+
+</div>
+</body>
+</html>
